@@ -192,3 +192,32 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Ignore Solana private key file
+solana_private_key.json
+
+# Ignore environment variable files
+.env
+*.env
+
+# Ignore IDE-specific files (like VS Code)
+.vscode/
+
+# Ignore logs and temporary files
+*.log
+*.sqlite
+*.bak
+*.tmp
+
+# Ignore Redis, cache, and other generated files
+*.db
+.cache
+
+# Ignore compiled files and temporary Python files
+*.pyc
+__pycache__/
+
+# Ignore deployment artifacts
+build/
+dist/
+wheels/
