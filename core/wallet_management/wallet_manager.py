@@ -46,11 +46,12 @@ def _load_keypair(cfg: Config) -> Keypair:
     """Load a Solana Keypair from *either* a JSON file (Render secret‑mount) or
     a comma‑delimited env string."""
 
-    if cfg.SOL_PRIVATE_KEY:  # already parsed by Config from json file
+    if cfg.SOL_PRIVATE_KEY:
+        # Parsed by Config from mounted secret file
         secret = cfg.SOL_PRIVATE_KEY  # list[int]
     else:
-        # BACK‑COMPAT: Allow SOL_PRIVATE_KEY env string (comma‑sep ints)
-        raw = cfg._get_env("SOL_PRIVATE_KEY")  # may raise if missing
+        # BACK‑COMPAT fallback to env string
+        raw = cfg._get_env("SOL_PRIVATE_KEY")
         secret = [int(x) for x in raw.strip().split(",")]
 
     return Keypair.from_secret_key(bytes(secret))
@@ -152,13 +153,13 @@ class WalletManager:
         WALLET_TX_COUNT.inc()
         (WALLET_TX_CONFIRMS if confirm.value else WALLET_TX_CONFIRM_FAILS).inc()
 
-        return sig, quote.get("outAmount", 0) / 1e9  # convert lamports→SOL
+        return sig, quote.get("outAmount", 0) / 1e9  # lamports → SOL
 
     # ── Portfolio helpers (placeholders – wire to PnL module) ────────────────
-    async def get_total_open_sol(self) -> float:  # noqa: D401 – simple future impl
-        """Return current open SOL exposure (live PnL module TBD)."""
-        raise NotImplementedError("Hook to PnL tracker / open‑position cache")
+    async def get_total_open_sol(self) -> float:  # noqa: D401
+        """Return current open SOL exposure (TODO: integrate PnL tracker)."""
+        raise NotImplementedError
 
     async def has_open_position(self, symbol: str) -> bool:
-        """Check if *symbol* is already held open."""
+        """True if *symbol* already open (TODO: link to position manager)."""
         raise NotImplementedError
