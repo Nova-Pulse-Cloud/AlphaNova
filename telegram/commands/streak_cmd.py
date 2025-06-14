@@ -1,24 +1,27 @@
-# 🚀 Nova Pulse ALPHA – telegram/streak_cmd.py
+# File: telegram/commands/streak_cmd.py
 # Elite-tier aiogram streak command router—track, display, and share your win/loss streaks and cycle stats.
 # Enhanced with inline UX and leaderboard-ready signals.
 # ADMIN-ONLY: All commands are restricted to TELEGRAM_CHAT_ID
 
 import os
+import uuid
+import logging
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-import logging
 
-from core.pnl_tracker import get_streak_history, get_best_streak, get_cycle_stats
+from utils.pnl_tracker import get_streak_history, get_best_streak, get_cycle_stats
 from utils.pnl_image_card import generate_streak_card
-from core.plugin_manager import fire_plugin_event  # Event firing for plugin integration
-from core.reinforcement_learning import RLTrader  # Adding RL feedback functionality
+from utils.plugin_manager import fire_plugin_event
+from core.signal_generation.reinforcement_learning import RLTrader  # Adding RL feedback functionality
+from telegram.commands.commands import COMMANDS_EXECUTED, COMMANDS_FAILED
 
 logger = logging.getLogger("telegram_streak_cmd")
 router = Router()
 
 # === Config ===
 ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "7545342838"))
+
 
 def admin_only(func):
     """
@@ -27,9 +30,11 @@ def admin_only(func):
     async def wrapper(message: Message, *args, **kwargs):
         if message.from_user.id != ADMIN_CHAT_ID:
             await message.reply("❌ Access denied. This bot is private.")
+            COMMANDS_FAILED.inc()
             return
         return await func(message, *args, **kwargs)
     return wrapper
+
 
 def streak_inline_buttons(user_id: int) -> InlineKeyboardMarkup:
     """
@@ -52,7 +57,6 @@ async def streak_handler(message: Message):
         streaks = await get_streak_history(user=user_id)
         best = await get_best_streak(user=user_id)
 
-        # Check if streak data is available and format the message
         if streaks and best:
             summary = (
                 f"🔥 *Your Current Streak:*\n"
@@ -60,25 +64,33 @@ async def streak_handler(message: Message):
                 f"🏆 *Best:* {best['wins']}W/{best['losses']}L"
             )
             img = await generate_streak_card(user_id)
-            await message.answer_photo(img, caption=summary, parse_mode="Markdown", reply_markup=streak_inline_buttons(user_id))
+            await message.answer_photo(
+                img,
+                caption=summary,
+                parse_mode="Markdown",
+                reply_markup=streak_inline_buttons(user_id)
+            )
 
-            # Log the streak command and fire plugin event
             logger.info(f"[Streak] Sent streak card to user {user_id}")
-            await fire_plugin_event("cmd_streak", {"user_id": user_id, "streaks": streaks, "best": best, "trace_id": trace_id})
+            await fire_plugin_event(
+                "cmd_streak",
+                {"user_id": user_id, "streaks": streaks, "best": best, "trace_id": trace_id}
+            )
 
-            # RL Feedback (reward based on streak performance)
             rl_trader = RLTrader()
-            await rl_trader.reward({"user_id": user_id}, {"streaks": streaks, "best": best}, user=user_id)
-
+            await rl_trader.reward(
+                {"user_id": user_id}, {"streaks": streaks, "best": best}, user=user_id
+            )
         else:
             await message.answer("📭 No streak data yet—start trading to build your streak!")
-    
     except Exception as e:
         logger.error(f"[Streak] Error: {e}")
         await message.answer("⚠️ Failed to load streak data.")
-        await fire_plugin_event("cmd_streak_error", {"user_id": user_id, "error": str(e), "trace_id": trace_id})
+        await fire_plugin_event(
+            "cmd_streak_error",
+            {"user_id": user_id, "error": str(e), "trace_id": trace_id}
+        )
 
-    # Metrics Update
     COMMANDS_EXECUTED.inc()
 
 @router.message(Command("cycle"))
@@ -92,7 +104,6 @@ async def cycle_handler(message: Message):
     try:
         stats = await get_cycle_stats(user=user_id)
 
-        # Check if cycle stats are available and format the message
         if stats:
             win_rate = stats.get("win_rate", 0.0)
             avg_pnl = stats["pnl"] / stats["trades"] if stats["trades"] else 0
@@ -104,23 +115,28 @@ async def cycle_handler(message: Message):
             )
             await message.answer(msg, parse_mode="Markdown")
 
-            # Log the cycle stats command and fire plugin event
             logger.info(f"[Cycle] Sent cycle stats to user {user_id}")
-            await fire_plugin_event("cmd_cycle", {"user_id": user_id, "stats": stats, "trace_id": trace_id})
+            await fire_plugin_event(
+                "cmd_cycle",
+                {"user_id": user_id, "stats": stats, "trace_id": trace_id}
+            )
 
-            # RL Feedback (reward based on cycle performance)
             rl_trader = RLTrader()
-            await rl_trader.reward({"user_id": user_id}, {"cycle_stats": stats}, user=user_id)
-
+            await rl_trader.reward(
+                {"user_id": user_id}, {"cycle_stats": stats}, user=user_id
+            )
         else:
-            await message.answer("🔄 No cycle stats yet. Trade during the next market cycle to track performance.")
-    
+            await message.answer(
+                "🔄 No cycle stats yet. Trade during the next market cycle to track performance."
+            )
     except Exception as e:
         logger.error(f"[Cycle] Error: {e}")
         await message.answer("⚠️ Failed to load cycle stats.")
-        await fire_plugin_event("cmd_cycle_error", {"user_id": user_id, "error": str(e), "trace_id": trace_id})
+        await fire_plugin_event(
+            "cmd_cycle_error",
+            {"user_id": user_id, "error": str(e), "trace_id": trace_id}
+        )
 
-    # Metrics Update
     COMMANDS_EXECUTED.inc()
 
 # === Future Plug-ins ===
