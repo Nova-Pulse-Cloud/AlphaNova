@@ -38,20 +38,16 @@ TX_ROUTE_CACHE_MISSES = Counter("tx_route_cache_misses_total", "Cache misses for
 _route_cache: Dict[str, Dict[str, Any]] = {}
 _cache_lock = asyncio.Lock()
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Helper: Provenance Hash
 # ────────────────────────────────────────────────────────────────────────────────
-
 def _provenance_hash(route_data: Dict[str, Any]) -> str:
     """SHA‑256 hash for route provenance."""
     return hashlib.sha256(str(route_data).encode()).hexdigest()
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Public API: build_compressed_swap
 # ────────────────────────────────────────────────────────────────────────────────
-
 async def build_compressed_swap(
     wallet: Keypair,
     input_mint: str,
@@ -111,14 +107,12 @@ async def build_compressed_swap(
         )
         TX_BUILDS.inc()
         TX_LATENCY.observe(monotonic() - start)
-
         return {
             "tx": tx,
             "route": route,
             "hash": _provenance_hash(route),
             "trace_id": trace_id,
         }
-
     except Exception as e:
         TX_FAILURES.inc()
         logger.exception(f"[TX:{trace_id}] Transaction build failed: {e}")
