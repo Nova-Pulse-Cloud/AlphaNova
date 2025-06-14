@@ -1,9 +1,8 @@
 # File: core/execution/execute_trade.py
-# 🚀 Nova Pulse ALPHA – Ultra-Grade Trade Executor (Phantom / Jupiter)
-
+# 🚀 Nova Pulse ALPHA – Ultra‑Grade Trade Executor (Phantom / Jupiter)
 """
-Executes trades with RL-driven sizing, on‑chain routing, Prometheus metrics,
-OpenAI rationale, and full DLQ / audit hashing. Worthy of the #1 crypto bot.
+Executes trades with RL‑driven sizing, on‑chain routing, Prometheus metrics,
+OpenAI rationale, and full DLQ / audit hashing — worthy of the #1 crypto bot.
 """
 
 import asyncio
@@ -11,7 +10,7 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 from openai import AsyncOpenAI
@@ -141,15 +140,14 @@ async def execute_trade(
     market_service: MarketConditionsService,
     plugin_manager: PluginManager,
 ) -> TradeResult:
-    """Main async entrypoint for executing a single live trade."""
-
+    """Execute a single live trade with full audit trail."""
     TRADES_EXECUTED.inc()
     rl_trader = RLTrader()
 
-    # RL-driven position sizing
+    # RL sizing
     trade.amount = rl_trader.get_position_size(trade.symbol, trade.user_id)
 
-    # Wallet check
+    # Wallet readiness
     if not await wallet_manager.is_ready(trade.user_id):
         return TradeResult(success=False, error="Wallet not ready", timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
 
@@ -160,24 +158,19 @@ async def execute_trade(
         return TradeResult(success=False, error=f"Router {trade.dex} not found", timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
 
     try:
-        # Market‑aware slippage adjustment
+        # Market‑aware slippage
         ob_imbalance = await get_orderbook_imbalance(trade.symbol)
         trade.slippage = max(trade.slippage, ob_imbalance * 0.01)
 
         async with TRADE_LATENCY.time():
-            # 1️⃣ Get Quote
-            quote = await _retry_async(lambda: router_fn.get_quote(trade), 2, 2, "DEX quote failed")
-
-            # 2️⃣ Execute Swap
+            quote   = await _retry_async(lambda: router_fn.get_quote(trade), 2, 2, "DEX quote failed")
             tx_hash, pnl = await _retry_async(lambda: router_fn.execute_swap(trade, quote), 2, 3, "Swap failed")
+            rationale    = await _retry_async(lambda: _explain_trade_llm(trade, quote, pnl), 2, 3, "LLM rationale failed")
 
-            # 3️⃣ LLM Rationale
-            rationale = await _retry_async(lambda: _explain_trade_llm(trade, quote, pnl), 2, 3, "LLM rationale failed")
-
-        # 4️⃣ Audit & Memory
-        audit = {**trade.dict(), "tx_hash": tx_hash, "pnl": pnl}
-        audit_hash = hashlib.sha256(str(audit).encode()).hexdigest()
-        await update_memory(trade.symbol, "trade_audit", audit, user=trade.user_id)
+        # Audit & Memory
+        audit_data  = {**trade.dict(), "tx_hash": tx_hash, "pnl": pnl}
+        audit_hash  = hashlib.sha256(str(audit_data).encode()).hexdigest()
+        await update_memory(trade.symbol, "trade_audit", audit_data, user=trade.user_id)
         rl_trader.reward(trade.meta, {"pnl": pnl}, user=trade.user_id)
         TRADE_PNL.set(pnl or 0.0)
 
