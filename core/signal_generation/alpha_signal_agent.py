@@ -1,5 +1,5 @@
 # File: core/signal_generation/alpha_signal_agent.py
-# 🚀 Nova Pulse ALPHA – AlphaSignalAgent v2: Production Signal Fusion
+# 🚀 Nova Pulse ALPHA – AlphaSignalAgent v2.1: Production Signal Fusion
 
 import asyncio
 import logging
@@ -9,7 +9,7 @@ from typing import Dict, Any, List, Optional
 from uuid import uuid4
 
 import openai
-import aioredis
+import redis.asyncio as redis_async
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
@@ -17,21 +17,15 @@ from utils.config import Config
 from utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.data_collection.orderbook_overlay import OrderBookOverlay
-from utils.plugin_manager import fire_event  # centralized event bus
+from utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.alpha_signal_agent_v2")
 logger.setLevel(logging.INFO)
 
 # Prometheus metrics
-SIGNAL_TRIGGERS = Counter(
-    "alpha_signal_triggers_total", "Total alpha signals triggered"
-)
-SIGNAL_ERRORS   = Counter(
-    "alpha_signal_errors_total", "Total alpha signal errors"
-)
-SIGNAL_LATENCY  = Histogram(
-    "alpha_signal_latency_seconds", "Alpha signal latency (seconds)"
-)
+SIGNAL_TRIGGERS = Counter("alpha_signal_triggers_total", "Total alpha signals triggered")
+SIGNAL_ERRORS   = Counter("alpha_signal_errors_total", "Total alpha signal errors")
+SIGNAL_LATENCY  = Histogram("alpha_signal_latency_seconds", "Alpha signal latency (seconds)")
 
 class AlphaSignal(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -48,7 +42,7 @@ class AlphaSignal(BaseModel):
 
 class AlphaSignalAgent:
     """
-    Nova ALPHA – AlphaSignalAgent v2
+    Nova ALPHA – AlphaSignalAgent v2.1
     Ultra-fast signal fusion: RL + trade memory weighting, Prometheus metrics,
     async event bus, LLM captioning, Redis DLQ, and provenance.
     """
@@ -71,7 +65,7 @@ class AlphaSignalAgent:
 
     async def connect(self):
         try:
-            self.redis = await aioredis.from_url(
+            self.redis = await redis_async.from_url(
                 self.redis_url, decode_responses=True
             )
             logger.info("[Nova] Connected to Redis.")
@@ -170,7 +164,7 @@ class AlphaSignalAgent:
                 timestamp=int(start.timestamp())
             )
 
-            await fire_event("alpha_signal", signal.dict())
+            await fire_plugin_event("alpha_signal", signal.dict())
             SIGNAL_LATENCY.observe((datetime.utcnow() - start).total_seconds())
             return signal
 
