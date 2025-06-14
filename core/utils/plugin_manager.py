@@ -1,206 +1,132 @@
-import importlib
+# File: telegram/commands/pnl_commands.py
+# Elite-tier PnL command router (aiogram)—image-first, extensible, and Alpha Engine ready.
+# Fully async, compressed image responses, LLM/mesh-aware captions, and telemetry.
+
+import os
 import logging
-import hashlib
-import asyncio
-from typing import Dict, Any, Optional, Callable, List
-from prometheus_client import Counter, Histogram
+import re
 import uuid
-from aiocache import Cache
+from aiogram import Router
+from aiogram.filters import Command
+from aiogram.types import Message
 
-# === Prometheus metrics ===
-PLUGIN_LOADS = Counter("plugin_loads_total", "Total plugins loaded")
-PLUGIN_ERRORS = Counter("plugin_errors_total", "Plugin load/runtime errors")
-PLUGIN_LATENCY = Histogram("plugin_latency_seconds", "Plugin execution latency")
-PLUGIN_DLQ = Counter("plugin_dlq_total", "Plugin DLQ events")
+from utils.pnl_renderer import generate_pnl_image, generate_pnl_card, get_pnl_history, get_token_stats
+from utils.plugin_manager import fire_plugin_event
+from core.signal_generation.reinforcement_learning import RLTrader  # Adding RL trader feedback
+from telegram.commands.commands import COMMANDS_EXECUTED, COMMANDS_FAILED
 
-FAILED_PLUGIN_DLQ = []
-plugin_event_hooks: List[Callable] = []
+logger = logging.getLogger("telegram_pnl_commands")
+router = Router()
 
-# === Cache Setup ===
-cache = Cache.from_url("redis://localhost:6379")
-cache.namespace = "nova_plugins"  # Setting the namespace after initializing the Cache
+# === Config ===
+ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "7545342838"))
 
-def register_plugin_event_hook(hook_fn: Callable):
-    plugin_event_hooks.append(hook_fn)
-
-async def fire_plugin_event(event_name: str, data: dict):
-    for hook in plugin_event_hooks:
-        try:
-            await hook(event_name, data)
-        except Exception as e:
-            log.warning(f"[Nova][PluginManager] Event hook failed: {e}")
-
-log = logging.getLogger("nova.plugin_manager")
-log.setLevel(logging.WARNING)  # Set the log level to WARNING to avoid unnecessary log flooding
-
-class PluginManager:
+def admin_only(func):
     """
-    Nova Pulse ALPHA: Full async mesh plugin manager—router, trade hooks, health, meta, confidence.
+    Decorator to ensure that only the admin can access the commands.
     """
-    def __init__(self):
-        self.plugins: Dict[str, Any] = {}
-        self.plugin_meta: Dict[str, dict] = {}
-        self.plugin_health: Dict[str, str] = {}
-        self.plugin_performance: Dict[str, Dict[str, dict]] = {}
-        self.plugins_by_type: Dict[str, List[str]] = {}
-        self.loop = asyncio.get_event_loop()
+    async def wrapper(message: Message, *args, **kwargs):
+        if message.from_user.id != ADMIN_CHAT_ID:
+            await message.reply("❌ Access denied. This bot is private.")
+            COMMANDS_FAILED.inc()
+            return
+        return await func(message, *args, **kwargs)
+    return wrapper
 
-    async def initialize(self, plugins: Optional[Dict[str, str]] = None):
-        """
-        Initialize all plugins from dict: {name: module_path}.
-        """
-        if plugins:
-            for name, module_path in plugins.items():
-                await self.load_plugin(name, module_path)
+def sanitize_symbol(text: str) -> str:
+    """
+    Sanitize input symbol to ensure no invalid characters.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "", text.upper())
 
-    async def load_plugin(self, name: str, module_path: str):
-        """
-        Load (or reload) a plugin module.
-        """
-        try:
-            PLUGIN_LOADS.inc()
-            async with PLUGIN_LATENCY.time():
-                mod = importlib.import_module(module_path)
-                self.plugins[name] = mod
-                meta = {
-                    "module": module_path,
-                    "version": getattr(mod, "__version__", "0.1.0"),
-                    "type": getattr(mod, "__type__", "unknown"),
-                    "capabilities": getattr(mod, "__capabilities__", []),
-                    "modes": getattr(mod, "__modes__", ["live", "sim"]),
-                    "confidence": 0.5
-                }
-                self.plugin_meta[name] = meta
-                self.plugin_health[name] = "healthy"
-                self.plugins_by_type.setdefault(meta["type"], []).append(name)
-                self.plugin_performance[name] = {}
+@router.message(Command("pnl"))
+@admin_only
+async def pnl_handler(message: Message):
+    """
+    Handler for fetching the PnL image for the user or specific symbol.
+    """
+    user_id = message.from_user.id
+    args = message.text.split()
+    symbol = sanitize_symbol(args[1]) if len(args) > 1 else None
+    trace_id = f"pnl-{uuid.uuid4().hex[:6]}"
 
-                if hasattr(mod, "__on_load__"):
-                    await mod.__on_load__()
+    try:
+        img = await generate_pnl_image(user=user_id, symbol=symbol)
+        caption = f"📈 PnL {f'for {symbol}' if symbol else ''}"
+        stats = await get_token_stats(symbol) if symbol else None
 
-                await fire_plugin_event("plugin_loaded", {"name": name, "module": module_path})
-                log.info(f"[Nova][PluginManager] Loaded plugin: {name} from {module_path}")
+        if stats and "cycle" in stats:
+            caption += f"\n⏳ Cycle: {stats['cycle']} | Win Rate: {stats.get('win_rate', 'N/A')}"
 
-        except Exception as e:
-            PLUGIN_ERRORS.inc()
-            PLUGIN_DLQ.inc()
-            FAILED_PLUGIN_DLQ.append({"name": name, "module": module_path, "error": str(e)})
-            self.plugin_health[name] = "error"
-            await fire_plugin_event("plugin_load_failed", {"name": name, "module": module_path, "error": str(e)})
-            log.error(f"[Nova][PluginManager] Plugin load failed: {name} from {module_path}: {e}")
+        await fire_plugin_event("cmd_pnl", {"user_id": user_id, "symbol": symbol, "trace_id": trace_id})
 
-    async def reload_plugin(self, name: str):
-        """
-        Reload a plugin in place.
-        """
-        if name in self.plugins:
-            path = self.plugins[name].__name__
-            del self.plugins[name]
-            await self.load_plugin(name, path)
+        await message.answer_photo(img, caption=caption)
+        logger.info(f"[PnL] Sent PnL image to user {user_id} for symbol={symbol}")
+    except Exception as e:
+        logger.error(f"[PnL] Failed to generate PnL image: {e}")
+        await message.answer("⚠️ Error generating PnL image.")
 
-    async def plugin_health_check(self):
-        """
-        Health check for all loaded plugins (calls .health() if present).
-        """
-        for name in self.plugins:
-            healthy = True
-            try:
-                getattr(self.plugins[name], "health", lambda: True)()
-            except Exception:
-                healthy = False
-            self.plugin_health[name] = "healthy" if healthy else "error"
-            await fire_plugin_event("plugin_health", {"name": name, "healthy": healthy})
+    COMMANDS_EXECUTED.inc()
 
-    async def pre_trade(self, signal: Dict[str, Any]):
-        """
-        Run all plugins with 'pre_trade' capability before trade execution.
-        """
-        for name, mod in self.plugins.items():
-            if "pre_trade" in self.plugin_meta.get(name, {}).get("capabilities", []):
-                try:
-                    signal.setdefault("trace_id", f"plugin-{uuid.uuid4().hex[:6]}")
-                    async with PLUGIN_LATENCY.time():
-                        await mod.pre_trade(signal)
-                except Exception as e:
-                    PLUGIN_ERRORS.inc()
-                    await fire_plugin_event("plugin_pre_trade_error", {"name": name, "error": str(e), "trace_id": signal.get("trace_id")})
+@router.message(Command("pnlcard"))
+@admin_only
+async def pnlcard_handler(message: Message):
+    """
+    Handler for generating the PnL card for the provided mint symbol.
+    """
+    args = message.text.split()
+    mint = args[1] if len(args) > 1 else None
+    trace_id = f"pnlcard-{uuid.uuid4().hex[:6]}"
 
-    async def post_trade(self, signal: Dict[str, Any], tx_result: Dict[str, Any]):
-        """
-        Run all plugins with 'post_trade' capability after trade execution.
-        """
-        for name, mod in self.plugins.items():
-            if "post_trade" in self.plugin_meta.get(name, {}).get("capabilities", []):
-                try:
-                    async with PLUGIN_LATENCY.time():
-                        await mod.post_trade(signal, tx_result)
-                except Exception as e:
-                    PLUGIN_ERRORS.inc()
-                    await fire_plugin_event("plugin_post_trade_error", {"name": name, "error": str(e), "trace_id": signal.get("trace_id")})
+    if not mint:
+        await message.answer("❗ Usage: /pnlcard <mint>")
+        COMMANDS_FAILED.inc()
+        return
 
-    async def plugin_feedback(self, name: str, coin: str, pnl: float, sl_hit: bool, trace_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        """
-        Log plugin PnL feedback and adjust confidence.
-        """
-        trace = trace_id or f"trace-{uuid.uuid4().hex[:8]}"
-        perf = self.plugin_performance.setdefault(name, {}).setdefault(coin, {"trades": 0, "pnl": 0, "sl_hits": 0})
-        perf["trades"] += 1
-        perf["pnl"] += pnl
-        if sl_hit:
-            perf["sl_hits"] += 1
-        delta = 0.01 if pnl > 0 else (-0.03 if sl_hit else -0.01)
-        confidence = self.plugin_meta[name]["confidence"]
-        self.plugin_meta[name]["confidence"] = max(0.0, min(1.0, confidence + delta))
-        await fire_plugin_event("plugin_feedback", {
-            "name": name,
-            "coin": coin,
-            "pnl": pnl,
-            "sl_hit": sl_hit,
-            "confidence": self.plugin_meta[name]["confidence"],
-            "trace_id": trace,
-            "meta": metadata or {}
-        })
+    try:
+        card = await generate_pnl_card(mint)
+        await fire_plugin_event("cmd_pnl_card", {"mint": mint, "trace_id": trace_id})
+        await message.answer_photo(card, caption=f"🃏 PnL Card for {mint}")
+        logger.info(f"[PnLCard] Sent PnL card for mint={mint} to user={message.from_user.id}")
+    except Exception as e:
+        logger.error(f"[PnLCard] Failed for mint={mint}: {e}")
+        await message.answer(f"❗ Could not generate card for {mint}")
 
-    async def plugin_signal(self, name: str, symbol: str, strength: float, strategy: str, trace_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
-        """
-        Fire a plugin-generated signal (for mesh/event/ops).
-        """
-        trace = trace_id or f"trace-{uuid.uuid4().hex[:8]}"
-        await fire_plugin_event("plugin_signal", {
-            "plugin": name,
-            "symbol": symbol,
-            "strength": strength,
-            "strategy": strategy,
-            "trace_id": trace,
-            "meta": meta or {}
-        })
+    COMMANDS_EXECUTED.inc()
 
-    def get_plugin(self, name: str, default: Any = None):
-        return self.plugins.get(name, default)
+@router.message(Command("pnlsummary"))
+@admin_only
+async def pnlsummary_handler(message: Message):
+    """
+    Handler for sending a summary of the PnL for the user or a symbol.
+    """
+    user_id = message.from_user.id
+    args = message.text.split()
+    symbol = sanitize_symbol(args[1]) if len(args) > 1 else None
+    trace_id = f"pnlsummary-{uuid.uuid4().hex[:6]}"
 
-    def get_router(self, venue: str) -> Optional[Callable]:
-        for name, mod in self.plugins.items():
-            if getattr(mod, "__type__", None) == "router" and hasattr(mod, "route"):
-                if venue in getattr(mod, "__venues__", [venue]):
-                    return mod.route
-        return None
+    try:
+        pnl_data = await get_pnl_history(user=user_id, symbol=symbol)
+        if pnl_data:
+            total = sum(item['pnl'] for item in pnl_data)
+            n = len(pnl_data)
+            avg = total / n if n > 0 else 0
+            msg = (
+                f"📊 PnL summary for {symbol or 'all'}:\n"
+                f"Total: {total:.2f}\n"
+                f"Trades: {n}\n"
+                f"Avg: {avg:.2f}"
+            )
+            await message.answer(msg)
+            await fire_plugin_event(
+                "cmd_pnl_summary",
+                {"user_id": user_id, "symbol": symbol, "total": total, "avg": avg, "trace_id": trace_id}
+            )
+            logger.info(f"[PnLSummary] Sent summary to user {user_id} for symbol={symbol}")
+        else:
+            await message.answer("📭 No trade data available for summary.")
+    except Exception as e:
+        logger.error(f"[PnLSummary] Error: {e}")
+        await message.answer("⚠️ Failed to fetch PnL summary.")
 
-    def plugin_audit_hash(self, name: str) -> str:
-        meta = self.plugin_meta.get(name, {})
-        m = hashlib.sha256()
-        m.update(str(meta).encode())
-        return m.hexdigest()
-
-    def get_plugin_health(self):
-        return self.plugin_health.copy()
-
-    def get_dlq(self):
-        return FAILED_PLUGIN_DLQ.copy()
-
-    def get_plugin_meta(self):
-        return self.plugin_meta.copy()
-
-    def list_plugins_by_type(self, type_filter: Optional[str] = None):
-        if type_filter:
-            return self.plugins_by_type.get(type_filter, [])
-        return self.plugins_by_type.copy()
+    COMMANDS_EXECUTED.inc()
