@@ -9,6 +9,9 @@ from prometheus_client import Counter, Histogram
 from core.signal_generation.ml_tp_sl import extract_features, predict_tp_sl, tpsl_rl_feedback as ml_feedback
 from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
 
+# --- Jupiter TP/SL plugin registration ---
+from utils.tpsl_jupiter_plugin import jupiter_tp_sl_plugin
+
 logger = logging.getLogger("nova.sl_manager")
 
 # === Prometheus Metrics ===
@@ -20,9 +23,11 @@ SLM_CACHE_HITS = Counter("slm_cache_hits_total", "SL Manager Cache Hits")
 # === Plugin registry for alternate TP/SL logic ===
 slm_plugins: Dict[str, Callable[[Dict[str, Any]], Awaitable[Tuple[float, float, dict]]]] = {}
 
-
 def register_slm_plugin(name: str, fn: Callable[[Dict[str, Any]], Awaitable[Tuple[float, float, dict]]]):
     slm_plugins[name] = fn
+
+# --- Register the Jupiter plugin under the name "jupiter" ---
+register_slm_plugin("jupiter", jupiter_tp_sl_plugin)
 
 # === Initialize Adaptive TPSL Instance ===
 adaptive_tp_sl = AdaptiveTPSL()  # Assumes defaults or injected dependencies
