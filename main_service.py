@@ -16,7 +16,6 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-# Utils & Core imports aligned with repo structure
 from utils.config import Config
 from core.wallet_management.wallet_manager import WalletManager
 from utils.trade_memory import TradeMemory
@@ -41,6 +40,11 @@ from utils.token_guardian import TokenGuardian
 from utils.trade_logger import log_trade
 from utils.dlq_manager import get_all_dlq, get_dlq_summary, replay_execution_dlq
 
+# --- Signal/Trade Card Imports ---
+from utils.signal_card import generate_signal_card
+from utils.pnl_card import generate_pnl_card
+from aiogram import Bot
+
 # === Settings ===
 class Settings(BaseSettings):
     WEBHOOK_URL: str
@@ -63,6 +67,9 @@ class Settings(BaseSettings):
 # Initialize settings and config
 settings = Settings()
 config = Config()
+
+# Telegram Bot (aiogram)
+bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
 # FastAPI app
 app = FastAPI(title="Nova Pulse Alpha", version="1.0.0")
@@ -104,9 +111,9 @@ auto_trader      = AutoTrader(
 )
 
 # Agent registry
-AGENT_REGISTRY: dict[str, Any] = {}
+AGENT_REGISTRY: dict[str, any] = {}
 
-def register_agent(name: str, agent_obj: Any):
+def register_agent(name: str, agent_obj: any):
     AGENT_REGISTRY[name] = agent_obj
 
 register_agent(
@@ -147,14 +154,11 @@ async def load_plugins_from_dir(directory: str = "core/plugins"):
     await plugin_manager.initialize(plugin_map)
     logging.info("🔌 Loaded plugins: %s", list(plugin_map.keys()))
 
-# Tracing and Logging
-
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-
 
 def setup_tracing():
     exporter = JaegerExporter(
@@ -166,7 +170,68 @@ def setup_tracing():
     trace.set_tracer_provider(provider)
     logging.info(f"✅ Jaeger tracing initialized on {settings.JAEGER_HOST}:{settings.JAEGER_PORT}")
 
-# Startup & Shutdown
+# --- Telegram card pushers ---
+async def push_signal_card(signal: dict):
+    try:
+        img = await generate_signal_card(signal)
+        caption = (
+            f"🚨 *Nova Pulse Signal*\n"
+            f"Symbol: {signal.get('symbol')}\n"
+            f"Confidence: {signal.get('score'):.2f}\n"
+            f"Entry: {signal.get('entry', 'N/A')}\n"
+            f"TP: {signal.get('tp', '...')} | SL: {signal.get('sl', '...')}\n"
+            f"@NovaPulseAI"
+        )
+        await bot.send_photo(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            photo=img,
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"[push_signal_card] Failed to send signal card: {e}")
+
+async def push_trade_card(signal: dict, execution: dict):
+    try:
+        img = await generate_signal_card({**signal, **execution, "executed": True})
+        caption = (
+            f"💸 *Trade Executed*\n"
+            f"Symbol: {signal.get('symbol')}\n"
+            f"Side: {execution.get('side', 'N/A')}\n"
+            f"Size: {execution.get('size', 'N/A')}\n"
+            f"Entry: {execution.get('entry', 'N/A')}\n"
+            f"TP: {execution.get('tp', '...')} | SL: {execution.get('sl', '...')}\n"
+            f"Status: {'✅ Success' if execution.get('success') else '❌ Fail'}\n"
+            f"@NovaPulseAI"
+        )
+        await bot.send_photo(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            photo=img,
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"[push_trade_card] Failed to send trade card: {e}")
+
+async def push_pnl_card(symbol: str):
+    try:
+        img = await generate_pnl_card(symbol)
+        caption = (
+            f"🏁 *Trade Closed*\n"
+            f"Symbol: {symbol}\n"
+            f"PnL Card: Shareable PnL snapshot below\n"
+            f"@NovaPulseAI"
+        )
+        await bot.send_photo(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            photo=img,
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"[push_pnl_card] Failed to send pnl card: {e}")
+
+# --- Startup & Shutdown ---
 @app.on_event("startup")
 async def startup_event():
     setup_logging()
@@ -182,7 +247,6 @@ async def startup_event():
     await explainer.connect()
     await auto_trader.connect()
     await execution_router.connect()
-
     await load_plugins_from_dir()
     asyncio.create_task(RLTrainerLoop(rl_tuner).start())
     asyncio.create_task(start_sl_watchdog(wallet_manager, trade_memory, execution_router))
@@ -196,7 +260,7 @@ async def startup_event():
             except Exception as e:
                 logging.error(f"Auto-trade loop error: {e}")
     asyncio.create_task(trade_loop())
-    
+
     await register_helius_webhook(settings)
     logging.info("✅ Nova Pulse Alpha LIVE with agents: %s", list(AGENT_REGISTRY.keys()))
 
@@ -258,17 +322,27 @@ async def generate_signal(request: Request):
     signals_counter.inc()
     agents_gauge.set(len(AGENT_REGISTRY))
 
+    # --- Broadcast and push signal card to Telegram ---
     fused_signal = await adaptive_signal_fusion(symbol, agent_results)
     await ws_manager.broadcast(fused_signal)
+    await push_signal_card(fused_signal)  # <-- Signal card sent here
 
+    # --- Trade execution and trade card ---
     execution = await execution_router.execute_trade(fused_signal, user_id="telegram")
     fused_signal["execution"] = execution
+    await push_trade_card(fused_signal, execution)  # <-- Trade card sent here
+
+    # --- Log and update ---
     await log_trade(
         fused_signal["symbol"], execution.get("side"), execution.get("size"),
         execution.get("entry"), execution.get("exit"), execution.get("pnl"),
         rationale="fused signal auto-trade", user="telegram"
     )
     await push_trade_update(fused_signal)
+
+    # --- If trade is closed, push PnL card ---
+    if execution.get("success") and execution.get("exit"):
+        await push_pnl_card(fused_signal["symbol"])
 
     return fused_signal
 
