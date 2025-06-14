@@ -1,112 +1,157 @@
-import logging
-from typing import Dict, Any, List
-from solana.rpc.async_api import AsyncClient
-from solana.publickey import PublicKey
+# Nova Pulse ALPHA – OrderBookOverlay 2.0
+# -------------------------------------------------------------
+# • Live L2 order‑book depth for ANY SPL token via Jupiter API
+# • Solana‑native (no mock RPC) – works on Raydium/OpenBook pools
+# • Async, cache‑aware, Prometheus instrumented, SHA‑256 provenance
+# • Plug‑ready for CombinedSignalEngine → slippage / TP‑SL logic
+# -------------------------------------------------------------
+
+from __future__ import annotations
+
 import asyncio
+import hashlib
+import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from prometheus_client import Counter, Histogram
 
 logger = logging.getLogger("nova.orderbook_overlay")
+logger.setLevel(logging.INFO)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Prometheus Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+OB_FETCH         = Counter("orderbook_fetch_total", "Total Jupiter order‑book pulls")
+OB_ERRORS        = Counter("orderbook_errors_total", "Order‑book fetch/parse errors")
+OB_LATENCY       = Histogram("orderbook_latency_seconds", "Latency of order‑book pulls")
+OB_CACHE_HITS    = Counter("orderbook_cache_hits_total", "Cache hits (≤ ttl)")
+OB_CACHE_MISSES  = Counter("orderbook_cache_miss_total", "Cache misses (> ttl)")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# In‑mem cache (key → (timestamp, depth)) – ttl default 10 s
+# ────────────────────────────────────────────────────────────────────────────────
+_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_CACHE_TTL = 10.0  # seconds
+_CACHE_LOCK = asyncio.Lock()
+
+# Jupiter v6 order‑book endpoint (pairAddress param)
+JUP_OB_URL = "https://quote-api.jup.ag/v6/orderbook/{market}"
+
+# depth_n controls how many levels we keep (Jupiter returns top 20 by default)
+DEFAULT_DEPTH_N = 20
+
+# -----------------------------------------------------------------------------
+# helper: provenance hash (for audits)
+# -----------------------------------------------------------------------------
+
+def _hash(data: Dict[str, Any]) -> str:
+    return hashlib.sha256(str(data).encode()).hexdigest()
+
+# -----------------------------------------------------------------------------
+# OrderBookOverlay class
+# -----------------------------------------------------------------------------
 
 class OrderBookOverlay:
-    """
-    Elite OrderBookOverlay - Monitors and analyzes the order book data (market depth)
-    for on-chain tokens, detecting large price movements and market trends.
+    """Pulls live L2 depth from Jupiter for a Raydium/OpenBook market address.
+
+    Args:
+        market (str): *On‑chain* market address (a.k.a. Serum/OpenBook market).
     """
 
-    def __init__(self, rpc_url: str, symbol: str, depth_threshold: float = 100.0):
-        """
-        Initialize the OrderBookOverlay object.
-
-        :param rpc_url: URL of the Solana or Ethereum RPC node.
-        :param symbol: The trading symbol (e.g., 'SOL/USDT').
-        :param depth_threshold: Threshold for detecting significant order book imbalances.
-        """
-        self.rpc_url = rpc_url
-        self.symbol = symbol
+    def __init__(
+        self,
+        market: str,
+        *,
+        depth_threshold: float = 1000.0,  # SOL‑notional imbalance threshold
+        depth_n: int = DEFAULT_DEPTH_N,
+        ttl: float = _CACHE_TTL,
+    ) -> None:
+        self.market = market
         self.depth_threshold = depth_threshold
-        self.client = AsyncClient(rpc_url)
+        self.depth_n = depth_n
+        self.ttl = ttl
 
-    async def fetch_order_book(self) -> Dict[str, Any]:
-        """
-        Fetch the current order book for a given symbol (e.g., 'SOL/USDT').
+    # ────────────────────────────────────────────────────────────────────────
+    # public async API
+    # ────────────────────────────────────────────────────────────────────────
+    async def get_orderbook_data(self) -> Dict[str, Any]:
+        """Return cached (or freshly‑fetched) order‑book depth dict."""
+        async with _CACHE_LOCK:
+            ts, data = _CACHE.get(self.market, (0.0, {}))
+            if time.time() - ts < self.ttl and data:
+                OB_CACHE_HITS.inc()
+                return data
+            OB_CACHE_MISSES.inc()
 
-        :return: A dictionary containing bid and ask orders.
-        """
-        try:
-            # Fetch the order book from the RPC (for Solana or Ethereum)
-            public_key = PublicKey(self.symbol)  # This can vary based on your symbol
-            order_book_data = await self.client.get_orderbook(public_key)
+        # cache miss → pull from Jupiter
+        async with OB_LATENCY.time():
+            try:
+                async with httpx.AsyncClient(timeout=8) as client:
+                    url = JUP_OB_URL.format(market=self.market)
+                    r = await client.get(url)
+                    r.raise_for_status()
+                    raw = r.json()
+            except Exception as e:
+                OB_ERRORS.inc()
+                logger.error("[OrderBookOverlay] fetch error %s: %s", self.market, e)
+                return {}
 
-            logger.info(f"Fetched order book for {self.symbol}")
-            return order_book_data
-        except Exception as e:
-            logger.error(f"Error fetching order book for {self.symbol}: {e}")
-            return {}
+        depth = self._parse_depth(raw)
 
-    async def analyze_market_depth(self, order_book_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analyze the market depth (order book) to detect large price imbalances.
+        async with _CACHE_LOCK:
+            _CACHE[self.market] = (time.time(), depth)
 
-        :param order_book_data: The order book data (bids/asks) to analyze.
-        :return: A dictionary with market depth insights.
-        """
-        total_bid = sum(order["price"] * order["size"] for order in order_book_data["bids"])
-        total_ask = sum(order["price"] * order["size"] for order in order_book_data["asks"])
+        return depth
 
-        imbalance = total_bid - total_ask
-        market_trend = "neutral"
+    async def get_orderbook_summary(self) -> Dict[str, Any]:
+        """Shortcut: returns trend + imbalance for signal engines."""
+        depth = await self.get_orderbook_data()
+        return self._analyse(depth)
 
+    # ------------------------------------------------------------------
+    # internal parsing / analytics helpers
+    # ------------------------------------------------------------------
+
+    def _parse_depth(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert Jupiter JSON → {bids:[(p,q)], asks:[(p,q)]}."""
+        book = {"bids": [], "asks": []}
+        for side in ("bids", "asks"):
+            for lvl in raw.get(side, [])[: self.depth_n]:
+                book[side].append((float(lvl["price"]), float(lvl["size"])))
+        return book
+
+    def _analyse(self, depth: Dict[str, Any]) -> Dict[str, Any]:
+        if not depth.get("bids") or not depth.get("asks"):
+            return {"imbalance_score": 0.0, "trend": "neutral", "hash": _hash(depth)}
+
+        bid_notional = sum(p * q for p, q in depth["bids"])
+        ask_notional = sum(p * q for p, q in depth["asks"])
+        imbalance = bid_notional - ask_notional
+        trend = "neutral"
         if imbalance > self.depth_threshold:
-            market_trend = "bullish"
+            trend = "bullish"
         elif imbalance < -self.depth_threshold:
-            market_trend = "bearish"
+            trend = "bearish"
 
-        logger.info(f"Market Trend for {self.symbol}: {market_trend} | Bid-Ask Imbalance: {imbalance}")
         return {
-            "symbol": self.symbol,
-            "market_trend": market_trend,
-            "imbalance": imbalance,
+            "imbalance_score": imbalance,
+            "trend": trend,
+            "depth_n": self.depth_n,
+            "hash": _hash(depth),
         }
 
-    async def get_order_book_summary(self) -> Dict[str, Any]:
-        """
-        Get a summarized view of the current order book and market depth.
+# -----------------------------------------------------------------------------
+# Example CLI (run with:  python -m core.data_collection.orderbook_overlay <market>)
+# -----------------------------------------------------------------------------
 
-        :return: A summary of the order book (market trend, imbalance, etc.).
-        """
-        order_book_data = await self.fetch_order_book()
-        if not order_book_data:
-            return {}
+if __name__ == "__main__":
+    import sys, asyncio, pprint
 
-        summary = await self.analyze_market_depth(order_book_data)
-        return summary
+    if len(sys.argv) < 2:
+        print("Usage: python -m core.data_collection.orderbook_overlay <marketAddress>")
+        sys.exit(1)
 
-    async def track_significant_price_movement(self, previous_price: float, current_price: float) -> bool:
-        """
-        Track significant price movement based on current and previous prices.
-
-        :param previous_price: The price from the previous check.
-        :param current_price: The current price from the order book.
-        :return: Boolean indicating if a significant price movement occurred.
-        """
-        price_change = abs(current_price - previous_price) / previous_price
-        significant_movement = price_change >= 0.05  # 5% price movement threshold for "significant"
-
-        if significant_movement:
-            logger.info(f"Significant price movement detected for {self.symbol}: {price_change * 100:.2f}%")
-        return significant_movement
-
-# Example Usage
-async def run_example():
-    rpc_url = "https://api.mainnet-beta.solana.com"
-    symbol = "SOL/USDT"
-    orderbook = OrderBookOverlay(rpc_url=rpc_url, symbol=symbol)
-
-    # Get order book summary for the symbol
-    order_book_summary = await orderbook.get_order_book_summary()
-    print(order_book_summary)
-
-    # Track significant price movements
-    previous_price = 120.0
-    current_price = 125.0
-    is_significant = await orderbook.track_significant_price_movement(previous_price, current_price)
-    print(f"Significant movement: {is_significant}")
+    ob = OrderBookOverlay(sys.argv[1])
+    pprint.pp(asyncio.run(ob.get_orderbook_summary()))
