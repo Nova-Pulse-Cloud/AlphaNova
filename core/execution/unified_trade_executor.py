@@ -40,7 +40,6 @@ EXECUTION_ERRORS  = Counter("trade_execution_errors_total", "Trade execution fai
 # DLQ (in‑mem)
 FAILED_EXEC_DLQ: list[Dict[str, Any]] = []
 
-
 class UnifiedTradeExecutor:
     """High‑level façade that wires every subsystem into a single `execute()` call."""
 
@@ -76,7 +75,6 @@ class UnifiedTradeExecutor:
         """End‑to‑end execution for **one** trading signal."""
         trace_id = signal.get("trace_id") or str(uuid.uuid4())
         logger.info(f"[UTE:{trace_id}] Start — {signal}")
-
         with EXECUTION_LATENCY.time():
             try:
                 # ----------------------------------------------------------------
@@ -86,11 +84,9 @@ class UnifiedTradeExecutor:
                 if trust.risk > self.cfg.MAX_RISK_THRESHOLD:
                     EXECUTION_SKIPS.inc()
                     return {"status": "skipped", "reason": "risk", "trace_id": trace_id}
-
                 if not await self.market.is_favorable(signal["symbol"]):
                     EXECUTION_SKIPS.inc()
                     return {"status": "skipped", "reason": "market", "trace_id": trace_id}
-
                 # ----------------------------------------------------------------
                 # 2️⃣ RL Action
                 # ----------------------------------------------------------------
@@ -99,7 +95,6 @@ class UnifiedTradeExecutor:
                 if action in (0, "hold"):
                     return {"status": "held", "trace_id": trace_id}
                 side = "buy" if action in (1, "enter") else "sell"
-
                 # ----------------------------------------------------------------
                 # 3️⃣ Routing & Execution
                 # ----------------------------------------------------------------
@@ -110,13 +105,11 @@ class UnifiedTradeExecutor:
                     trace_id=trace_id,
                 )
                 EXECUTIONS.inc()
-
                 # ----------------------------------------------------------------
                 # 4️⃣ Post‑processing (LLM explanation + PnL card)
                 # ----------------------------------------------------------------
                 rationale = await self.explainer.explain_signal(signal)
                 pnl_card  = await generate_pnl_card(signal["symbol"])
-
                 # ----------------------------------------------------------------
                 # 5️⃣ Persistence / Rewards / Mesh / Plugins
                 # ----------------------------------------------------------------
@@ -132,7 +125,6 @@ class UnifiedTradeExecutor:
                 await self.mesh.log_trade(record, signal)
                 if hasattr(self.plugins, "post_trade"):
                     await self.plugins.post_trade(signal, tx)
-
                 exec_hash = hashlib.sha256(f"{signal['symbol']}:{side}:{trace_id}".encode()).hexdigest()
                 return {
                     "status"   : "executed",
@@ -141,7 +133,6 @@ class UnifiedTradeExecutor:
                     "rationale": rationale,
                     "execution_hash": exec_hash,
                 }
-
             except Exception as e:
                 EXECUTION_ERRORS.inc()
                 logger.exception(f"[UTE:{trace_id}] Fatal: {e}")
