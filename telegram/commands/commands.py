@@ -1,6 +1,5 @@
 # File: telegram/commands/commands.py
-# 🚀 Nova Pulse ALPHA – telegram/commands.py
-# Elite async commands for Nova Pulse, integrated with RL, event-driven execution, full AI, and live trade ops
+# 🚀 Nova Pulse ALPHA – Elite async commands for Nova Pulse
 
 import os
 import logging
@@ -109,7 +108,7 @@ async def signalcard_handler(message: Message):
         COMMANDS_FAILED.inc()
         return
     symbol = args[1].upper()
-    img = await generate_signal_card(symbol)
+    img = await generate_signal_card({"symbol": symbol})
     await fire_plugin_event("cmd_signal_card", {"symbol": symbol})
     await message.answer_photo(img, caption=f"🎴 Signal Card for {symbol}")
     COMMANDS_EXECUTED.inc()
@@ -166,7 +165,7 @@ async def whales_handler(message: Message):
     await message.answer(f"🐋 *Latest Whale Token Swaps:*\n{msg}", parse_mode="Markdown")
     COMMANDS_EXECUTED.inc()
 
-# === Alpha Command ===
+# === Alpha Command (Upgraded: sends both signal and card) ===
 @router.message(Command("alpha"))
 @admin_only
 async def alpha_handler(message: Message):
@@ -178,12 +177,16 @@ async def alpha_handler(message: Message):
         return
     symbol = args[1].upper()
     result = await engine.generate_signal(symbol, user=message.from_user.id)
+    # Send the main signal result
     if "composite" in result and "signal_strength" in result["composite"]:
         s_strength = result["composite"]["signal_strength"]
         await message.answer(
             f"🚀 *Alpha Signal for {symbol}:* {s_strength:.2f}",
             parse_mode="Markdown"
         )
+        # Also send signal card (elite upgrade: pass full composite object)
+        card_img = await generate_signal_card(result["composite"])
+        await message.answer_photo(card_img, caption=f"🎴 Nova Pulse AI Card for {symbol}")
     else:
         await message.answer(f"⚠️ No alpha signal available for {symbol}")
     COMMANDS_EXECUTED.inc()
@@ -294,7 +297,7 @@ async def help_handler(message: Message):
         "/stats <SYMBOL> — Token memory stats\n"
         "/social — Twitter trending tokens\n"
         "/whales — Whale swaps\n"
-        "/alpha <SYMBOL> — Generate and view alpha signal\n"
+        "/alpha <SYMBOL> — Generate and view alpha signal (plus custom card)\n"
         "/explain <SYMBOL> — AI-powered explanation\n"
         "/auto — Toggle auto-trading\n"
         "/status — Auto mode status\n"
