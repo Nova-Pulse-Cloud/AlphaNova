@@ -1,4 +1,5 @@
 # File: core/signal_generation/sl_watchdog.py
+# 🚀 Nova Pulse ALPHA – SL/TP Watchdog: Ultra-Reliable Position Sentinel
 
 import asyncio
 import logging
@@ -10,8 +11,8 @@ from core.execution.execution_router import ExecutionRouter
 from utils.trade_memory import TradeMemory
 from prometheus_client import Counter, Histogram
 
-log = logging.getLogger("sl_watchdog")
-log.setLevel(logging.INFO)
+logger = logging.getLogger("nova.sl_watchdog")
+logger.setLevel(logging.INFO)
 
 # === Prometheus Metrics ===
 SL_WATCHDOG_ERRORS  = Counter("sl_watchdog_errors_total", "SL Watchdog errors")
@@ -21,7 +22,7 @@ SL_WATCHDOG_LATENCY = Histogram("sl_watchdog_latency_seconds", "SL/TP watch late
 POLL_INTERVAL = 8  # Seconds between price checks
 
 async def get_live_price(symbol: str) -> float:
-    """Fetch live price using CoinGecko API, with retries and exponential backoff."""
+    """Fetch live price from CoinGecko (use utils.pricing_utils if available)."""
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol.lower()}&vs_currencies=usd"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -29,7 +30,7 @@ async def get_live_price(symbol: str) -> float:
             resp.raise_for_status()
             return resp.json()[symbol.lower()]["usd"]
     except Exception as e:
-        log.warning(f"[SL Watchdog] Price fetch error for {symbol}: {e}")
+        logger.warning(f"[SL Watchdog] Price fetch error for {symbol}: {e}")
         SL_WATCHDOG_ERRORS.inc()
         raise
 
@@ -48,9 +49,8 @@ async def monitor_open_positions(
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
-            log.warning(f"[SL Watchdog] Monitoring loop error: {e}")
+            logger.warning(f"[SL Watchdog] Monitoring loop error: {e}")
             SL_WATCHDOG_ERRORS.inc()
-
         await asyncio.sleep(POLL_INTERVAL)
 
 async def monitor_trade(
@@ -60,11 +60,12 @@ async def monitor_trade(
     execution_router: ExecutionRouter
 ):
     """Watch a single trade for TP/SL hits and auto-close if triggered."""
-    symbol = trade.symbol
-    entry  = trade.entry
-    sl     = trade.sl
-    tp     = trade.tp
-    side   = trade.side
+    symbol = getattr(trade, "symbol", None)
+    entry  = getattr(trade, "entry", None)
+    sl     = getattr(trade, "sl", None)
+    tp     = getattr(trade, "tp", None)
+    side   = getattr(trade, "side", None)
+    user   = getattr(trade, "user", None)
 
     start = asyncio.get_event_loop().time()
     try:
@@ -78,7 +79,7 @@ async def monitor_trade(
 
     if hit_tp or hit_sl:
         reason = "tp" if hit_tp else "sl"
-        log.info(f"[SL Watchdog] Hit {reason} on {symbol} | entry={entry} | price={price}")
+        logger.info(f"[SL Watchdog] Hit {reason} on {symbol} | entry={entry} | price={price}")
 
         signal = {
             "symbol": symbol,
@@ -89,12 +90,11 @@ async def monitor_trade(
             "reason": reason,
             "price": price,
         }
-
         try:
-            await execution_router.execute_trade(signal, user_id=getattr(trade, "user", None))
+            await execution_router.execute_trade(signal, user_id=user)
             SL_WATCHDOG_HITS.inc()
         except Exception as exec_err:
-            log.error(f"[SL Watchdog] Auto-close failed for {symbol}: {exec_err}")
+            logger.error(f"[SL Watchdog] Auto-close failed for {symbol}: {exec_err}")
             SL_WATCHDOG_ERRORS.inc()
     finally:
         SL_WATCHDOG_LATENCY.observe(asyncio.get_event_loop().time() - start)
@@ -105,7 +105,7 @@ async def start_sl_watchdog(
     execution_router: ExecutionRouter
 ):
     """Kick off the SL/TP watchdog in the background."""
-    log.info("🧠 Starting SL/TP Watchdog...")
+    logger.info("🧠 Starting SL/TP Watchdog...")
     asyncio.create_task(
         monitor_open_positions(wallet_manager, trade_memory, execution_router)
     )
