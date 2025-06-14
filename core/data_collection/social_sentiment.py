@@ -1,188 +1,220 @@
-# core/social_sentiment.py (merged: operational + pro, async, mesh, plugin, metrics, DLQ, audit, ops, simulation, RL)
+"""
+Nova Pulse ALPHA – Live Social‑Sentiment Streamer
+──────────────────────────────────────────────────
+•  Listens to a Redis pub/sub channel of raw social‑media & on‑chain
+   sentiment signals (produced by upstream scrapers / agents).
+•  Scores each payload with a plug‑in registry (default: weighted aggregate).
+•  Emits high‑confidence alerts (+/‑) to an outbound Redis channel *and*
+   fires in‑process hooks for downstream modules (alpha‑agent, Telegram, …).
+•  Prometheus instrumentation, DLQ buffering, audit‑hash provenance.
+•  **No placeholders** – every call is wired for production.
+"""
+from __future__ import annotations
+
 import asyncio
-import logging
-import aioredis
-import openai
 import hashlib
 import json
-from typing import Dict, Any, Optional, Callable, List
+import logging
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+import aioredis
+import openai
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
-logger = logging.getLogger("social_sentiment")
+from utils.config import Config  # pulls OPENAI key / Redis URL
+from utils.plugin_manager import fire_plugin_event  # cross‑module event bus
 
-# === Prometheus metrics ===
-SENTIMENT_SCAN_REQUESTS = Counter("sentiment_scan_requests_total", "Total social sentiment scans")
-SENTIMENT_ALERTS = Counter("sentiment_alerts_total", "Total sentiment alerts detected")
-SENTIMENT_ERRORS = Counter("sentiment_errors_total", "Social sentiment errors")
-SENTIMENT_LATENCY = Histogram("sentiment_latency_seconds", "Latency of sentiment computations")
-SENTIMENT_DLQ = Counter("sentiment_dlq_total", "Social sentiment DLQ events")
+logger = logging.getLogger("nova.social_sentiment")
+logger.setLevel(logging.INFO)
 
-# === DLQ, plugin/event system ===
-FAILED_SENTIMENT_DLQ = []
-sentiment_event_hooks = []
-sentiment_plugins = {}
+# ───────────────────────────────────────────────────────────────────────────────
+# Prometheus Metrics
+# ───────────────────────────────────────────────────────────────────────────────
+SENTIMENT_REQS   = Counter("sentiment_requests_total", "Payloads processed")
+SENTIMENT_ALERTS = Counter("sentiment_alerts_total", "High‑confidence alerts")
+SENTIMENT_ERRS   = Counter("sentiment_errors_total", "Processing errors")
+SENTIMENT_LAT    = Histogram("sentiment_latency_seconds", "End‑to‑end latency")
+SENTIMENT_DLQ    = Counter("sentiment_dlq_total", "Failed emissions to DLQ")
 
-def register_sentiment_plugin(name: str, fn: Callable):
-    sentiment_plugins[name] = fn
+# ───────────────────────────────────────────────────────────────────────────────
+# In‑memory DLQ
+# ───────────────────────────────────────────────────────────────────────────────
+_FAILED_DLQ: List[Dict[str, Any]] = []
 
-def register_sentiment_event_hook(hook_fn):
-    sentiment_event_hooks.append(hook_fn)
+# ───────────────────────────────────────────────────────────────────────────────
+# Plug‑in & Event infrastructure
+# ───────────────────────────────────────────────────────────────────────────────
+PLUGIN_REGISTRY: Dict[str, Callable[[Dict[str, Any], bool], Awaitable[float]]] = {}
+EVENT_HOOKS: List[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
 
-async def fire_sentiment_event(event_name, data):
-    for hook in sentiment_event_hooks:
-        await hook(event_name, data)
+def register_sentiment_plugin(name: str, fn: Callable[[Dict[str, Any], bool], Awaitable[float]]):
+    PLUGIN_REGISTRY[name] = fn
 
-def sentiment_hash(ctx: dict, result: dict) -> str:
-    m = hashlib.sha256()
-    m.update(json.dumps(ctx, sort_keys=True).encode())
-    m.update(json.dumps(result, sort_keys=True).encode())
-    return m.hexdigest()
+def register_sentiment_event_hook(fn: Callable[[str, Dict[str, Any]], Awaitable[None]]):
+    EVENT_HOOKS.append(fn)
 
+async def _fire_event(name: str, data: Dict[str, Any]):
+    # internal + global plugin bus
+    for hook in EVENT_HOOKS:
+        try:
+            await hook(name, data)
+        except Exception as exc:
+            logger.error("[Sentiment] Event hook %s failed: %s", hook.__name__, exc)
+    # outward facing global bus
+    await fire_plugin_event(name, data)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Helper – audit hash
+# ───────────────────────────────────────────────────────────────────────────────
+
+def _audit_hash(ctx: Dict[str, Any], score: float) -> str:
+    return hashlib.sha256(json.dumps({**ctx, "score": score}, sort_keys=True).encode()).hexdigest()
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Pydantic DTO
+# ───────────────────────────────────────────────────────────────────────────────
 class SentimentAlert(BaseModel):
     symbol: str
     sentiment_score: float
     ai_caption: str
-    details: Dict[str, Any]
-    timestamp: int
+    raw: Dict[str, Any]
+    timestamp: int = Field(default_factory=lambda: int(asyncio.get_event_loop().time()))
     audit_hash: str
     plugin: str = "default"
     simulation: bool = False
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Main class
+# ───────────────────────────────────────────────────────────────────────────────
 class SocialSentiment:
+    """Live sentiment processor – subscribes, scores, publishes."""
+
     def __init__(
         self,
-        redis_url: str,
-        openai_api_key: str,
-        sentiment_channel: str = "sentiment_signals",
-        output_channel: str = "sentiment_alerts",
+        cfg: Optional[Config] = None,
+        *,
+        in_channel: str = "sentiment_signals",
+        out_channel: str = "sentiment_alerts",
         cache_ttl: int = 900,
-        plugins: Optional[Dict[str, Callable]] = None,
-    ):
-        self.redis_url = redis_url
-        self.sentiment_channel = sentiment_channel
-        self.output_channel = output_channel
+    ) -> None:
+        self.cfg = cfg or Config()
+        self.redis_url = self.cfg.REDIS_URL
+        self.in_channel = in_channel
+        self.out_channel = out_channel
         self.cache_ttl = cache_ttl
-        self.redis = None
-        openai.api_key = openai_api_key
-        self.plugins = plugins or {}
-        register_sentiment_plugin("default", self._sentiment_score)
+        self._redis: aioredis.Redis | None = None
 
+        # OpenAI key configured via Config – use sync client inside executor
+        openai.api_key = self.cfg.OPENAI_API_KEY
+
+        # register default plugin
+        register_sentiment_plugin("default", self._default_score)
+
+    # ── Connection helpers ──────────────────────────────────────────────────
     async def connect(self):
-        self.redis = await aioredis.from_url(self.redis_url)
-        logger.info("SocialSentiment connected to Redis.")
+        self._redis = await aioredis.from_url(self.redis_url, decode_responses=True)
+        logger.info("[SocialSentiment] Connected to Redis @ %s", self.redis_url)
 
     async def disconnect(self):
-        await self.redis.close()
-        logger.info("SocialSentiment disconnected.")
+        if self._redis:
+            await self._redis.close()
+            logger.info("[SocialSentiment] Redis connection closed")
 
-    async def process_stream(self, plugin: str = "default", simulation: bool = False):
-        pubsub = self.redis.pubsub()
-        await pubsub.subscribe(self.sentiment_channel)
-        logger.info("SocialSentiment subscribed to channel.")
-        async for message in pubsub.listen():
-            if message["type"] != "message":
+    # ── Stream consumer ─────────────────────────────────────────────────────
+    async def run(self, plugin: str = "default", *, simulation: bool = False):
+        assert self._redis, "call connect() first"
+        pubsub = self._redis.pubsub()
+        await pubsub.subscribe(self.in_channel)
+        logger.info("[SocialSentiment] Subscribed to %s", self.in_channel)
+
+        async for msg in pubsub.listen():
+            if msg.get("type") != "message":
                 continue
-            SENTIMENT_SCAN_REQUESTS.inc()
+            SENTIMENT_REQS.inc()
             try:
-                data = self._parse_message(message)
-                if data:
-                    await self.handle_signal(data, plugin=plugin, simulation=simulation)
-            except Exception as e:
-                SENTIMENT_ERRORS.inc()
-                logger.error(f"Sentiment processing error: {e}")
+                payload = json.loads(msg["data"] if isinstance(msg["data"], str) else msg["data"].decode())
+                await self._handle_payload(payload, plugin=plugin, simulation=simulation)
+            except Exception as exc:
+                SENTIMENT_ERRS.inc()
+                logger.error("[SocialSentiment] Processing error: %s", exc)
 
-    def _parse_message(self, message):
-        try:
-            channel = message.get("channel")
-            if not isinstance(channel, str):
-                channel = channel.decode()
-            payload = message["data"]
-            if isinstance(payload, bytes):
-                payload = payload.decode()
-            data = eval(payload) if isinstance(payload, str) else payload
-            data["channel"] = channel
-            return data
-        except Exception:
-            return None
-
-    async def handle_signal(self, data: Dict[str, Any], plugin: str = "default", simulation: bool = False):
+    # ── Core handler ────────────────────────────────────────────────────────
+    async def _handle_payload(self, data: Dict[str, Any], *, plugin: str, simulation: bool):
         symbol = data.get("symbol")
         if not symbol:
             return
 
-        with SENTIMENT_LATENCY.time():
-            # Use plugin registry for custom scoring
-            plugin_fn = sentiment_plugins.get(plugin, self._sentiment_score)
-            sentiment_score = await plugin_fn(data, simulation=simulation)
+        async with SENTIMENT_LAT.time():
+            # score
+            score_fn = PLUGIN_REGISTRY.get(plugin, self._default_score)
+            score = await score_fn(data, simulation)
 
-            if abs(sentiment_score) > 0.7:
-                SENTIMENT_ALERTS.inc()
-                ai_caption = await self._ai_caption(symbol, sentiment_score)
-                alert = SentimentAlert(
-                    symbol=symbol,
-                    sentiment_score=sentiment_score,
-                    ai_caption=ai_caption,
-                    details=data,
-                    timestamp=int(asyncio.get_event_loop().time()),
-                    audit_hash=sentiment_hash(data, {"sentiment_score": sentiment_score}),
-                    plugin=plugin,
-                    simulation=simulation,
-                )
-                try:
-                    await self._emit_alert(alert)
-                    await fire_sentiment_event("sentiment_alert", alert.dict())
-                except Exception as e:
-                    SENTIMENT_DLQ.inc()
-                    FAILED_SENTIMENT_DLQ.append({"data": data, "error": str(e)})
-                    logger.error(f"Sentiment alert emission failed: {e}")
+        if abs(score) < 0.7:  # threshold – tweakable
+            return
 
-    async def _sentiment_score(self, data: Dict[str, Any], simulation: bool = False):
-        # Example: Use social, news, and on-chain scores if present
-        social = float(data.get("social_score", 0.0))
-        news = float(data.get("news_score", 0.0))
-        onchain = float(data.get("onchain_score", 0.0))
-        aggregate = (0.6 * social) + (0.3 * news) + (0.1 * onchain)
-        if simulation:
-            aggregate *= 0.95
-        return max(-1.0, min(aggregate, 1.0))
+        SENTIMENT_ALERTS.inc()
+        caption = await self._caption(symbol, score)
+        alert = SentimentAlert(
+            symbol=symbol,
+            sentiment_score=score,
+            ai_caption=caption,
+            raw=data,
+            audit_hash=_audit_hash(data, score),
+            plugin=plugin,
+            simulation=simulation,
+        )
+        await self._emit(alert)
 
-    async def _ai_caption(self, symbol, sentiment_score):
+    # ── Default scoring plug‑in ─────────────────────────────────────────────
+    async def _default_score(self, data: Dict[str, Any], simulation: bool) -> float:
+        social = float(data.get("social_score", 0))
+        news = float(data.get("news_score", 0))
+        onchain = float(data.get("onchain_score", 0))
+        score = 0.6 * social + 0.3 * news + 0.1 * onchain
+        return score * (0.95 if simulation else 1.0)
+
+    # ── OpenAI caption helper ───────────────────────────────────────────────
+    async def _caption(self, symbol: str, score: float) -> str:
         prompt = (
             f"Symbol: {symbol}\n"
-            f"Sentiment Score: {sentiment_score:.2f}\n"
-            "Write a one-sentence alert for traders about this sentiment signal:"
+            f"Sentiment Score: {score:+.2f}\n"
+            "Write an urgent, one‑line trader alert with an emoji:"  # style prompt
         )
         try:
-            response = await asyncio.to_thread(
+            resp = await asyncio.to_thread(
                 lambda: openai.ChatCompletion.create(
-                    model="gpt-4o-mini",
+                    model="gpt-3.5-turbo",
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=50,
+                    max_tokens=40,
                     temperature=0.7,
                 )
             )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning(f"AI caption error: {e}")
-            return f"Sentiment alert: {symbol}, score {sentiment_score:.2f}"
+            return resp.choices[0].message.content.strip()
+        except Exception as exc:
+            logger.warning("[Sentiment] Caption fallback: %s", exc)
+            return f"Sentiment alert for {symbol} ({score:+.2f})"
 
-    async def _emit_alert(self, alert: SentimentAlert):
-        await self.redis.publish(self.output_channel, alert.json())
-        await self.redis.set(
-            f"sentiment:{alert.symbol}:{alert.timestamp}",
-            alert.json(),
-            ex=self.cache_ttl,
-        )
-        logger.info(f"Sentiment alert emitted for {alert.symbol}")
+    # ── Emit alert to Redis + hooks ─────────────────────────────────────────
+    async def _emit(self, alert: SentimentAlert):
+        try:
+            assert self._redis, "Redis not connected"
+            await self._redis.publish(self.out_channel, alert.json())
+            await self._redis.set(f"sentiment:{alert.symbol}:{alert.timestamp}", alert.json(), ex=self.cache_ttl)
+            await _fire_event("sentiment_alert", alert.dict())
+        except Exception as exc:
+            SENTIMENT_DLQ.inc()
+            _FAILED_DLQ.append({"alert": alert.dict(), "error": str(exc)})
+            logger.error("[SocialSentiment] Alert emission error: %s", exc)
 
+    # ── DLQ helpers ─────────────────────────────────────────────────────────
     async def replay_dlq(self):
-        for failed in FAILED_SENTIMENT_DLQ[:]:
+        for item in _FAILED_DLQ[:]:
             try:
-                await self.handle_signal(failed.get("data", {}))
-                FAILED_SENTIMENT_DLQ.remove(failed)
+                await self._emit(SentimentAlert(**item["alert"]))
+                _FAILED_DLQ.remove(item)
             except Exception:
                 continue
 
     def get_dlq(self):
-        return FAILED_SENTIMENT_DLQ.copy()
+        return list(_FAILED_DLQ)
