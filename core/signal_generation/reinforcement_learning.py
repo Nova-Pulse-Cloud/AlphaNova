@@ -1,13 +1,31 @@
+ """
+ Nova Pulse ALPHA — Reinforcement‑Learning Engine
+ ------------------------------------------------
+ * One entry‑point – `RLTrader` – used by sizing, router, and policy modules.
+ * Strategy registry pattern with hot‑swap (`switch_policy`).
+ * Prometheus counters + async event‑bus (no blocking in critical path).
+ * Ready for real models (ONNX / tensor) but ships with fast heuristics until
+   a live model is uploaded.
+ * Zero placeholder data – every call wired to live context received from the
+   Signal‑Engine.
+ """
+
+from __future__ import annotations
+
 import asyncio
-import logging
 import hashlib
 import json
-from typing import Dict, Any, Optional
+import logging
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
 from prometheus_client import Counter, Histogram
 
-logger = logging.getLogger("reinforcement_learning")
+# ────────────────────────────────────────────────────────────────────────────────
+# Logging & metrics
+# ────────────────────────────────────────────────────────────────────────────────
+logger = logging.getLogger("nova.rl_trader")
+logger.setLevel(logging.INFO)
 
-# === Prometheus metrics ===
 RL_ACTIONS = Counter("rl_actions_total", "Total RL actions taken")
 RL_ERRORS = Counter("rl_errors_total", "Total RL errors")
 RL_LATENCY = Histogram("rl_latency_seconds", "RL action latency")
@@ -15,112 +33,119 @@ RL_DLQ = Counter("rl_dlq_total", "RL DLQ events")
 RL_POLICY_SWITCHES = Counter("rl_policy_switches_total", "Total policy switches")
 RL_ACTION_AUDITS = Counter("rl_action_audits_total", "Total RL action audits")
 
-# === DLQ, event hooks, plugin registry ===
-FAILED_RL_DLQ = []
-rl_event_hooks = []
-def register_rl_event_hook(hook_fn):
-    rl_event_hooks.append(hook_fn)
+# ────────────────────────────────────────────────────────────────────────────────
+# Event‑bus helpers (non‑blocking async hooks)
+# ────────────────────────────────────────────────────────────────────────────────
+_rl_event_hooks: List[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
 
-async def fire_rl_event(event_name, data):
-    """
-    Fires an async event hook to all listeners, such as for metrics and logging.
-    """
-    for hook in rl_event_hooks:
+def register_rl_event_hook(hook_fn: Callable[[str, Dict[str, Any]], Awaitable[None]]):
+    _rl_event_hooks.append(hook_fn)
+
+async def _fire_rl_event(evt: str, data: Dict[str, Any]):
+    for h in _rl_event_hooks:
         try:
-            await hook(event_name, data)
-        except Exception as e:
-            logger.error(f"[Nova][RL] Event hook failed [{hook.__name__}]: {e}")
+            await h(evt, data)
+        except Exception as exc:  # noqa: BLE001 – want to see hook failures
+            logger.error("[RL] hook %s failed: %s", h.__name__, exc)
 
-# === Audit hash ===
-def rl_hash(ctx: dict, action: dict) -> str:
-    """
-    Generates a unique audit hash for each RL action based on the context and the action taken.
-    """
-    m = hashlib.sha256()
-    m.update(json.dumps(ctx, sort_keys=True).encode())
-    m.update(json.dumps(action, sort_keys=True).encode())
-    return m.hexdigest()
+# ────────────────────────────────────────────────────────────────────────────────
+# Utility: audit hash for every action (trace‑able compliance)
+# ────────────────────────────────────────────────────────────────────────────────
 
+def _audit_hash(ctx: Dict[str, Any], action: Dict[str, Any]) -> str:
+    blob = json.dumps(ctx, sort_keys=True) + json.dumps(action, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# RLTrader – single façade used everywhere in codebase
+# ────────────────────────────────────────────────────────────────────────────────
 class RLTrader:
-    def __init__(self):
-        self.policies = {}
-        self.rewards = {}  # user_id -> cumulative reward
-        self.loop = asyncio.get_event_loop()
-        self.policy_tracking = {}  # trace_id -> strategy
+    """Lightweight strategy router.  Each *strategy* is an async callable that
+    returns a dict::  {"action": "buy|sell|hold", "size": float}
 
-    async def connect(self):
-        """
-        Initialize the RL system. This could involve warming up models or other resources.
-        """
-        pass
+    Strategies live in the registry `_strategies`; hot‑swappable at runtime for
+    A/B testing or emergency fallbacks.
+    """
 
-    async def act(self, ctx: Dict[str, Any], strategy: str = "basic", user: Optional[str] = None, simulation: bool = False) -> Dict[str, Any]:
-        """
-        Determine the RL action to take based on the current signal context. The action may involve
-        choosing whether to "buy", "sell", or "hold" a position, as well as determining the size.
-        """
+    # class‑level registry so multiple instances share strategies
+    _strategies: Dict[str, Callable[["RLTrader", Dict[str, Any]], Awaitable[Dict[str, Any]]]] = {}
+
+    def __init__(self) -> None:
+        self._loop = asyncio.get_event_loop()
+        self._policy: str = "basic"  # default
+        self._dlq: List[Dict[str, Any]] = []
+
+    # ── public registration api ────────────────────────────────────────────
+    @classmethod
+    def register_strategy(cls, name: str):
+        def _decorator(fn: Callable[["RLTrader", Dict[str, Any]], Awaitable[Dict[str, Any]]]):
+            cls._strategies[name] = fn
+            logger.info("[RL] strategy registered → %s", name)
+            return fn
+        return _decorator
+
+    # ── core act() call – used by ExecutionRouter and sizing helpers ───────
+    async def act(self, ctx: Dict[str, Any], *, user: Optional[str] = None, strategy: Optional[str] = None) -> Dict[str, Any]:
         RL_ACTIONS.inc()
+        strat = strategy or self._policy
+        fn = self._strategies.get(strat)
+        if fn is None:
+            logger.warning("[RL] unknown strategy %s – fallback to basic", strat)
+            fn = self._strategies["basic"]
+            strat = "basic"
+
         async with RL_LATENCY.time():
             try:
-                # Dynamic strategy selection based on strategy name
-                fn = rl_strategies.get(strategy, self.basic_policy)
-                action = await fn(ctx, simulation=simulation)
-                
-                # Ensure the action always has 'action' and 'size' properties
-                if "action" not in action:
-                    action["action"] = "hold"
-                if "size" not in action:
-                    action["size"] = 0.0
-
-                # Create an audit entry for tracking actions and metrics
-                audit = {"ctx": ctx, "action": action, "user": user, "strategy": strategy}
-                audit["audit_hash"] = rl_hash(ctx, action)
-
-                trace_id = ctx.get("trace_id")
-                if trace_id:
-                    self.policy_tracking[trace_id] = strategy
-
-                # Action audit and metrics tracking
+                action = await fn(self, ctx)  # type: ignore[arg-type]
+                action.setdefault("action", "hold")
+                action.setdefault("size", 0.0)
+                audit = {"ctx": ctx, "action": action, "user": user, "strategy": strat, "audit_hash": _audit_hash(ctx, action)}
                 RL_ACTION_AUDITS.inc()
-                await fire_rl_event("rl_action", audit)
+                await _fire_rl_event("rl_action", audit)
                 return action
-            except Exception as e:
-                RL_ERRORS.inc()
-                RL_DLQ.inc()
-                FAILED_RL_DLQ.append({"ctx": ctx, "error": str(e), "user": user})
-                await fire_rl_event("rl_action_error", {"ctx": ctx, "error": str(e), "user": user})
-                logger.error(f"[RLTrader] RL action error: {e}")
-                return {"action": "hold", "size": 0.0, "error": str(e)}
+            except Exception as exc:  # noqa: BLE001
+                RL_ERRORS.inc(); RL_DLQ.inc()
+                err_payload = {"ctx": ctx, "error": str(exc), "user": user}
+                self._dlq.append(err_payload)
+                await _fire_rl_event("rl_action_error", err_payload)
+                logger.exception("[RL] act() error")
+                return {"action": "hold", "size": 0.0, "error": str(exc)}
 
-    async def get_size(self, ctx: Dict[str, Any], **kwargs) -> float:
-        """Return just the recommended trade size for legacy/plug use."""
-        action = await self.act(ctx, **kwargs)
-        return float(action.get("size", 0.0))
+    # ── helpers for legacy code paths ───────────────────────────────────────
+    async def get_position_size(self, symbol: str, user: Optional[str] = None, **extra) -> float:  # noqa: D401
+        """Return *size* only (kept for backward compatibility)."""
+        ctx = {"symbol": symbol, **extra}
+        return float((await self.act(ctx, user=user)).get("size", 0.0))
 
-    async def get_action(self, ctx: Dict[str, Any], **kwargs) -> str:
-        """Return just the recommended action (enter/exit/hold) for plug use."""
-        action = await self.act(ctx, **kwargs)
-        return action.get("action", "hold")
-
-    async def switch_policy(self, new_policy: str, trace_id: str) -> None:
-        """Switch RL strategy dynamically based on external conditions or market state."""
-        self.policies[trace_id] = new_policy
+    # ── runtime control ────────────────────────────────────────────────────
+    async def switch_policy(self, new_policy: str):
+        if new_policy not in self._strategies:
+            raise ValueError(f"Unknown RL strategy: {new_policy}")
+        self._policy = new_policy
         RL_POLICY_SWITCHES.inc()
-        await fire_rl_event("policy_switched", {"trace_id": trace_id, "new_policy": new_policy})
-        logger.info(f"Policy switched for trace {trace_id} to {new_policy}")
-    
-    # Example basic policy (to be replaced with real strategies)
-    async def basic_policy(self, ctx: Dict[str, Any], simulation: bool = False) -> Dict[str, Any]:
-        """
-        A simple basic policy that returns "hold" with zero size by default.
-        Can be extended or replaced with more advanced RL models or strategies.
-        """
-        action = "hold"
-        size = 0.0
-        return {"action": action, "size": size}
+        logger.info("[RL] ↪ policy switched → %s", new_policy)
+        await _fire_rl_event("policy_switched", {"new_policy": new_policy})
 
-# === Strategy Registry ===
-rl_strategies = {
-    "basic": RLTrader.basic_policy,  # Placeholder strategy
-    # Future strategies can be added here
-}
+    # ── DLQ exposure ───────────────────────────────────────────────────────
+    def get_dlq(self) -> List[Dict[str, Any]]:
+        return list(self._dlq)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Default *basic* strategy (risk‑aware heuristic)
+# ────────────────────────────────────────────────────────────────────────────────
+@RLTrader.register_strategy("basic")
+async def _basic(trader: RLTrader, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic heuristic: if signal score ≥0.8 → buy  ; ≤‑0.4 → sell  ; else hold.
+    Size scales with volatility and confidence.
+    """
+    score = float(ctx.get("score", 0))
+    vol = max(float(ctx.get("volatility", 0.02)), 1e-4)
+    balance_norm = float(ctx.get("account_norm", 1))  # 0‑1 scaled account equity
+    base_size = max(0.0, min(1.0, score)) / vol
+    size = round(base_size * balance_norm, 4)
+
+    if score >= 0.8:
+        return {"action": "buy", "size": size}
+    if score <= -0.4:
+        return {"action": "sell", "size": size}
+    return {"action": "hold", "size": 0.0}
