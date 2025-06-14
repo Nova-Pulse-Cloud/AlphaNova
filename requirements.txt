@@ -1,0 +1,65 @@
+# Core dependencies
+fastapi
+uvicorn[standard]
+python-dotenv
+apscheduler
+
+# Telegram Bot
+aiogram
+aiohttp
+aiofiles
+magic-filter
+
+# AI / ML
+scikit-learn
+joblib
+openai
+distro
+tqdm
+
+# Data and Utility
+numpy
+pandas
+matplotlib
+pillow
+requests
+redis
+
+# Solana Blockchain
+solana
+solders
+anchorpy
+base58
+
+# Observability
+prometheus_client
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-asgi
+opentelemetry-util-http
+opentelemetry-semantic-conventions
+deprecated  # Added to resolve the issue
+
+# Additional dependencies
+tenacity
+python-multipart
+
+# Pydantic Settings Fix
+pydantic-settings
+
+# Other dependencies
+wrapt
+zipp
+
+# ASGI Compatibility
+asgiref
+
+# OpenTelemetry Exporter for Jaeger
+opentelemetry-exporter-jaeger
+
+# Missing dependencies
+aiocache
+ujson
+msgpack
