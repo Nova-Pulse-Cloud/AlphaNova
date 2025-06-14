@@ -11,8 +11,8 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from utils.pnl_renderer import generate_pnl_image, generate_pnl_card, get_pnl_history, get_token_stats
-from core.plugin_manager import fire_plugin_event
-from core.reinforcement_learning import RLTrader  # Adding RL trader feedback
+from utils.plugin_manager import fire_plugin_event
+from core.signal_generation.reinforcement_learning import RLTrader  # Adding RL trader feedback
 from telegram.commands.commands import COMMANDS_EXECUTED, COMMANDS_FAILED
 
 logger = logging.getLogger("telegram_pnl_commands")
@@ -20,6 +20,7 @@ router = Router()
 
 # === Config ===
 ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "7545342838"))
+
 
 def admin_only(func):
     """
@@ -33,11 +34,13 @@ def admin_only(func):
         return await func(message, *args, **kwargs)
     return wrapper
 
+
 def sanitize_symbol(text: str) -> str:
     """
     Sanitize input symbol to ensure no invalid characters.
     """
     return re.sub(r"[^A-Za-z0-9]", "", text.upper())
+
 
 @router.message(Command("pnl"))
 @admin_only
@@ -68,6 +71,7 @@ async def pnl_handler(message: Message):
 
     COMMANDS_EXECUTED.inc()
 
+
 @router.message(Command("pnlcard"))
 @admin_only
 async def pnlcard_handler(message: Message):
@@ -93,6 +97,7 @@ async def pnlcard_handler(message: Message):
         await message.answer(f"❗ Could not generate card for {mint}")
 
     COMMANDS_EXECUTED.inc()
+
 
 @router.message(Command("pnlsummary"))
 @admin_only
