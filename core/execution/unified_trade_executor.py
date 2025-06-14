@@ -1,9 +1,18 @@
-# File: core/execution/unified_trade_executor.py
+"""core/execution/unified_trade_executor.py
+-------------------------------------------------------------------------------
+World‑class unified execution pipeline:
+• Multi‑layer risk filters (Audit + MarketConditions)
+• RL decision (DQN or RLTrader)
+• Plugin‑based routing + post‑hooks
+• Prometheus metrics, DLQ, full audit hash
+• LLM rationale + PnL card attachment
+-------------------------------------------------------------------------------"""
 
-import logging
+import asyncio
 import hashlib
+import logging
 import uuid
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 from prometheus_client import Counter, Histogram
 
@@ -15,26 +24,31 @@ from core.data_collection.market_conditions import MarketConditionsService
 from utils.trade_memory import TradeMemory
 from core.alpha_memory_mesh import MemoryMesh
 from utils.plugin_manager import PluginManager
-from utils.dlq_manager import get_all_dlq
 from utils.pnl_card import generate_pnl_card
 
-logger = logging.getLogger("unified_trade_executor")
+logger = logging.getLogger("nova.unified_trade_executor")
 logger.setLevel(logging.INFO)
 
-# === Prometheus Metrics ===
-EXECUTIONS       = Counter("trade_executions_total", "Total trades executed")
+# ────────────────────────────────────────────────────────────────────────────────
+# Prometheus Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+EXECUTIONS        = Counter("trade_executions_total", "Total trades executed")
 EXECUTION_LATENCY = Histogram("trade_execution_latency_seconds", "Execution latency")
-EXECUTION_SKIPS   = Counter("trade_skips_total", "Trades skipped due to risk or market filter")
+EXECUTION_SKIPS   = Counter("trade_skips_total", "Trades skipped")
 EXECUTION_ERRORS  = Counter("trade_execution_errors_total", "Trade execution failures")
 
-# Dead-letter queue for failed executions
-FAILED_EXEC_DLQ: list = []
+# DLQ (in‑mem)
+FAILED_EXEC_DLQ: list[Dict[str, Any]] = []
+
 
 class UnifiedTradeExecutor:
+    """High‑level façade that wires every subsystem into a single `execute()` call."""
+
     def __init__(
         self,
+        *,
         config: Config,
-        wallet_manager,
+        wallet_manager: Any,
         memory: TradeMemory,
         auditor: TokenAuditor,
         explainer: SignalExplainerAI,
@@ -42,100 +56,104 @@ class UnifiedTradeExecutor:
         rl_agent: DQNAgent,
         rl_trader: RLTrader,
         mesh: MemoryMesh,
-        plugin_manager: PluginManager
-    ):
-        self.config         = config
-        self.wallet_manager = wallet_manager
-        self.memory         = memory
-        self.auditor        = auditor
-        self.explainer      = explainer
-        self.market         = market_filter
-        self.agent          = rl_agent
-        self.rl_trader      = rl_trader
-        self.mesh           = mesh
-        self.plugins        = plugin_manager
+        plugin_manager: PluginManager,
+    ) -> None:
+        self.cfg           = config
+        self.wallet_mgr    = wallet_manager
+        self.memory        = memory
+        self.auditor       = auditor
+        self.explainer     = explainer
+        self.market        = market_filter
+        self.dqn           = rl_agent
+        self.rl_trader     = rl_trader
+        self.mesh          = mesh
+        self.plugins       = plugin_manager
 
-    async def execute_trade(
-        self,
-        signal: Dict[str, Any],
-        user_id: Any = None
-    ) -> Dict[str, Any]:
+    # ────────────────────────────────────────────────────────────────────────────
+    # Public: execute_trade
+    # ────────────────────────────────────────────────────────────────────────────
+    async def execute_trade(self, signal: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """End‑to‑end execution for **one** trading signal."""
         trace_id = signal.get("trace_id") or str(uuid.uuid4())
-        logger.info(f"[Executor:{trace_id}] Pipeline start: {signal}")
+        logger.info(f"[UTE:{trace_id}] Start — {signal}")
 
         with EXECUTION_LATENCY.time():
             try:
-                symbol = signal["symbol"]
-                side   = signal["side"]
-
-                # 1️⃣ Risk & Market Filter
-                trust = await self.auditor.audit_token(symbol)
-                if trust.risk > self.config.MAX_RISK_THRESHOLD:
+                # ----------------------------------------------------------------
+                # 1️⃣ Risk / Market Filters
+                # ----------------------------------------------------------------
+                trust = await self.auditor.audit_token(signal["symbol"])
+                if trust.risk > self.cfg.MAX_RISK_THRESHOLD:
                     EXECUTION_SKIPS.inc()
-                    return {
-                        "status": "skipped",
-                        "reason": "risk",
-                        "trust": trust.to_dict(),
-                        "trace_id": trace_id,
-                    }
+                    return {"status": "skipped", "reason": "risk", "trace_id": trace_id}
 
-                if not await self.market.is_favorable(symbol):
+                if not await self.market.is_favorable(signal["symbol"]):
                     EXECUTION_SKIPS.inc()
-                    return {
-                        "status": "skipped",
-                        "reason": "market",
-                        "trace_id": trace_id,
-                    }
+                    return {"status": "skipped", "reason": "market", "trace_id": trace_id}
 
-                # 2️⃣ RL Decision
-                state_vector = self._build_state(signal, trust)
-                action = await self.agent.act(state_vector)
+                # ----------------------------------------------------------------
+                # 2️⃣ RL Action
+                # ----------------------------------------------------------------
+                state_vec = self._build_state(signal, trust)
+                action = await self.dqn.act(state_vec)
                 if action in (0, "hold"):
                     return {"status": "held", "trace_id": trace_id}
+                side = "buy" if action in (1, "enter") else "sell"
 
-                # 3️⃣ Trade Execution
+                # ----------------------------------------------------------------
+                # 3️⃣ Routing & Execution
+                # ----------------------------------------------------------------
                 tx = await self.plugins.route_trade(
-                    symbol=symbol,
+                    symbol=signal["symbol"],
                     side=side,
-                    wallet=self.wallet_manager.get_wallet("solana"),
+                    wallet=self.wallet_mgr.get_wallet("solana"),
                     trace_id=trace_id,
                 )
                 EXECUTIONS.inc()
 
-                # 4️⃣ Explanation & PnL
+                # ----------------------------------------------------------------
+                # 4️⃣ Post‑processing (LLM explanation + PnL card)
+                # ----------------------------------------------------------------
                 rationale = await self.explainer.explain_signal(signal)
-                pnl_card  = await generate_pnl_card(tx)
+                pnl_card  = await generate_pnl_card(signal["symbol"])
 
-                # 5️⃣ Record & Reward & Mesh & Plugins
+                # ----------------------------------------------------------------
+                # 5️⃣ Persistence / Rewards / Mesh / Plugins
+                # ----------------------------------------------------------------
                 record = {
-                    "symbol": symbol,
-                    "side": side,
-                    "pnl": tx.get("pnl", 0.0),
-                    "price": tx.get("price"),
+                    "symbol": signal["symbol"],
+                    "side"  : side,
+                    "pnl"   : tx.get("pnl", 0.0),
+                    "price" : tx.get("price"),
                     "trace_id": trace_id,
                 }
-                await self.memory.add_trade(symbol, record)
+                await self.memory.add_trade(signal["symbol"], record)
                 await self.rl_trader.reward(signal, {"pnl": record["pnl"]}, user_id)
                 await self.mesh.log_trade(record, signal)
                 if hasattr(self.plugins, "post_trade"):
                     await self.plugins.post_trade(signal, tx)
 
-                exec_hash = hashlib.sha256(f"{symbol}:{side}:{trace_id}".encode()).hexdigest()
+                exec_hash = hashlib.sha256(f"{signal['symbol']}:{side}:{trace_id}".encode()).hexdigest()
                 return {
-                    "status": "executed",
-                    "trace_id": trace_id,
-                    "pnl_card": pnl_card,
+                    "status"   : "executed",
+                    "trace_id" : trace_id,
+                    "pnl_card" : pnl_card,
                     "rationale": rationale,
                     "execution_hash": exec_hash,
                 }
 
             except Exception as e:
                 EXECUTION_ERRORS.inc()
-                logger.exception(f"[Executor:{trace_id}] Error: {e}")
+                logger.exception(f"[UTE:{trace_id}] Fatal: {e}")
                 FAILED_EXEC_DLQ.append({"signal": signal, "error": str(e)})
                 return {"status": "error", "reason": str(e), "trace_id": trace_id}
 
-    def _build_state(self, signal: Dict[str, Any], trust) -> list:
+    # ────────────────────────────────────────────────────────────────────────────
+    # Private Helpers
+    # ────────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _build_state(signal: Dict[str, Any], trust) -> list:
+        """State vector for DQN agent."""
         return [
             signal.get("score", 0.0),
             trust.risk,
