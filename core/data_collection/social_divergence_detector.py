@@ -1,13 +1,13 @@
-﻿"""
-Nova Pulse ALPHA – Social‑to‑Price Divergence Detector 2.0
-=========================================================
-• Listens to *three* Redis pub/sub channels in real‑time: price ticks, social sentiment, on‑chain flow.
-• Pluggable scoring registry (`register_div_plugin`).  
-• Full Prometheus metrics, DLQ, SHA‑256 provenance.  
-• Non‑blocking GPT‑4o caption generation (async‑friendly).  
-• Zero placeholders – all fields sourced live via upstream scrapers.
 """
-
+Nova Pulse ALPHA – Social‑to‑Price Divergence Detector 2.1
+========================================================
+• Listens to three Redis pub/sub channels in real-time: price ticks, social sentiment, on-chain flow.
+• Plug-in scoring registry (`register_divergence_plugin`).
+• Full Prometheus metrics, DLQ, SHA-256 provenance.
+• Non-blocking GPT-4o caption generation (async-friendly).
+• Zero placeholders – all fields sourced live via upstream scrapers.
+• Modern redis.asyncio, async/await everywhere.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,14 +16,14 @@ import json
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-import aioredis
-import numpy as np  # noqa: F401 – may be used by custom plugins
+import redis.asyncio as redis_async
+import numpy as np
 import openai
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
 from utils.config import Config
-from utils.plugin_manager import fire_plugin_event  # global event bus
+from utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.social_divergence_detector")
 logger.setLevel(logging.INFO)
@@ -44,34 +44,28 @@ _FAILED_DLQ: List[Dict[str, Any]] = []
 _plugins: Dict[str, Callable] = {}
 _event_hooks: List[Callable[[str, Dict[str, Any]], Any]] = []
 
-
 def register_divergence_plugin(name: str, fn: Callable):
     _plugins[name] = fn
-
 
 def register_divergence_event_hook(hook_fn: Callable):
     _event_hooks.append(hook_fn)
 
-
 async def _fire_event(name: str, data: Dict[str, Any]):
-    await fire_plugin_event(name, data)  # broadcast globally
+    await fire_plugin_event(name, data)
     for hk in _event_hooks:
         try:
             await hk(name, data)
-        except Exception as exc:  # pragma: no cover
-            logger.error("[DivergenceHook] %s failed: %s", hk.__name__, exc)
-
+        except Exception as exc:
+            logger.error("[DivergenceHook] %s failed: %s", getattr(hk, "__name__", "?"), exc)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Models & helpers
 # ────────────────────────────────────────────────────────────────────────────────
-
 def _audit_hash(*parts: Any) -> str:
     h = hashlib.sha256()
     for p in parts:
         h.update(json.dumps(p, sort_keys=True, default=str).encode())
     return h.hexdigest()
-
 
 class DivergenceAlert(BaseModel):
     symbol: str
@@ -86,14 +80,11 @@ class DivergenceAlert(BaseModel):
     plugin: str = "default"
     simulation: bool = False
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Detector class
 # ────────────────────────────────────────────────────────────────────────────────
-
 class SocialDivergenceDetector:
     """Fuse price, sentiment, and on‑chain flow to surface strong divergences."""
-
     def __init__(
         self,
         cfg: Optional[Config] = None,
@@ -110,16 +101,12 @@ class SocialDivergenceDetector:
         self.flow_ch = onchain_channel
         self.out_ch = output_channel
         self.ttl = cache_ttl
-
-        self.redis: aioredis.Redis | None = None
+        self.redis: Optional[redis_async.Redis] = None
         openai.api_key = self.cfg.OPENAI_API_KEY
-
-        # default plugin
         register_divergence_plugin("default", self._default_divergence_score)
 
-    # ── Lifecycle ────────────────────────────────────────────────────────────
     async def connect(self):
-        self.redis = await aioredis.from_url(self.cfg.REDIS_URL)
+        self.redis = await redis_async.from_url(self.cfg.REDIS_URL)
         logger.info("SocialDivergenceDetector connected → Redis %s", self.cfg.REDIS_URL)
 
     async def disconnect(self):
@@ -127,14 +114,12 @@ class SocialDivergenceDetector:
             await self.redis.close()
             logger.info("SocialDivergenceDetector disconnected.")
 
-    # ── Main stream loop ─────────────────────────────────────────────────────
     async def listen(self, plugin: str = "default", *, simulation: bool = False):
         if not self.redis:
             await self.connect()
         pubsub = self.redis.pubsub()
         await pubsub.subscribe(self.price_ch, self.sent_ch, self.flow_ch)
         logger.info("Subscribed to %s, %s, %s", self.price_ch, self.sent_ch, self.flow_ch)
-
         async for msg in pubsub.listen():
             if msg["type"] != "message":
                 continue
@@ -143,12 +128,11 @@ class SocialDivergenceDetector:
                 payload = self._parse_msg(msg)
                 if payload:
                     await self._handle_signal(payload, plugin, simulation)
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 DIV_ERRORS.inc()
                 logger.exception("Divergence processing error: %s", exc)
 
-    # ── Internals ────────────────────────────────────────────────────────────
-    def _parse_msg(self, msg: Dict[str, Any]) -> Dict[str, Any] | None:
+    def _parse_msg(self, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             chan = msg.get("channel")
             if not isinstance(chan, str):
@@ -160,7 +144,7 @@ class SocialDivergenceDetector:
                 data = json.loads(data)
             data["channel"] = chan
             return data
-        except Exception:  # pragma: no cover
+        except Exception:
             return None
 
     async def _handle_signal(self, data: Dict[str, Any], plugin: str, simulation: bool):
@@ -170,15 +154,12 @@ class SocialDivergenceDetector:
         latest = await self._latest_snapshot(symbol)
         if not latest:
             return
-
         with DIV_LATENCY.time():
             price_change = self._price_change(latest["price_hist"])
             social = latest["sent"]
             flow = latest["flow"]
-
             score_fn = _plugins.get(plugin, self._default_divergence_score)
             div_score = await score_fn(price_change, social, flow, simulation=simulation)
-
             if abs(div_score) > 0.7:
                 DIV_FOUND.inc()
                 caption = await self._caption(symbol, price_change, social, flow, div_score)
@@ -196,7 +177,6 @@ class SocialDivergenceDetector:
                 )
                 await self._emit(alert)
 
-    # ── Redis helpers ───────────────────────────────────────────────────────
     async def _latest_snapshot(self, sym: str):
         try:
             r = self.redis  # type: ignore
@@ -211,7 +191,6 @@ class SocialDivergenceDetector:
         except Exception:
             return None
 
-    # ── Scoring / caption / emit ────────────────────────────────────────────
     @staticmethod
     def _price_change(hist: List[float]) -> float:
         if len(hist) < 2:
@@ -236,14 +215,14 @@ class SocialDivergenceDetector:
         try:
             res = await asyncio.to_thread(
                 lambda: openai.ChatCompletion.create(
-                    model="gpt-4o-mini",
+                    model="gpt-4o",
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=60,
                     temperature=0.7,
                 )
             )
             return res.choices[0].message.content.strip()
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             logger.warning("GPT caption fallback: %s", exc)
             return f"Divergence ⚠️ {sym} score {score:.2f}"
 
@@ -254,7 +233,6 @@ class SocialDivergenceDetector:
         await _fire_event("divergence_alert", alert.dict())
         logger.info("Divergence alert → %s (score %.2f)", alert.symbol, alert.divergence_score)
 
-    # ── DLQ helpers ─────────────────────────────────────────────────────────
     async def replay_dlq(self):
         for item in list(_FAILED_DLQ):
             try:
