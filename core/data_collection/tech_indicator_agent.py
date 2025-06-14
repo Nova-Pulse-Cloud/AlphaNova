@@ -1,11 +1,12 @@
 # ────────────────────────────────────────────────────────────────────────────────
-#  Nova Pulse ALPHA – Technical‑Indicator Agent 2.0
+#  Nova Pulse ALPHA – Technical-Indicator Agent 2.1 (Live OHLC, Prom, SHA-256)
 #  -----------------------------------------------------------------------------
-#  • Live OHLCV pull (DexScreener "chart" endpoint ‑ 5‑minute candles)
-#  • Async/await end‑to‑end – zero blocking I/O
-#  • Pluggable scoring via `register_tech_ind_plugin()`
-#  • Full Prometheus instrumentation, audit‑hash & DLQ replay
-#  • No placeholders ‑ every data‑point is fetched live from main‑net Solana DEXs
+#  • Pure async/await: no blocking, all HTTP/TA calls run live
+#  • 5-min OHLCV candles pulled directly from DexScreener mainnet
+#  • Extensible plugin hooks and event dispatch
+#  • Prometheus metrics for calls, errors, DLQ, alerts, and latency
+#  • SHA-256 provenance hash per analysis
+#  • No placeholders, no fake data: 100% mainnet source
 # ────────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
@@ -30,37 +31,35 @@ logger.setLevel(logging.INFO)
 # ────────────────────────────────────────────────────────────────────────────────
 # Prometheus metrics
 # ────────────────────────────────────────────────────────────────────────────────
-TIND_CALLS        = Counter("tech_ind_calls_total", "Total technical‑indicator agent invocations")
-TIND_ERRORS       = Counter("tech_ind_errors_total", "Tech‑indicator failures")
-TIND_LATENCY      = Histogram("tech_ind_latency_seconds", "Latency of TA analysis")
-TIND_DLQ          = Counter("tech_ind_dlq_total", "Tech‑indicator DLQ events")
-TIND_ALERTS       = Counter("tech_ind_alerts_total", "High‑confidence TA alerts")
+TIND_CALLS   = Counter("tech_ind_calls_total", "Total technical-indicator agent invocations")
+TIND_ERRORS  = Counter("tech_ind_errors_total", "Tech-indicator failures")
+TIND_LATENCY = Histogram("tech_ind_latency_seconds", "Latency of TA analysis")
+TIND_DLQ     = Counter("tech_ind_dlq_total", "Tech-indicator DLQ events")
+TIND_ALERTS  = Counter("tech_ind_alerts_total", "High-confidence TA alerts")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Event / plug‑in registry
+# Plugin/event registry
 # ────────────────────────────────────────────────────────────────────────────────
-_tech_ind_plugins: dict[str, Callable] = {}
-_event_hooks: list[Callable[[str, dict[str, Any]], asyncio.Future]] = []
-_failed_dlq: list[dict[str, Any]] = []
-
+_tech_ind_plugins: Dict[str, Callable] = {}
+_event_hooks: List[Callable[[str, Dict[str, Any]], asyncio.Future]] = []
+_failed_dlq: List[Dict[str, Any]] = []
 
 def register_plugin(name: str, fn: Callable):
     _tech_ind_plugins[name] = fn
 
-def register_event_hook(fn: Callable[[str, dict[str, Any]], asyncio.Future]):
+def register_event_hook(fn: Callable[[str, Dict[str, Any]], asyncio.Future]):
     _event_hooks.append(fn)
 
-async def _fire_event(ev: str, payload: dict[str, Any]):
+async def _fire_event(ev: str, payload: Dict[str, Any]):
     for hook in _event_hooks:
         try:
             await hook(ev, payload)
-        except Exception as exc:  # noqa: BLE001 – we must not let hooks crash core
+        except Exception as exc:
             logger.error("[TechInd] hook %s failed: %s", getattr(hook, "__name__", "?"), exc)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Helper: SHA‑256 provenance hash
+# Helper: SHA-256 provenance hash
 # ────────────────────────────────────────────────────────────────────────────────
-
 def _hash(symbol: str, result: dict[str, Any]) -> str:
     h = hashlib.sha256()
     h.update(symbol.encode())
@@ -71,19 +70,16 @@ def _hash(symbol: str, result: dict[str, Any]) -> str:
 # Main class
 # ────────────────────────────────────────────────────────────────────────────────
 class TechIndicatorAgent:
-    """Live TA engine pulling 5‑minute OHLCV from DexScreener."""
-
+    """Live TA engine pulling 5-min OHLCV from DexScreener."""
     _CHART_URL = "https://api.dexscreener.com/latest/dex/chart/solana/{pair_id}?from={start}&to={end}&interval=5m"
 
     def __init__(self, cfg: Optional[Config] = None):
         self.cfg = cfg or Config()
-        # user supplies the *DexScreener pair ID* (ex: "SOL_USDC") when calling analyse()
 
-    # ── Data fetch ──────────────────────────────────────────────────────────
-    async def _fetch_candles(self, pair_id: str, lookback: int = 500) -> pd.DataFrame | None:
-        """Fetch *lookback* 5‑minute candles for `pair_id`. Returns DataFrame or None."""
+    async def _fetch_candles(self, pair_id: str, lookback: int = 500) -> Optional[pd.DataFrame]:
+        """Fetch *lookback* 5-min candles for `pair_id`. Returns DataFrame or None."""
         end_ts = int(datetime.utcnow().timestamp())
-        start_ts = end_ts - lookback * 300  # 300 sec per 5‑m candle
+        start_ts = end_ts - lookback * 300
         url = self._CHART_URL.format(pair_id=pair_id, start=start_ts, end=end_ts)
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -101,14 +97,13 @@ class TechIndicatorAgent:
             logger.error("[TechInd] fetch_candles error %s: %s", pair_id, exc)
             return None
 
-    # ── Public analyse entrypoint ───────────────────────────────────────────
     async def analyse(self, pair_id: str, *, plugin: str = "default", simulation: bool = False, **kw) -> dict[str, Any]:
         """Return score/meta for *pair_id* (DexScreener pair ID)."""
         TIND_CALLS.inc()
         try:
             async with TIND_LATENCY.time():
                 fn = _tech_ind_plugins.get(plugin, self._default_analysis)
-                result = await fn(pair_id, simulation=simulation, **kw)
+                result = await fn(self, pair_id, simulation=simulation, **kw)
                 payload = {
                     "pair_id": pair_id,
                     "result": result,
@@ -127,34 +122,28 @@ class TechIndicatorAgent:
             logger.error("[TechInd] analyse error for %s: %s", pair_id, exc)
             return {"pair_id": pair_id, "score": 0.0, "meta": {"error": str(exc)}}
 
-    # ── Default TA strategy ────────────────────────────────────────────────
     async def _default_analysis(self, pair_id: str, *, simulation: bool = False, **_) -> dict[str, Any]:
         df = await self._fetch_candles(pair_id)
         if df is None or len(df) < 120:  # need at least 10 hours of data
             return {"score": 0.0, "meta": {"error": "insufficient data"}}
-
-        # compute indicators (vectorised via pandas‑ta)
         df.ta.rsi(length=14, append=True)
         macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
         df["macd_hist"] = macd["MACDh_12_26_9"]
         df.ta.sma(length=20, append=True)
         bb = ta.bbands(df["close"], length=20)
         df["bb_low"], df["bb_high"] = bb["BBL_20_2.0"], bb["BBU_20_2.0"]
-
         last = df.iloc[-1]
         rsi = float(last["RSI_14"])
         macd_hist = float(last["macd_hist"])
         close = float(last["close"])
         upper, lower = float(last["bb_high"]), float(last["bb_low"])
         sma20 = float(last["SMA_20"])
-
         score = 0.0; rationale: list[str] = []
         if rsi < 30:                     score += 0.25; rationale.append("RSI oversold")
         if macd_hist > 0:                score += 0.25; rationale.append("MACD bullish")
         if close < lower:                score += 0.25; rationale.append("Bollinger pierce")
         if close > sma20:                score += 0.25; rationale.append("Above SMA20")
         if simulation:                   score *= 0.97
-
         return {
             "score": round(score, 2),
             "entry": close,
@@ -167,19 +156,17 @@ class TechIndicatorAgent:
             },
         }
 
-    # ── DLQ helpers ─────────────────────────────────────────────────────────
     async def replay_dlq(self):
         for item in _failed_dlq[:]:
             try:
                 await self.analyse(item["pair_id"])
                 _failed_dlq.remove(item)
-            except Exception:  # keep in DLQ
+            except Exception:
                 continue
 
-    # exposed for monitoring
-    def dlq(self) -> list[dict[str, Any]]:
+    def dlq(self) -> List[Dict[str, Any]]:
         return _failed_dlq.copy()
 
-
-# Register default plugin on import
-register_plugin("default", TechIndicatorAgent._default_analysis)
+# Register default plugin (class method)
+default_agent = TechIndicatorAgent()
+register_plugin("default", default_agent._default_analysis)
