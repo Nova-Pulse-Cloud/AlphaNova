@@ -1,17 +1,21 @@
+# File: core/signal_generation/sl_watchdog.py
+
 import asyncio
 import logging
 import httpx
-from typing import Any
-from core.wallet_manager import WalletManager
-from core.execution_router import ExecutionRouter
-from core.trade_memory import TradeMemory
+from typing import Any, List
+
+from core.wallet_management.wallet_manager import WalletManager
+from core.execution.execution_router import ExecutionRouter
+from utils.trade_memory import TradeMemory
 from prometheus_client import Counter, Histogram
 
 log = logging.getLogger("sl_watchdog")
+log.setLevel(logging.INFO)
 
 # === Prometheus Metrics ===
-SL_WATCHDOG_ERRORS = Counter("sl_watchdog_errors_total", "SL Watchdog errors")
-SL_WATCHDOG_HITS = Counter("sl_watchdog_hits_total", "SL/TP hit events")
+SL_WATCHDOG_ERRORS  = Counter("sl_watchdog_errors_total", "SL Watchdog errors")
+SL_WATCHDOG_HITS    = Counter("sl_watchdog_hits_total", "SL/TP hit events")
 SL_WATCHDOG_LATENCY = Histogram("sl_watchdog_latency_seconds", "SL/TP watch latency")
 
 POLL_INTERVAL = 8  # Seconds between price checks
@@ -24,61 +28,84 @@ async def get_live_price(symbol: str) -> float:
             resp = await client.get(url)
             resp.raise_for_status()
             return resp.json()[symbol.lower()]["usd"]
-    except httpx.RequestError as e:
+    except Exception as e:
         log.warning(f"[SL Watchdog] Price fetch error for {symbol}: {e}")
         SL_WATCHDOG_ERRORS.inc()
         raise
 
-async def monitor_open_positions(wallet_manager: WalletManager, trade_memory: TradeMemory, execution_router: ExecutionRouter):
+async def monitor_open_positions(
+    wallet_manager: WalletManager,
+    trade_memory: TradeMemory,
+    execution_router: ExecutionRouter
+):
+    """Continuously scan open positions and spawn per-trade watchers."""
     while True:
         try:
-            open_trades = await trade_memory.get_open_trades()
-            tasks = [monitor_trade(trade, wallet_manager, trade_memory, execution_router) for trade in open_trades]
-            await asyncio.gather(*tasks)  # Use asyncio.gather for concurrent execution
-
+            open_trades: List[Any] = await trade_memory.get_open_trades()
+            tasks = [
+                monitor_trade(tr, wallet_manager, trade_memory, execution_router)
+                for tr in open_trades
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
-            log.warning(f"[SL Watchdog] Error in monitoring loop: {e}")
+            log.warning(f"[SL Watchdog] Monitoring loop error: {e}")
             SL_WATCHDOG_ERRORS.inc()
 
         await asyncio.sleep(POLL_INTERVAL)
 
-async def monitor_trade(trade: Any, wallet_manager: WalletManager, trade_memory: TradeMemory, execution_router: ExecutionRouter):
+async def monitor_trade(
+    trade: Any,
+    wallet_manager: WalletManager,
+    trade_memory: TradeMemory,
+    execution_router: ExecutionRouter
+):
+    """Watch a single trade for TP/SL hits and auto-close if triggered."""
     symbol = trade.symbol
-    entry = trade.entry
-    sl = trade.sl
-    tp = trade.tp
-    side = trade.side
+    entry  = trade.entry
+    sl     = trade.sl
+    tp     = trade.tp
+    side   = trade.side
 
-    # Fetch live price with retries
+    start = asyncio.get_event_loop().time()
     try:
         price = await get_live_price(symbol)
-    except Exception as price_e:
-        log.warning(f"[SL Watchdog] Failed to fetch live price for {symbol}: {price_e}")
+    except Exception:
         return
 
-    # Calculate PnL trigger for SL/TP
-    hit_tp = (price >= tp if side == "buy" else price <= tp) if tp is not None else False
-    hit_sl = (price <= sl if side == "buy" else price >= sl) if sl is not None else False
+    # Determine hit conditions
+    hit_tp = tp is not None and ((price >= tp) if side == "buy" else (price <= tp))
+    hit_sl = sl is not None and ((price <= sl) if side == "buy" else (price >= sl))
 
     if hit_tp or hit_sl:
         reason = "tp" if hit_tp else "sl"
-        log.info(f"📉 SL/TP hit on {symbol} | reason={reason} | entry={entry} | now={price}")
+        log.info(f"[SL Watchdog] Hit {reason} on {symbol} | entry={entry} | price={price}")
 
         signal = {
             "symbol": symbol,
             "entry": entry,
-            "side": "sell" if side == "buy" else "buy",  # Close position
-            "score": 1.0,  # Forced high confidence
+            "side": "sell" if side == "buy" else "buy",
+            "score": 1.0,
             "auto_close": True,
             "reason": reason,
             "price": price,
         }
 
-        await execution_router.execute_trade(signal, user_id=getattr(trade, 'user', None))
+        try:
+            await execution_router.execute_trade(signal, user_id=getattr(trade, "user", None))
+            SL_WATCHDOG_HITS.inc()
+        except Exception as exec_err:
+            log.error(f"[SL Watchdog] Auto-close failed for {symbol}: {exec_err}")
+            SL_WATCHDOG_ERRORS.inc()
+    finally:
+        SL_WATCHDOG_LATENCY.observe(asyncio.get_event_loop().time() - start)
 
-        # Prometheus metrics tracking
-        SL_WATCHDOG_HITS.inc()
-
-async def start_sl_watchdog(wallet_manager: WalletManager, trade_memory: TradeMemory, execution_router: ExecutionRouter):
-    log.info("🧠 SL/TP Watchdog starting...")
-    asyncio.create_task(monitor_open_positions(wallet_manager, trade_memory, execution_router))
+async def start_sl_watchdog(
+    wallet_manager: WalletManager,
+    trade_memory: TradeMemory,
+    execution_router: ExecutionRouter
+):
+    """Kick off the SL/TP watchdog in the background."""
+    log.info("🧠 Starting SL/TP Watchdog...")
+    asyncio.create_task(
+        monitor_open_positions(wallet_manager, trade_memory, execution_router)
+    )
