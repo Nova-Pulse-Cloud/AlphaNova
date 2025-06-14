@@ -24,40 +24,35 @@ from utils.token_guardian import TokenGuardian
 from telegram.integration.telegram_router import push_trade_update
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Logging & Tracing
-# ────────────────────────────────────────────────────────────────────────────────
 logger = logging.getLogger("nova.execution_router")
 logger.setLevel(logging.INFO)
 tracer = trace.get_tracer(__name__)
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 # Prometheus Metrics
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 RPC_CALLS   = Counter("execution_router_rpc_calls_total", "Total RPC calls made")
 RPC_LATENCY = Histogram("execution_router_rpc_latency_seconds", "Latency of RPC calls")
 RPC_ERRORS  = Counter("execution_router_rpc_errors_total", "RPC execution errors")
 EXEC_DLQ    = Counter("execution_router_dlq_total", "Failed executions routed to DLQ")
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 # DLQ & Event Hooks
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 FAILED_EXEC_DLQ: List[Dict[str, Any]] = []
 execution_router_event_hooks: List[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 # Limits (override via Config if needed)
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 MAX_TOTAL_SOL = 0.5
 MAX_TRADE_SOL = 0.1
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 # Helpers
-# ────────────────────────────────────────────────────────────────────────────────
-
+# ────────────────────────────────
 def register_execution_router_hook(hook_fn: Callable[[str, Dict[str, Any]], Awaitable[None]]):
     execution_router_event_hooks.append(hook_fn)
-
 
 async def _fire_event(name: str, data: Dict[str, Any]):
     for hook in execution_router_event_hooks:
@@ -66,17 +61,15 @@ async def _fire_event(name: str, data: Dict[str, Any]):
         except Exception as e:
             logger.error(f"[ExecutionRouter Event] Hook failure {hook.__name__}: {e}")
 
-
 def _execution_hash(signal: Dict[str, Any], result: Dict[str, Any]) -> str:
     m = hashlib.sha256()
     m.update(str(signal).encode())
     m.update(str(result).encode())
     return m.hexdigest()
 
-
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 # ExecutionRouter Class
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────
 class ExecutionRouter:
     """Async, RL‑driven, plugin‑based execution engine."""
 
@@ -98,9 +91,9 @@ class ExecutionRouter:
         self.auditor        = TokenAuditor(redis_url=wallet_manager.redis_url)
         self.guardian       = TokenGuardian(helius_api_key=self.cfg.HELIUS_API_KEY)
 
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────
     # Lifecycle
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────
     async def connect(self):
         await self.plugin_mgr.initialize()
         await self.auditor.connect()
@@ -113,9 +106,9 @@ class ExecutionRouter:
         await self.guardian.close()
         logger.info("🔕 ExecutionRouter shut down.")
 
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────
     # Internal Helpers
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────
     async def _choose_rpc(self, signal: Dict[str, Any]) -> str:
         RPC_CALLS.inc()
         idx = self.rl_trader.pick_best_node(self.rpc_nodes, signal)
@@ -137,9 +130,9 @@ class ExecutionRouter:
             return f"Guardian blocked: {guardian.get('reason')}"
         return None
 
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────
     # Public: execute_trade
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────
     async def execute_trade(self, signal: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
         async with self.sem, tracer.start_as_current_span("execute_trade"):
             try:
