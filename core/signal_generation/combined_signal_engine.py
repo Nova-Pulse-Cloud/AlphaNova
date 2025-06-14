@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable
 
 import openai
-import aioredis
+import redis.asyncio as redis_async
 import numpy as np
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram, Gauge
@@ -30,8 +30,8 @@ from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from utils.token_utils import get_token_rug_score
 from core.alpha_memory_mesh import update_memory, get_token_memory_score
 from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
-from utils.plugin_manager import fire_event  # Unified event bus
-from fills_db import get_latest_fill_result  # RL feedback
+from utils.plugin_manager import fire_plugin_event
+from fills_db import get_latest_fill_result
 
 logger = logging.getLogger("nova.combined_signal_engine")
 logger.setLevel(logging.INFO)
@@ -50,12 +50,11 @@ SIG_ALERTS   = Counter("signal_alerts_total",    "Signal alerts")
 SIG_ACTION   = Gauge("signal_action_gauge",      "RL action output", ["action"])
 
 # === Shared Utilities ===
-
 def init_redis():
     global redis_client
     if not redis_client:
         redis_client = asyncio.get_event_loop().run_until_complete(
-            aioredis.from_url(config.REDIS_URL, decode_responses=True)
+            redis_async.from_url(config.REDIS_URL, decode_responses=True)
         )
 
 # === Data Models ===
@@ -102,6 +101,7 @@ class CombinedSignalEngine:
                 await hook(event, data)
             except Exception as e:
                 logger.error(f"[Event] Hook failure {hook}: {e}")
+        await fire_plugin_event(event, data)
 
     async def evaluate_alpha(self, symbol: str, agent_signals: List[Dict[str, Any]], user_context: Optional[Dict] = None) -> AlphaSignal:
         """
@@ -119,28 +119,27 @@ class CombinedSignalEngine:
                 weight = (trust + memory) / 2
                 scores[src] = base * weight
                 trusts[src] = weight
-
             # Market depth overlays
-            liquidity, whale = await get_orderbook_imbalance(symbol), await get_recent_whale_activity(symbol)
+            liquidity = await get_orderbook_imbalance(symbol)
+            whale_data = await get_recent_whale_activity(symbol)
+            whale_score = whale_data.get("score", 0)
             depth_adj = 1.0
-            if liquidity < 0.1: depth_adj *= 0.9
-            if whale > 0.8: depth_adj *= 1.2
-
+            if liquidity < 0.1:
+                depth_adj *= 0.9
+            if whale_score > 0.8:
+                depth_adj *= 1.2
             # Composite score
             score = sum(scores.values())/max(len(scores),1) * depth_adj
             risk  = 1 - min(trusts.values()) if trusts else 1
-            entry = float(agent_signals[0].get("entry", 0))
-            flavor= self._choose_flavor(scores, user_context)
-            meta  = {"trusts": trusts, "depth_adj": depth_adj}
-
+            entry = float(agent_signals[0].get("entry", 0)) if agent_signals else 0
+            flavor = self._choose_flavor(scores, user_context)
+            meta  = {"trusts": trusts, "depth_adj": depth_adj, "whale_score": whale_score}
             # Caption via LLM
             prompt = f"Caption for {symbol} with meta {meta}"
             caption= await self._gen_caption(prompt)
-
             # Provenance
             prov_str = f"{symbol}{scores}{meta}{flavor}{score}{risk}{entry}"
             prov_hash= hashlib.sha256(prov_str.encode()).hexdigest()
-
             signal = AlphaSignal(
                 symbol=symbol,
                 trigger_sources=scores,
@@ -166,7 +165,7 @@ class CombinedSignalEngine:
         Orchestrator: overlay fetch, RL action, ensemble combine, adaptive TP/SL, optional execution
         """
         init_redis()
-        auto = await redis_client.get(f"auto:{user}")
+        auto = await redis_client.get(f"auto:{user}") if user else None
         SIG_TRIGGERS.inc()
         start = datetime.utcnow()
         try:
@@ -174,28 +173,23 @@ class CombinedSignalEngine:
             overlays={}
             for n, fn in self.overlay_plugins.items():
                 overlays[n] = await fn(symbol)
-
             # RL action
             state = list(overlays.values())
-            fill  = await get_latest_fill_result(symbol, user)
+            fill  = await get_latest_fill_result(symbol, user) if user else None
             agent= DQNAgent()
             action,qv= agent.act(state, feedback=fill)
             SIG_ACTION.labels(action=str(action)).set(qv[action])
-
             # Ensemble or default
             if self.signal_plugins:
                 comps=[(n, await fn(symbol)) for n,fn in self.signal_plugins.items()]
                 composite=combine_ensemble(comps)
             else:
                 composite=self._default_signal(overlays)
-
             # TP/SL
             tp_sl= await self.adaptive_tp_sl.compute(symbol, overlays.get("price"), composite)
             composite.update(tp_sl)
-
             result={"symbol":symbol,"action":action,"composite":composite}
             await self.fire_event("signal_generated", result)
-
             if auto:
                 from core.execution_router import ExecutionRouter
                 # dispatch trade via execution_router
@@ -228,3 +222,11 @@ class CombinedSignalEngine:
     async def execute_trade(self, symbol:str, action:str, user:Optional[str]=None):
         # Use your unified executor here
         pass
+
+def combine_ensemble(comps: List[Any]) -> Dict[str, Any]:
+    # Placeholder: ensemble logic for combining plugin signals
+    if not comps:
+        return {"signal_strength": 0.0, "alert": False, "note": "No ensemble data"}
+    scores = [c[1]["signal_strength"] for c in comps if "signal_strength" in c[1]]
+    mean_score = float(np.mean(scores)) if scores else 0.0
+    return {"signal_strength": mean_score, "alert": mean_score > 0.85, "note": "Ensemble"}
