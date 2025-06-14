@@ -13,6 +13,7 @@ from prometheus_client import Counter, Histogram
 
 from core.wallet_manager import get_wallet_snapshot
 from core.trade_logger import get_trade_log
+from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.signal_sources import get_top_signals
 from core.alpha_memory_mesh import get_token_stats
 from core.top_wallet_tracer import get_recent_whale_tokens
@@ -23,6 +24,9 @@ from utils.signal_card import generate_signal_card
 from utils.config import OPENAI_API_KEY, REDIS_URL
 from core.plugin_manager import fire_plugin_event
 from core.reinforcement_learning import RLTrader  # RL Feedback Integration
+
+engine = CombinedSignalEngine(trade_memory, rl_tuner, adaptive_tp_sl)
+result = await engine.generate_signal(symbol)
 
 # Prometheus metrics
 COMMANDS_RECEIVED = Counter("commands_received_total", "Total commands received by the bot")
