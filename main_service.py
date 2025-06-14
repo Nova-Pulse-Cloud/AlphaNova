@@ -23,7 +23,7 @@ from utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_learning import ReinforcementTuner
 from core.execution.execution_router import ExecutionRouter
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
-from core.signal_generation.alpha_signal_agent import AlphaSignalAgent
+from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.agents.quantum_fractal_agent import QuantumFractalAgent
 from core.data_collection.social_sentiment import SocialSentimentEngine
 from core.signal_generation.sl_watchdog import start_sl_watchdog
