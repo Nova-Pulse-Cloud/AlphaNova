@@ -1,116 +1,140 @@
-import os
+"""
+Nova Pulse ALPHA – Whale‑Detector 2.0
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+• Live Solana whale sweep via **Helius v0 token‑transfer** endpoint.
+• Async TTL cache with Prometheus hit/miss telemetry.
+• Event‑bus emit → `whale_activity` for plug‑ins / Telegram feed.
+• Concurrency‑safe; no mock data ‑ production‑ready.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import logging
-import aiohttp
+import os
 import time
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Tuple
+
+import aiohttp
 from prometheus_client import Counter, Histogram
 
-logger = logging.getLogger("whale_detector")
+from utils.config import Config
+from utils.plugin_manager import fire_plugin_event
 
-# === Prometheus metrics ===
-WHALE_DETECTION_CALLS = Counter("whale_detection_calls_total", "Total whale detection API calls")
-WHALE_DETECTION_ERRORS = Counter("whale_detection_errors_total", "Total errors in whale detection")
-WHALE_DETECTION_LATENCY = Histogram("whale_detection_latency_seconds", "Latency of whale detection")
-WHALER_DETECTION_CACHE_HITS = Counter("whale_detection_cache_hits_total", "Cache hits for whale detection")
-WHALER_DETECTION_CACHE_MISSES = Counter("whale_detection_cache_misses_total", "Cache misses for whale detection")
+# ────────────────────────────────────────────────────────────────────────────────
+# Logging & Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+logger = logging.getLogger("nova.whale_detector")
+logger.setLevel(logging.INFO)
 
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-SOLANA_ADDRESS_BOOK = os.getenv("SOLANA_ADDRESS_BOOK", "https://api.helius.xyz/v0/addresses")  # Example
-SUI_API_URL = os.getenv("SUI_API_URL")  # For Sui whale scanning
+WHALE_API_CALLS = Counter("whale_api_calls_total", "Helius whale‑API calls")
+WHALE_API_ERRS  = Counter("whale_api_errors_total", "Errors from whale detector")
+WHALE_API_LAT   = Histogram("whale_api_latency_seconds", "Latency of whale‑API fetch")
 
-# ---- Caching mechanism (TTL 5 minutes) ----
-cache: Dict[str, Dict[str, Any]] = {}
-cache_ttl = 300  # 5 minutes in seconds
+WHALE_CACHE_HIT = Counter("whale_cache_hits_total", "Whale‑detector cache hits")
+WHALE_CACHE_MIS = Counter("whale_cache_misses_total", "Whale‑detector cache misses")
+WHALE_TX_TOTAL  = Counter("whale_tx_total", "Whale‑sized transfers detected")
 
-async def get_whale_activity_from_cache(symbol: str, chain: str) -> Dict[str, Any]:
-    key = f"{symbol}-{chain}"
-    current_time = time.time()
-    cached_data = cache.get(key)
+# ────────────────────────────────────────────────────────────────────────────────
+# Config & Constants
+# ────────────────────────────────────────────────────────────────────────────────
+_cfg = Config()
+HELIUS_KEY = _cfg.HELIUS_API_KEY
+HELIUS_ENDPOINT = "https://api.helius.xyz/v0/token-transfers"  # + params
 
-    if cached_data and (current_time - cached_data['timestamp'] < cache_ttl):
-        WHALER_DETECTION_CACHE_HITS.inc()
-        return cached_data['data']
-    else:
-        WHALER_DETECTION_CACHE_MISSES.inc()
+_CACHE_TTL = 300  # seconds
+_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_cache_lock = asyncio.Lock()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _cache_key(symbol: str, chain: str) -> str:
+    return f"{chain}:{symbol.upper()}"
+
+
+async def _read_cache(symbol: str, chain: str) -> Dict[str, Any] | None:
+    async with _cache_lock:
+        ts, data = _cache.get(_cache_key(symbol, chain), (0.0, None))
+        if time.time() - ts < _CACHE_TTL:
+            WHALE_CACHE_HIT.inc()
+            return data
+        WHALE_CACHE_MIS.inc()
         return None
 
-async def set_whale_activity_cache(symbol: str, chain: str, data: Dict[str, Any]):
-    key = f"{symbol}-{chain}"
-    cache[key] = {
-        "timestamp": time.time(),
-        "data": data
-    }
 
-# === Whale Activity Detection ===
-async def get_recent_whale_activity(symbol: str, chain: str = "solana") -> dict:
-    """
-    Get live recent whale trades/swaps for a given token symbol on supported chain.
-    Supports Solana (Helius), Sui (add your own endpoint), and plug-in for more.
-    Returns standardized whale meta for AI/risk/rotation/Telegram.
-    """
-    start_time = time.monotonic()
+async def _write_cache(symbol: str, chain: str, data: Dict[str, Any]):
+    async with _cache_lock:
+        _cache[_cache_key(symbol, chain)] = (time.time(), data)
+
+
+async def _fetch_solana_whales(symbol: str) -> List[Dict[str, Any]]:
+    url = f"{HELIUS_ENDPOINT}?api-key={HELIUS_KEY}&symbol={symbol}&limit=20"
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url, timeout=10) as resp:
+            resp.raise_for_status()
+            raw = await resp.json()
+            return raw.get("transfers", [])  # type: ignore[attr-defined]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Public API
+# ────────────────────────────────────────────────────────────────────────────────
+
+async def get_recent_whale_activity(symbol: str, *, chain: str = "solana", min_amount: float = 10_000) -> Dict[str, Any]:
+    """Return recent whale transfers + score (0‑1). Currently Solana only."""
+
+    if chain != "solana":
+        raise NotImplementedError("Only Solana chain implemented in v2.0")
+    if not HELIUS_KEY:
+        logger.warning("[WhaleDetector] Missing HELIUS_API_KEY – returning empty result")
+        return {"whales": [], "score": 0.0, "error": "no_api_key"}
+
+    if cached := await _read_cache(symbol, chain):
+        return cached
+
+    start = time.perf_counter()
     try:
-        whales = []
-        score = 0
-        
-        # Check cache first
-        cached_data = await get_whale_activity_from_cache(symbol, chain)
-        if cached_data:
-            return cached_data
-        
-        if chain == "solana" and HELIUS_API_KEY:
-            url = f"https://api.helius.xyz/v0/token-transfers?api-key={HELIUS_API_KEY}&symbol={symbol}&limit=10"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as res:
-                    if res.status == 200:
-                        data = await res.json()
-                        for tx in data.get("transfers", []):
-                            # Simplified: check for big swaps/mints/burns
-                            if tx.get("amount", 0) > 10000:  # Amount threshold for whale activity
-                                whales.append({
-                                    "from": tx.get("from"),
-                                    "to": tx.get("to"),
-                                    "amount": tx.get("amount"),
-                                    "tx": tx.get("signature"),
-                                    "time": tx.get("blockTime")
-                                })
-                        score = min(len(whales) / 10, 1.0)  # Simple score based on whale count
-
-        # (Future: Add Sui, ETH, BSC, and other chains by plug-in)
-        result = {
+        WHALE_API_CALLS.inc()
+        transfers = await _fetch_solana_whales(symbol)
+        whales = [
+            {
+                "from": tx.get("from"),
+                "to": tx.get("to"),
+                "amount": tx.get("amount"),
+                "sig": tx.get("signature"),
+                "slot": tx.get("slot"),
+                "time": tx.get("blockTime"),
+            }
+            for tx in transfers
+            if tx.get("amount", 0) >= min_amount
+        ]
+        for _ in whales:
+            WHALE_TX_TOTAL.inc()
+        score = min(len(whales) / 10, 1.0)
+        payload = {
+            "symbol": symbol,
             "whales": whales,
             "score": score,
-            "last_check": datetime.utcnow().isoformat(),
+            "checked_at": datetime.utcnow().isoformat(),
         }
-
-        # Set the cache for future requests
-        await set_whale_activity_cache(symbol, chain, result)
-        
-        WHALE_DETECTION_LATENCY.observe(time.monotonic() - start_time)
-        return result
-
+        await _write_cache(symbol, chain, payload)
+        await fire_plugin_event("whale_activity", payload)
+        WHALE_API_LAT.observe(time.perf_counter() - start)
+        return payload
     except Exception as e:
-        WHALE_DETECTION_ERRORS.inc()
-        logger.error(f"[WhaleDetector] Error for {symbol} on {chain}: {e}")
-        return {"whales": [], "score": 0, "error": str(e)}
+        WHALE_API_ERRS.inc()
+        logger.error("[WhaleDetector] %s | %s", symbol, e)
+        return {"whales": [], "score": 0.0, "error": str(e)}
 
-# === Retrieve Tokens with Recent Whale Activity ===
-async def get_recent_whale_tokens(limit: int = 5, chain: str = "solana") -> str:
-    """
-    Get a list of top tokens with the most recent whale activity—demo-ready for Telegram and dashboard.
-    """
-    try:
-        results = []
-        symbols = ["SOL", "USDC", "BONK", "RAY", "JUP"]  # Add top tokens from your source
-        for symbol in symbols[:limit]:
-            meta = await get_recent_whale_activity(symbol, chain=chain)
-            if meta.get("score", 0) > 0:
-                results.append(f"{symbol} (whale score: {meta['score']:.2f})")
-        
-        return "\n".join(results) if results else "No recent whale activity found."
-    
-    except Exception as e:
-        WHALE_DETECTION_ERRORS.inc()
-        logger.error(f"[WhaleDetector] Whale tokens error: {e}")
-        return "No whale data."
+
+async def get_recent_whale_tokens(*, limit: int = 6, chain: str = "solana") -> str:
+    """Return a human‑readable list of tokens with notable whale activity."""
+    top = ["SOL", "USDC", "RAY", "JUP", "BONK", "PYTH"][:limit]
+    lines: List[str] = []
+    for sym in top:
+        meta = await get_recent_whale_activity(sym, chain=chain)
+        if meta.get("score", 0) > 0:
+            lines.append(f"🐋 {sym} – score {meta['score']:.2f} – {len(meta['whales'])} tx")
+    return "\n".join(lines) or "No recent whale activity."
