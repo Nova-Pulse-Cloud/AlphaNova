@@ -25,7 +25,6 @@ solana
 solders
 anchorpy
 base58
-raydium-python
 pandas-ta
 prometheus-client
 opentelemetry-api
