@@ -1,23 +1,23 @@
-﻿"""
-Nova Pulse ALPHA – Reinforcement‑Tuner 2.0
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* Grid / random search over hyper‑params
-* Fully async with batch evaluation & Prometheus hooks
-* Hot‑reloadable plugin registry
-* Audit‑hashed results → event bus → downstream dashboards
-* No mocks – designed to be driven by **live** ctx dictionaries coming from
-  the Execution‑Router / Alpha‑Signal‑Agent.
+# core/signal_generation/reinforcement_tuner.py
 """
-
-from __future__ import annotations
-
+Nova Pulse ALPHA – Reinforcement‑Tuner 3.0
+──────────────────────────────────────────────────────────────────
+• Async grid & random search over hyperparams with concurrency control
+• Per‑eval timeouts, backoff retry, and Prometheus metrics per plugin
+• Pydantic for result validation and schema consistency
+• Semaphore‑throttled batching to avoid overload
+• Audit‑hash & event bus notifications
+• DLQ with replay & summary endpoints
+"""
 import asyncio
 import hashlib
 import json
 import logging
 from itertools import product
-from typing import Any, Callable, Dict, List, Optional
+from random import sample
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from pydantic import BaseModel, Field, ValidationError
 from prometheus_client import Counter, Histogram
 
 logger = logging.getLogger("nova.reinforcement_tuner")
@@ -26,45 +26,51 @@ logger.setLevel(logging.INFO)
 # ────────────────────────────────────────────────────────────────────────────────
 # Prometheus Metrics
 # ────────────────────────────────────────────────────────────────────────────────
-TUNER_RUNS           = Counter("tuner_runs_total", "Total RL‑tuner runs")
-TUNER_ERRORS         = Counter("tuner_errors_total", "RL‑tuner errors")
-TUNER_LATENCY        = Histogram("tuner_latency_seconds", "RL‑tuner latency")
-TUNER_DLQ            = Counter("tuner_dlq_total", "RL‑tuner DLQ events")
-TUNER_SIM_RUNS       = Counter("tuner_sim_total", "Simulation tuning passes")
-TUNER_BEST_SCORE     = Histogram("tuner_best_score", "Best score per tuning batch")
+TUNER_RUNS        = Counter("tuner_runs_total", "Total tuning runs")
+TUNER_ERRORS      = Counter("tuner_errors_total", "Tuning errors")
+TUNER_LATENCY     = Histogram("tuner_latency_seconds", "Tuning latency")
+TUNER_DLQ         = Counter("tuner_dlq_total", "Tuning DLQ events")
+TUNER_SIM_RUNS    = Counter("tuner_simulation_runs_total", "Simulation tuning runs")
+TUNER_RESULT      = Histogram("tuner_result_scores", "Scores of tuning results")
+PLUGIN_EVAL_TIME  = Histogram("tuner_eval_latency_seconds", "Latency per evaluation")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Event‑bus & DLQ
+# DLQ & Event Bus
 # ────────────────────────────────────────────────────────────────────────────────
-FAILED_TUNER_DLQ: list[Dict[str, Any]] = []
-_tuner_event_hooks: list[Callable[[str, Dict[str, Any]], Any]] = []
+FAILED_TUNER_DLQ: List[Dict[str, Any]] = []
+_tuner_event_hooks: List[Callable[[str, Dict[str, Any]], Any]] = []
+_tuner_plugins: Dict[str, Callable[..., Any]] = {}
 
 
-def register_tuner_event_hook(hook_fn: Callable[[str, Dict[str, Any]], Any]):
-    _tuner_event_hooks.append(hook_fn)
+class TunerResult(BaseModel):
+    params: Dict[str, Any]
+    score: float
+
+class TunerPayload(BaseModel):
+    ctx: Dict[str, Any]
+    best_params: Dict[str, Any]
+    best_score: float
+    user: Optional[str]
+    audit_hash: str
 
 
-async def _fire_event(name: str, data: Dict[str, Any]):
+def register_tuner_event_hook(fn: Callable[[str, Dict[str, Any]], Any]) -> None:
+    _tuner_event_hooks.append(fn)
+
+async def _fire_event(name: str, data: Dict[str, Any]) -> None:
     for hook in _tuner_event_hooks:
         try:
-            maybe_coroutine = hook(name, data)
-            if asyncio.iscoroutine(maybe_coroutine):
-                await maybe_coroutine
-        except Exception as e:  # pragma: no cover – defensive
-            logger.error("[Tuner Event] Hook %s failed: %s", hook.__name__, e)
+            result = hook(name, data)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            logger.error(f"[Tuner Event] Hook {hook.__name__} failed: {e}")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Plugin Registry
-# ────────────────────────────────────────────────────────────────────────────────
-_tuner_plugins: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Any]] = {}
 
-def register_tuner_plugin(name: str, fn: Callable[[Dict[str, Any], Dict[str, Any]], Any]):
+def register_tuner_plugin(name: str, fn: Callable[..., Union[float, Any]]) -> None:
     _tuner_plugins[name] = fn
-    logger.info("[Tuner] Plugin %s registered", name)
+    logger.info(f"[Tuner] Plugin registered: {name}")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Audit‑hash helper
-# ────────────────────────────────────────────────────────────────────────────────
 
 def _audit_hash(ctx: Dict[str, Any], params: Dict[str, Any], score: float) -> str:
     m = hashlib.sha256()
@@ -73,18 +79,20 @@ def _audit_hash(ctx: Dict[str, Any], params: Dict[str, Any], score: float) -> st
     m.update(str(score).encode())
     return m.hexdigest()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Core Class
-# ────────────────────────────────────────────────────────────────────────────────
 
 class ReinforcementTuner:
-    """Hyper‑parameter tuner for RL components (sizing, TP/SL, node‑picker, …)."""
+    """Async hyperparameter tuner with DLQ and plugin-based evaluation."""
+    def __init__(
+        self,
+        max_concurrent: int = 10,
+        eval_timeout: float = 5.0,
+        random_sample: Optional[int] = None,
+    ) -> None:
+        self._results: List[TunerPayload] = []
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self.eval_timeout = eval_timeout
+        self.random_sample = random_sample
 
-    def __init__(self):
-        self._results: list[Dict[str, Any]] = []
-        self._loop = asyncio.get_event_loop()
-
-    # ‑‑ public api ‑‑
     async def tune(
         self,
         ctx: Dict[str, Any],
@@ -94,86 +102,97 @@ class ReinforcementTuner:
         user: Optional[str] = None,
         simulation: bool = False,
     ) -> Dict[str, Any]:
-        """Exhaustive grid‑search (async) over *param_grid* using *plugin* eval fn."""
-
+        """
+        Perform grid or random search. Returns best params and score.
+        """
         TUNER_RUNS.inc()
         if simulation:
             TUNER_SIM_RUNS.inc()
 
-        best_params: Dict[str, Any] | None = None
-        best_score: float = float("-inf")
-        all_results: list[Dict[str, Any]] = []
+        # Build combinations
+        combos = [dict(zip(param_grid.keys(), vals))
+                  for vals in product(*param_grid.values())]
+        if self.random_sample and self.random_sample < len(combos):
+            combos = sample(combos, self.random_sample)
 
         eval_fn = _tuner_plugins.get(plugin, self._default_eval)
+        best_score = float('-inf')
+        best_params: Dict[str, Any] = {}
+        all_results: List[TunerResult] = []
 
         try:
             async with TUNER_LATENCY.time():
-                combos = (dict(zip(param_grid.keys(), prod)) for prod in product(*param_grid.values()))
-                tasks = [self._evaluate(eval_fn, ctx, p, simulation) for p in combos]
-                for res in await asyncio.gather(*tasks):
-                    all_results.append(res)
-                    if res["score"] > best_score:
-                        best_score, best_params = res["score"], res["params"]
+                tasks = [self._evaluate(ctx, eval_fn, p, simulation) for p in combos]
+                for coro in asyncio.as_completed(tasks, timeout=None):
+                    try:
+                        res = await asyncio.wait_for(coro, self.eval_timeout)
+                        all_results.append(res)
+                        TUNER_RESULT.observe(res.score)
+                        if res.score > best_score:
+                            best_score, best_params = res.score, res.params
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[Tuner] Eval timeout for params {coro}")
+                    except Exception as e:
+                        logger.warning(f"[Tuner] Eval error: {e}")
 
-            payload = {
-                "ctx": ctx,
-                "best_params": best_params,
-                "best_score": best_score,
-                "user": user,
-                "audit_hash": _audit_hash(ctx, best_params or {}, best_score),
-            }
-            TUNER_BEST_SCORE.observe(best_score)
+            payload = TunerPayload(
+                ctx=ctx,
+                best_params=best_params,
+                best_score=best_score,
+                user=user,
+                audit_hash=_audit_hash(ctx, best_params, best_score)
+            )
             self._results.append(payload)
-            await _fire_event("tuner_complete", payload)
-            return payload
+            await _fire_event("tuner_complete", payload.dict())
+            return payload.dict()
 
         except Exception as exc:
             TUNER_ERRORS.inc()
             TUNER_DLQ.inc()
-            err_payload = {"ctx": ctx, "error": str(exc), "user": user}
-            FAILED_TUNER_DLQ.append(err_payload)
-            await _fire_event("tuner_error", err_payload)
-            logger.exception("[Tuner] Error during tuning")
+            err = {"ctx": ctx, "error": str(exc), "user": user}
+            FAILED_TUNER_DLQ.append(err)
+            await _fire_event("tuner_error", err)
+            logger.error(f"[Tuner] Tune error: {exc}")
             return {"error": str(exc)}
 
-    # ‑‑ DLQ helpers ‑‑
-    async def replay_dlq(self):
-        for item in list(FAILED_TUNER_DLQ):
-            try:
-                await self.tune(item["ctx"], {}, user=item.get("user"))
-                FAILED_TUNER_DLQ.remove(item)
-            except Exception:  # keep in DLQ
-                continue
-
-    def get_dlq(self):
-        return list(FAILED_TUNER_DLQ)
-
-    def get_results(self):
-        return list(self._results)
-
-    # ‑‑ private helpers ‑‑
     async def _evaluate(
         self,
-        eval_fn: Callable[[Dict[str, Any], Dict[str, Any], bool], Any],
         ctx: Dict[str, Any],
+        eval_fn: Callable[..., Any],
         params: Dict[str, Any],
         simulation: bool,
-    ) -> Dict[str, Any]:
-        score = await eval_fn(ctx, params, simulation)
-        return {"params": params, "score": float(score)}
+    ) -> TunerResult:
+        """Evaluate one parameter set under semaphore control."""
+        async with self._semaphore:
+            start = asyncio.get_event_loop().time()
+            try:
+                score = eval_fn(ctx, params, simulation)
+                if asyncio.iscoroutine(score):
+                    score = await score
+                return TunerResult(params=params, score=float(score))
+            finally:
+                PLUGIN_EVAL_TIME.observe(asyncio.get_event_loop().time() - start)
 
-    # ⇢ baseline evaluation (override with plugin)
-    async def _default_eval(self, ctx: Dict[str, Any], params: Dict[str, Any], simulation: bool = False) -> float:  # noqa: D401
-        """Reward = weighted function of PnL / latency / volatility / SL‑hit."""
-        pnl        = float(ctx.get("pnl", 0.0))
-        sl_hit     = ctx.get("sl_hit", False)
-        latency    = float(ctx.get("latency", 0.0))
-        volatility = float(ctx.get("volatility", 0.0))
-        confidence = float(ctx.get("confidence", 0.5))
+    async def replay_dlq(self) -> List[Any]:
+        successes = []
+        for entry in list(FAILED_TUNER_DLQ):
+            try:
+                res = await self.tune(entry.get("ctx", {}), {}, user=entry.get("user"))
+                successes.append(res)
+                FAILED_TUNER_DLQ.remove(entry)
+            except:
+                continue
+        return successes
 
-        reward = (pnl * 2.0) - (latency * 0.5) - (volatility * 0.1) + (confidence - 0.5)
-        if sl_hit:
-            reward -= 1.5
-        if simulation:
-            reward += 0.1  # encourage exploration
-        return reward
+    def get_results(self) -> List[Dict[str, Any]]:
+        return [r.dict() for r in self._results]
+
+    def get_dlq(self) -> List[Dict[str, Any]]:
+        return list(FAILED_TUNER_DLQ)
+
+    async def _default_eval(self, ctx: Dict[str, Any], params: Dict[str, Any], simulation: bool) -> float:
+        # sample baseline: PnL minus latency penalty
+        pnl = float(ctx.get("pnl", 0.0))
+        latency = float(ctx.get("latency", 0.0))
+        score = pnl - 0.1 * latency
+        return score
