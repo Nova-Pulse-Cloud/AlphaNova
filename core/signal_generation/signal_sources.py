@@ -1,201 +1,222 @@
+# core/signal_generation/signal_sources.py
+
 import asyncio
-import logging
 import hashlib
 import json
-import uuid
+import logging
 import time
-from typing import Dict, Any, Optional, Callable, List
+import uuid
+from typing import Any, Dict, Optional, List
+
+from pydantic import BaseModel, Field, ValidationError
 from prometheus_client import Counter, Histogram
-from core.adaptive_tp_sl import AdaptiveTPSL  # Import AdaptiveTPSL to integrate dynamic TP/SL
-from core.orderbook_overlay import OrderBookOverlay  # Import OrderBookOverlay for market depth analysis
 
-logger = logging.getLogger("signal_sources")
+from core.adaptive_tp_sl import AdaptiveTPSL
+from core.data_collection.orderbook_overlay import OrderBookOverlay
+from core.utils.config import config
 
-# === Prometheus metrics ===
-SOURCE_FETCHES = Counter("signal_source_fetches_total", "Signal source fetches")
-SOURCE_ERRORS = Counter("signal_source_errors_total", "Signal source errors")
-SOURCE_LATENCY = Histogram("signal_source_latency_seconds", "Signal source latency")
-SOURCE_DLQ = Counter("signal_source_dlq_total", "Signal source DLQ events")
-SOURCE_ALERTS = Counter("signal_source_alert_total", "Signal source alert triggers")
+logger = logging.getLogger("nova.signal_sources")
+logger.setLevel(logging.INFO)
 
-# === DLQ, event hooks, plugin registry ===
-FAILED_SOURCE_DLQ = []
-source_event_hooks = []
+# ────────────────────────────────────────────────────────────────────────────────
+# Prometheus Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+SOURCE_FETCHES    = Counter("signal_source_fetches_total",      "Signal source fetches")
+SOURCE_ERRORS     = Counter("signal_source_errors_total",       "Signal source errors")
+SOURCE_LATENCY    = Histogram("signal_source_latency_seconds",   "Signal fetch latency")
+SOURCE_DLQ        = Counter("signal_source_dlq_total",         "Signal source DLQ events")
+SOURCE_ALERTS     = Counter("signal_source_alert_total",        "Signal source alert triggers")
+PLUGIN_LATENCY    = Histogram("signal_source_plugin_latency_seconds", "Latency per plugin", ["plugin"])
+PLUGIN_ERRORS     = Counter("signal_source_plugin_errors_total",   "Errors per plugin",   ["plugin"])
 
-def register_source_event_hook(hook_fn):
-    source_event_hooks.append(hook_fn)
+# ────────────────────────────────────────────────────────────────────────────────
+# Plugin Registry & DLQ
+# ────────────────────────────────────────────────────────────────────────────────
+FAILED_SOURCE_DLQ  : List[Dict[str, Any]] = []
+source_event_hooks   : List[Any] = []
+source_plugins       : Dict[str, Any] = {}
+_cache_locks         : Dict[str, asyncio.Lock] = {}
 
-async def fire_source_event(event_name, data):
+
+def register_source_event_hook(fn: Any):
+    source_event_hooks.append(fn)
+
+async def fire_source_event(event: str, payload: Dict[str, Any]) -> None:
     for hook in source_event_hooks:
-        await hook(event_name, data)
+        try:
+            await hook(event, payload)
+        except Exception:
+            logger.warning(f"[SignalSources] Event hook {hook.__name__} failed")
 
-source_plugins = {}
 
-def register_source_plugin(name: str, fn: Callable):
+def register_source_plugin(name: str, fn: Any) -> None:
     source_plugins[name] = fn
 
-# === Audit hash ===
-def source_hash(source: dict, result: dict) -> str:
-    m = hashlib.sha256()
-    m.update(json.dumps(source, sort_keys=True).encode())
-    m.update(json.dumps(result, sort_keys=True).encode())
-    return m.hexdigest()
+# ────────────────────────────────────────────────────────────────────────────────
+# Data Models
+# ────────────────────────────────────────────────────────────────────────────────
+class RawSignal(BaseModel):
+    price: float = Field(..., gt=0)
+    volume: float = Field(0)
+    trend: float = Field(0)
+    sentiment: float = Field(0)
+    news: float = Field(0)
+    alert: bool = Field(False)
+    timestamp: int
+    simulation: bool
 
+# ────────────────────────────────────────────────────────────────────────────────
+# SignalSources Class
+# ────────────────────────────────────────────────────────────────────────────────
 class SignalSources:
-    def __init__(self, adaptive_tp_sl: AdaptiveTPSL, orderbook_overlay: OrderBookOverlay):
-        self.last_source = None
-        self.alerts = []
-        self.loop = asyncio.get_event_loop()
-        self.cache = {}
-        self.cache_ttl = 5  # seconds
-        self.adaptive_tp_sl = adaptive_tp_sl  # Initialize the adaptive TP/SL module
-        self.orderbook_overlay = orderbook_overlay  # Initialize the OrderBookOverlay module
+    def __init__(self,
+                 adaptive_tp_sl: AdaptiveTPSL,
+                 orderbook_overlay: OrderBookOverlay,
+                 cache_ttl: int = 5
+                 ):
+        self.adaptive_tp_sl = adaptive_tp_sl
+        self.orderbook_overlay = orderbook_overlay
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.cache_ttl = cache_ttl
 
-    async def fetch_source(self, ctx: Dict[str, Any], plugin: str = "default", user: Optional[str] = None, simulation: bool = False) -> Dict[str, Any]:
+    async def fetch_source(self,
+                           ctx: Dict[str, Any],
+                           plugin: str = "default",
+                           user: Optional[str] = None,
+                           simulation: bool = False
+                           ) -> Dict[str, Any]:
         SOURCE_FETCHES.inc()
+        start = time.time()
         trace_id = ctx.get("trace_id") or f"sig-{uuid.uuid4().hex[:8]}"
         ctx["trace_id"] = trace_id
-        key = json.dumps(ctx, sort_keys=True)
+        key = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
 
-        # Check cache
-        if key in self.cache:
-            if time.time() - self.cache[key]["ts"] < self.cache_ttl:
-                return self.cache[key]["value"]
+        # Stampede-safe cache
+        lock = _cache_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            entry = self.cache.get(key)
+            if entry and time.time() - entry["ts"] < self.cache_ttl:
+                result = entry["value"]
+                SOURCE_LATENCY.observe(time.time() - start)
+                return result
 
-        try:
-            async with SOURCE_LATENCY.time():
-                # Fetch signals based on the plugin type
+            try:
+                # Parallel plugin fetch
                 if plugin == "ensemble":
-                    result = await self._fetch_ensemble(ctx, user, simulation)
+                    raw = await self._fetch_ensemble(ctx, user, simulation)
                 else:
                     fn = source_plugins.get(plugin, self.default_source)
-                    result = await asyncio.wait_for(fn(ctx, user=user, simulation=simulation), timeout=4.0)
+                    raw = await asyncio.wait_for(fn(ctx, user=user, simulation=simulation), timeout=3.0)
 
-                # Integrate the signal data into adaptive TP/SL system
-                signal_data = await self._process_for_tp_sl(ctx, result)
+                # Validate and normalize
+                try:
+                    signal = RawSignal(**raw)
+                except ValidationError as ve:
+                    raise RuntimeError(f"Plugin output invalid: {ve}")
 
-                # Integrate OrderBookOverlay data for liquidity and market depth analysis
-                orderbook_data = await self.orderbook_overlay.analyze(ctx.get("symbol"))
-                signal_data["orderbook_data"] = orderbook_data  # Attach market depth data to the signal
+                # Enrich with TP/SL (isolated)
+                try:
+                    tp_sl = await self.adaptive_tp_sl.compute(ctx.get("symbol"), signal.price, signal.dict())
+                    signal_dict = signal.dict()
+                    signal_dict.update(tp_sl)
+                except Exception as e:
+                    logger.warning(f"[SignalSources] TP/SL enrichment failed: {e}")
+                    signal_dict = signal.dict()
 
-                result["trace_id"] = trace_id
-                rationale = ctx.get("note", result.get("note", "No rationale"))
+                # Enrich with orderbook data (isolated)
+                try:
+                    ob = await self.orderbook_overlay.analyze(ctx.get("symbol"))
+                    signal_dict["orderbook_data"] = ob
+                except Exception as e:
+                    logger.warning(f"[SignalSources] Orderbook enrichment failed: {e}")
+
+                # Build audit
                 audit = {
                     "ctx": ctx,
-                    "source": result,
+                    "source": signal_dict,
                     "user": user,
                     "simulation": simulation,
                     "trace_id": trace_id,
-                    "rationale": rationale,
-                    "audit_hash": source_hash(ctx, result)
+                    "timestamp": int(time.time()),
+                    "audit_hash": hashlib.sha256(json.dumps(signal_dict, sort_keys=True).encode()).hexdigest()
                 }
 
-                # Fire events for fetched signals
+                # Cache and emit events
+                self.cache[key] = {"ts": time.time(), "value": audit}
                 await fire_source_event("source_fetched", audit)
-                self.last_source = audit
 
-                if result.get("alert"):
+                if signal.alert:
                     SOURCE_ALERTS.inc()
-                    self.alerts.append(audit)
                     await fire_source_event("source_alert", audit)
 
-                self.cache[key] = {"ts": time.time(), "value": audit}
                 return audit
 
-        except Exception as e:
-            SOURCE_ERRORS.inc()
-            SOURCE_DLQ.inc()
-            err_data = {"ctx": ctx, "error": str(e), "user": user, "trace_id": trace_id}
-            FAILED_SOURCE_DLQ.append(err_data)
-            await fire_source_event("source_error", err_data)
-            logger.error(f"[SignalSources] Source fetch error: {e}")
-            return {"error": str(e), "user": user, "trace_id": trace_id}
-
-    async def _fetch_ensemble(self, ctx: Dict[str, Any], user: Optional[str], simulation: bool) -> Dict[str, Any]:
-        responses = []
-        for name, plugin in source_plugins.items():
-            try:
-                result = await asyncio.wait_for(plugin(ctx, user=user, simulation=simulation), timeout=3.5)
-                responses.append(result)
             except Exception as e:
-                logger.warning(f"[SignalSources] Plugin {name} failed: {e}")
-                continue
+                SOURCE_ERRORS.inc()
+                SOURCE_DLQ.inc()
+                err = {"ctx": ctx, "error": str(e), "user": user, "trace_id": trace_id}
+                FAILED_SOURCE_DLQ.append(err)
+                await fire_source_event("source_error", err)
+                logger.error(f"[SignalSources] fetch_source error: {e}")
+                return err
 
-        if not responses:
+            finally:
+                SOURCE_LATENCY.observe(time.time() - start)
+
+    async def _fetch_ensemble(self,
+                              ctx: Dict[str, Any],
+                              user: Optional[str],
+                              simulation: bool
+                              ) -> Dict[str, Any]:
+        tasks = []
+        for name, fn in source_plugins.items():
+            tasks.append(self._run_plugin(name, fn, ctx, user, simulation))
+
+        results = await asyncio.gather(*tasks)
+        # Filter successes
+        good = [r for r in results if isinstance(r, dict)]
+        if not good:
             return await self.default_source(ctx, user, simulation)
 
-        # Aggregating results from multiple plugins
+        # Aggregate
         agg = {
-            "price": sum(r.get("price", 0) for r in responses) / len(responses),
-            "volume": sum(r.get("volume", 0) for r in responses) / len(responses),
-            "trend": sum(r.get("trend", 0) for r in responses) / len(responses),
-            "sentiment": sum(r.get("sentiment", 0) for r in responses) / len(responses),
-            "news": sum(r.get("news", 0) for r in responses) / len(responses),
-            "alert": any(r.get("alert") for r in responses),
+            "price": sum(r["price"] for r in good) / len(good),
+            "volume": sum(r.get("volume", 0) for r in good) / len(good),
+            "trend": sum(r.get("trend", 0) for r in good) / len(good),
+            "sentiment": sum(r.get("sentiment", 0) for r in good) / len(good),
+            "news": sum(r.get("news", 0) for r in good) / len(good),
+            "alert": any(r.get("alert") for r in good),
             "timestamp": ctx.get("timestamp"),
             "simulation": simulation
         }
         return agg
 
-    async def _process_for_tp_sl(self, ctx: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process the fetched signal data for integration into the adaptive TP/SL system.
-        Uses the AdaptiveTPSL class to calculate dynamic TP/SL based on the signal.
-        """
-        signal_context = {
-            "price": result.get("price"),
-            "volatility": result.get("volatility", 0.02),
-            "trend_strength": result.get("trend", 0.0),
-            "whale_pressure": result.get("whale_pressure", 0.0),
-            "spread": result.get("spread", 0.001),
-            "gas_cost": result.get("gas_cost", 0.0),
-            "orderbook_bias": result.get("orderbook_bias", 0.0),
-            "rug_score": result.get("rug_score", 0.0),
-            "cycle_phase": result.get("cycle_phase", 0.5),
-            "user_risk": result.get("user_risk", 0.0)
-        }
-        # Use the AdaptiveTPSL class to compute dynamic TP/SL based on the signal
-        tp_sl = await self.adaptive_tp_sl.compute(ctx.get("symbol"), result.get("price"), signal_context)
-        
-        # Append the TP/SL data to the result
-        result["tp"] = tp_sl["tp"]
-        result["sl"] = tp_sl["sl"]
-        result["rr_ratio"] = tp_sl["rr_ratio"]
-        result["size"] = tp_sl["size"]
+    async def _run_plugin(self,
+                          name: str,
+                          fn: Any,
+                          ctx: Dict[str, Any],
+                          user: Optional[str],
+                          simulation: bool
+                          ) -> Any:
+        start = time.time()
+        try:
+            result = await asyncio.wait_for(fn(ctx, user=user, simulation=simulation), timeout=3.0)
+            PLUGIN_LATENCY.labels(plugin=name).observe(time.time() - start)
+            return result
+        except Exception as e:
+            PLUGIN_ERRORS.labels(plugin=name).inc()
+            logger.warning(f"[SignalSources] plugin {name} failed: {e}")
+            return {}
 
-        return result
-
-    async def default_source(self, ctx: Dict[str, Any], user: Optional[str] = None, simulation: bool = False) -> Dict[str, Any]:
-        price = ctx.get("price", 0.0)
-        volume = ctx.get("volume", 0.0)
-        news = ctx.get("news", 0.0)
-        trend = ctx.get("trend", 0.0)
-        sentiment = ctx.get("sentiment", 0.0)
-        alert = abs(price) > 1_000_000 or trend > 0.85
-        return {
-            "price": price,
-            "volume": volume,
-            "news": news,
-            "trend": trend,
-            "sentiment": sentiment,
-            "alert": alert,
-            "timestamp": ctx.get("timestamp"),
-            "simulation": simulation
-        }
-
-    async def replay_dlq(self):
-        for failed in FAILED_SOURCE_DLQ[:]:
+    async def replay_dlq(self) -> None:
+        for entry in FAILED_SOURCE_DLQ[:]:
             try:
-                _ = await self.fetch_source(failed.get("ctx", {}), user=failed.get("user"))
-                FAILED_SOURCE_DLQ.remove(failed)
-            except Exception:
-                continue
+                await self.fetch_source(entry.get("ctx", {}), user=entry.get("user"))
+                FAILED_SOURCE_DLQ.remove(entry)
+            except: pass
 
-    def get_dlq(self):
-        return FAILED_SOURCE_DLQ.copy()
+    def get_dlq(self) -> List[Dict[str, Any]]:
+        return list(FAILED_SOURCE_DLQ)
 
-    def get_alerts(self):
-        return self.alerts
-
-    def get_last_source(self):
-        return self.last_source
+    def get_last(self) -> Optional[Dict[str, Any]]:
+        return self.cache.get(next(iter(self.cache)), {}).get("value")
