@@ -1,4 +1,5 @@
 # File: main_service.py
+# Elite pre-launch main service wiring for Nova Pulse Alpha
 
 import os
 import glob
@@ -16,31 +17,31 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+# Core imports
 from utils.config import Config
 from core.wallet_management.wallet_manager import WalletManager
 from utils.trade_memory import TradeMemory
-from core.signal_generation.reinforcement_learning import ReinforcementTuner
+from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.execution.execution_router import ExecutionRouter
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
+from core.signal_generation.alpha_signal_agent import AlphaSignalAgent
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.agents.quantum_fractal_agent import QuantumFractalAgent
-from core.data_collection.social_sentiment import SocialSentimentEngine
-from core.signal_generation.sl_watchdog import start_sl_watchdog
+from core.data_collection.social_sentiment import SocialSentiment
 from core.data_collection.tech_indicator_agent import TechIndicatorAgent
-from core.plugin_manager import PluginManager
+from core.signal_generation.sl_watchdog import start_sl_watchdog
+from core.plugin_manager import PluginManager  # legacy import replaced below, kept for backward compat
+from core.utils.plugin_manager import PluginManager as CorePluginManager
 from core.ws_endpoint import ws_manager, websocket_endpoint
-from core.feedback_router import build_feedback_router, router as feedback_router
 from core.rl_trainer_loop import RLTrainerLoop
-from core.pnl_api import router as pnl_router
-from core.telegram_pusher import push_trade_update
 from core.auto_trader import AutoTrader
-from core.helius_hooks import helius_router, register_helius_webhook
+from core.helius_hooks import register_helius_webhook
 from utils.token_auditor import TokenAuditor
 from utils.token_guardian import TokenGuardian
 from utils.trade_logger import log_trade
-from utils.dlq_manager import get_all_dlq, get_dlq_summary, replay_execution_dlq
+from utils.dlq_manager import get_dlq_summary, replay_execution_dlq
 
-# --- Signal/Trade Card Imports ---
+# --- Signal & PnL card renderers ---
 from utils.signal_card import generate_signal_card
 from utils.pnl_card import generate_pnl_card
 from aiogram import Bot
@@ -68,10 +69,10 @@ class Settings(BaseSettings):
 settings = Settings()
 config = Config()
 
-# Telegram Bot (aiogram)
+# Telegram Bot
 bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
-# FastAPI app
+# FastAPI app setup
 app = FastAPI(title="Nova Pulse Alpha", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -86,10 +87,9 @@ app.add_api_websocket_route("/ws/signal_feed", websocket_endpoint)
 # Prometheus metrics
 start_http_server(settings.METRICS_PORT)
 signals_counter = Counter('nova_signals_generated', 'Signals generated')
-agents_gauge    = Gauge('nova_agents_active',     'Active agents in mesh')
+agents_gauge    = Gauge('nova_agents_active', 'Active agents in mesh')
 
-# Initialize core components
-tools_logger = logging.getLogger()
+# Initialize core subsystems
 wallet_manager   = WalletManager(config)
 trade_memory     = TradeMemory(config)
 rl_tuner         = ReinforcementTuner(config)
@@ -101,7 +101,7 @@ execution_router = ExecutionRouter(
 auditor          = TokenAuditor(config.REDIS_URL)
 guardian         = TokenGuardian(config.HELIUS_API_KEY)
 explainer        = SignalExplainerAI(config.OPENAI_API_KEY)
-plugin_manager   = PluginManager()
+plugin_manager   = CorePluginManager()
 auto_trader      = AutoTrader(
     redis_url=settings.REDIS_URL,
     router=execution_router,
@@ -110,30 +110,27 @@ auto_trader      = AutoTrader(
     telegram_chat_id=settings.TELEGRAM_CHAT_ID
 )
 
-# Agent registry
-AGENT_REGISTRY: dict[str, any] = {}
-
-def register_agent(name: str, agent_obj: any):
+# Agent registry\AGENT_REGISTRY: dict[str, Any] = {}
+def register_agent(name: str, agent_obj: Any):
     AGENT_REGISTRY[name] = agent_obj
 
+# Register analysis agents
 register_agent(
     "alpha_signal",
     AlphaSignalAgent(
-        redis_url=settings.REDIS_URL,
-        openai_api_key=settings.OPENAI_API_KEY,
+        config=config,
         trade_memory=trade_memory,
-        rl_tuner=rl_tuner
+        rl_tuner=rl_tuner,
+        orderbook_overlay=None  # injected dynamically if needed
     )
 )
 register_agent("quantum_fractal", QuantumFractalAgent(config))
-register_agent("social_sentiment", SocialSentimentEngine(config))
+register_agent("social_sentiment", SocialSentiment(config))
 register_agent("tech_indicators", TechIndicatorAgent(config))
 
+# Fusion logic
 async def adaptive_signal_fusion(symbol: str, agent_results: list[dict]) -> dict:
-    weights = {
-        res["source"]: getattr(rl_tuner, 'get_trust_score', lambda s, sym: 1.0)(res["source"], symbol)
-        for res in agent_results
-    }
+    weights = {res["source"]: rl_tuner.get_trust_score(res["source"], symbol) for res in agent_results}
     total = sum(weights.values()) or 1.0
     score = sum(res["score"] * weights[res["source"]] for res in agent_results) / total
     entropy_penalty = 1.0 - min(max(score, 0), 1)
@@ -145,20 +142,16 @@ async def adaptive_signal_fusion(symbol: str, agent_results: list[dict]) -> dict
         "meta": {"fusion": "adaptive_trust_entropy", "agents": list(weights.keys())}
     }
 
-async def load_plugins_from_dir(directory: str = "core/plugins"):
-    plugin_map = {
-        os.path.splitext(os.path.basename(f))[0]:
-        f.replace('/', '.')[:-3]
-        for f in glob.glob(f"{directory}/*.py")
-    }
-    await plugin_manager.initialize(plugin_map)
-    logging.info("🔌 Loaded plugins: %s", list(plugin_map.keys()))
+# Plugin loading\async def load_plugins_from_dir(directory: str = "core/plugins"):
+    mapping = {os.path.splitext(os.path.basename(f))[0]: f.replace('/', '.')[:-3]
+               for f in glob.glob(f"{directory}/*.py")}
+    await plugin_manager.initialize(mapping)
+    logging.info("🔌 Loaded plugins: %s", list(mapping.keys()))
 
+# Logging & tracing
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 def setup_tracing():
     exporter = JaegerExporter(
@@ -168,81 +161,53 @@ def setup_tracing():
     provider = TracerProvider(resource=Resource.create({"service.name": "nova-pulse"}))
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
-    logging.info(f"✅ Jaeger tracing initialized on {settings.JAEGER_HOST}:{settings.JAEGER_PORT}")
+    logging.info("✅ Jaeger tracing initialized on %s:%s", settings.JAEGER_HOST, settings.JAEGER_PORT)
 
-# --- Telegram card pushers ---
+# Telegram pushers
 async def push_signal_card(signal: dict):
     try:
         img = await generate_signal_card(signal)
-        caption = (
-            f"🚨 *Nova Pulse Signal*\n"
-            f"Symbol: {signal.get('symbol')}\n"
-            f"Confidence: {signal.get('score'):.2f}\n"
-            f"Entry: {signal.get('entry', 'N/A')}\n"
-            f"TP: {signal.get('tp', '...')} | SL: {signal.get('sl', '...')}\n"
-            f"@NovaPulseAI"
-        )
-        await bot.send_photo(
-            chat_id=settings.TELEGRAM_CHAT_ID,
-            photo=img,
-            caption=caption,
-            parse_mode="Markdown"
-        )
+        caption = (f"🚨 *Nova Pulse Signal*\n"
+                   f"Symbol: {signal.get('symbol')}\n"
+                   f"Confidence: {signal.get('score'):.2f}\n"
+                   f"Entry: {signal.get('entry', 'N/A')}\n"
+                   f"TP: {signal.get('tp', '...')} | SL: {signal.get('sl', '...')}\n"
+                   f"@NovaPulseAI")
+        await bot.send_photo(settings.TELEGRAM_CHAT_ID, img, caption, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"[push_signal_card] Failed to send signal card: {e}")
+        logging.error("[push_signal_card] %s", e)
 
 async def push_trade_card(signal: dict, execution: dict):
     try:
         img = await generate_signal_card({**signal, **execution, "executed": True})
-        caption = (
-            f"💸 *Trade Executed*\n"
-            f"Symbol: {signal.get('symbol')}\n"
-            f"Side: {execution.get('side', 'N/A')}\n"
-            f"Size: {execution.get('size', 'N/A')}\n"
-            f"Entry: {execution.get('entry', 'N/A')}\n"
-            f"TP: {execution.get('tp', '...')} | SL: {execution.get('sl', '...')}\n"
-            f"Status: {'✅ Success' if execution.get('success') else '❌ Fail'}\n"
-            f"@NovaPulseAI"
-        )
-        await bot.send_photo(
-            chat_id=settings.TELEGRAM_CHAT_ID,
-            photo=img,
-            caption=caption,
-            parse_mode="Markdown"
-        )
+        caption = (f"💸 *Trade Executed*\n"
+                   f"Symbol: {signal.get('symbol')} | Side: {execution.get('side', 'N/A')}\n"
+                   f"Size: {execution.get('size', 'N/A')} | Entry: {execution.get('entry', 'N/A')}\n"
+                   f"TP: {execution.get('tp', '...')} | SL: {execution.get('sl', '...')}\n"
+                   f"Status: {'✅ Success' if execution.get('success') else '❌ Fail'}\n"
+                   f"@NovaPulseAI")
+        await bot.send_photo(settings.TELEGRAM_CHAT_ID, img, caption, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"[push_trade_card] Failed to send trade card: {e}")
+        logging.error("[push_trade_card] %s", e)
 
 async def push_pnl_card(symbol: str):
     try:
         img = await generate_pnl_card(symbol)
-        caption = (
-            f"🏁 *Trade Closed*\n"
-            f"Symbol: {symbol}\n"
-            f"PnL Card: Shareable PnL snapshot below\n"
-            f"@NovaPulseAI"
-        )
-        await bot.send_photo(
-            chat_id=settings.TELEGRAM_CHAT_ID,
-            photo=img,
-            caption=caption,
-            parse_mode="Markdown"
-        )
+        caption = (f"🏁 *Trade Closed*\nSymbol: {symbol}\nPnL snapshot below\n@NovaPulseAI")
+        await bot.send_photo(settings.TELEGRAM_CHAT_ID, img, caption, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"[push_pnl_card] Failed to send pnl card: {e}")
+        logging.error("[push_pnl_card] %s", e)
 
-# --- Startup & Shutdown ---
+# ─ Startup & shutdown ─
 @app.on_event("startup")
 async def startup_event():
     setup_logging()
     setup_tracing()
-    logging.info(f"Prometheus metrics running on port {settings.METRICS_PORT}")
+    logging.info("Prometheus metrics on port %s", settings.METRICS_PORT)
 
-    # Connect agents
+    # Connect subsystems
     for agent in AGENT_REGISTRY.values():
-        if hasattr(agent, "connect"):
-            await agent.connect()
-
+        if hasattr(agent, "connect"): await agent.connect()
     await auditor.connect()
     await explainer.connect()
     await auto_trader.connect()
@@ -258,28 +223,27 @@ async def startup_event():
                 await auto_trader.execute_next_trade()
                 await asyncio.sleep(60)
             except Exception as e:
-                logging.error(f"Auto-trade loop error: {e}")
+                logging.error("Auto-trade loop error: %s", e)
     asyncio.create_task(trade_loop())
 
     await register_helius_webhook(settings)
-    logging.info("✅ Nova Pulse Alpha LIVE with agents: %s", list(AGENT_REGISTRY.keys()))
+    logging.info("Nova Pulse LIVE: %s", list(AGENT_REGISTRY.keys()))
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logging.info("😕 Nova Pulse shutting down...")
+    logging.info("Shutting down Nova Pulse...")
     for agent in AGENT_REGISTRY.values():
-        if hasattr(agent, "disconnect"):
-            await agent.disconnect()
+        if hasattr(agent, "disconnect"): await agent.disconnect()
     await auditor.disconnect()
     await explainer.disconnect()
     await auto_trader.disconnect()
     await execution_router.disconnect()
-    logging.info("🧼 Clean shutdown complete.")
+    logging.info("Clean shutdown complete.")
 
 @app.exception_handler(Exception)
 async def universal_exception_handler(request: Request, exc: Exception):
-    logging.error(f"Unhandled error: {exc}", exc_info=True)
-    return JSONResponse(status_code=500, content={"detail": "Internal error. Nova Pulse has been notified."})
+    logging.error("Unhandled error: %s", exc, exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": "Internal error occurred."})
 
 @app.get("/healthz")
 def health_check():
@@ -303,48 +267,44 @@ async def generate_signal(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'symbol' field.")
 
     tasks = [
-        agent.analyze(symbol, **payload)
-        if hasattr(agent, "analyze") else agent.score_sentiment(symbol)
+        agent.analyze(symbol, **payload) if hasattr(agent, "analyze") else agent.score_sentiment(symbol)
         for agent in AGENT_REGISTRY.values()
     ]
     results = await asyncio.gather(*tasks)
 
     agent_results = []
-    for name, result in zip(AGENT_REGISTRY.keys(), results):
-        score = getattr(result, "confidence", None) or getattr(result, "score", 0.0)
+    for name, res in zip(AGENT_REGISTRY.keys(), results):
+        score = getattr(res, "confidence", None) or getattr(res, "score", 0.0)
         meta = {}
-        if hasattr(result, "trust_score"):
-            meta["trust"] = result.trust_score
-        if hasattr(result, "volume"):
-            meta["volume"] = result.volume
-        agent_results.append({"source": name, "score": score, "meta": meta, "entry": getattr(result, "entry", 0.0)})
+        if hasattr(res, "trust_score"): meta["trust"] = res.trust_score
+        if hasattr(res, "volume"): meta["volume"] = res.volume
+        agent_results.append({"source": name, "score": score, "meta": meta, "entry": getattr(res, "entry", 0.0)})
 
     signals_counter.inc()
     agents_gauge.set(len(AGENT_REGISTRY))
 
-    # --- Broadcast and push signal card to Telegram ---
-    fused_signal = await adaptive_signal_fusion(symbol, agent_results)
-    await ws_manager.broadcast(fused_signal)
-    await push_signal_card(fused_signal)  # <-- Signal card sent here
+    # Broadcast + push signal card
+    fused = await adaptive_signal_fusion(symbol, agent_results)
+    await ws_manager.broadcast(fused)
+    await push_signal_card(fused)
 
-    # --- Trade execution and trade card ---
-    execution = await execution_router.execute_trade(fused_signal, user_id="telegram")
-    fused_signal["execution"] = execution
-    await push_trade_card(fused_signal, execution)  # <-- Trade card sent here
+    # Execute + trade card
+    exec_res = await execution_router.execute_trade(fused, user_id="telegram")
+    fused["execution"] = exec_res
+    await push_trade_card(fused, exec_res)
 
-    # --- Log and update ---
-    await log_trade(
-        fused_signal["symbol"], execution.get("side"), execution.get("size"),
-        execution.get("entry"), execution.get("exit"), execution.get("pnl"),
-        rationale="fused signal auto-trade", user="telegram"
-    )
-    await push_trade_update(fused_signal)
+    # Log + notify
+    await log_trade(fused["symbol"], exec_res.get("side"), exec_res.get("size"),
+                   exec_res.get("entry"), exec_res.get("exit"), exec_res.get("pnl"),
+                   rationale="auto-trade fused signal", user="telegram")
+    from core.telegram_pusher import push_trade_update
+    await push_trade_update(fused)
 
-    # --- If trade is closed, push PnL card ---
-    if execution.get("success") and execution.get("exit"):
-        await push_pnl_card(fused_signal["symbol"])
+    # Closed trade PnL
+    if exec_res.get("success") and exec_res.get("exit"):
+        await push_pnl_card(fused["symbol"])
 
-    return fused_signal
+    return fused
 
 @app.post("/audit/{address}")
 async def audit_token(address: str):
@@ -353,9 +313,8 @@ async def audit_token(address: str):
 @app.post("/explain_signal")
 async def explain_signal(request: Request):
     payload = await request.json()
-    symbol = payload.get("symbol")
-    context = payload.get("context", {})
-    if not symbol:
+    sym = payload.get("symbol")
+    if not sym:
         raise HTTPException(status_code=400, detail="Missing 'symbol' field.")
-    explanation = await explainer.explain(symbol, context)
-    return explanation.dict() if hasattr(explanation, "dict") else explanation
+    result = await explainer.explain(sym, payload.get("context", {}))
+    return result.dict() if hasattr(result, "dict") else result
