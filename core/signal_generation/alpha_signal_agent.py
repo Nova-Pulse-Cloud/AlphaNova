@@ -1,5 +1,5 @@
 # core/signal_generation/alpha_signal_agent.py
-# 🚀 Nova Pulse ALPHA – AlphaSignalAgent v3.0: Dynamic, Fully Audited, TP/SL-Fused Signal Engine
+# 🚀 Nova Pulse ALPHA – AlphaSignalAgent v3.1: Dynamic, Fully Audited, TP/SL-Fused Signal Engine
 
 import asyncio
 import hashlib
@@ -19,7 +19,8 @@ from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.data_collection.orderbook_overlay import OrderBookOverlay
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.risk_signals import TokenAuditor, TokenGuardian, rug_pull_signal
-from core.agents.adaptive_tp_sl import AdaptiveTPSL  # Dynamic TP/SL agent
+from core.agents.adaptive_tp_sl import AdaptiveTPSL
+from core.signal_generation.reinforcement_learning import RLTrader
 
 logger = logging.getLogger("nova.alpha_signal_agent")
 logger.setLevel(logging.INFO)
@@ -79,9 +80,10 @@ class AlphaSignalAgent:
         self.redis_url = redis_url
         openai.api_key = openai_key
         self.redis: Optional[redis_client.Redis] = None
-        self.trade_memory = TradeMemory(config)
+        self.memory = TradeMemory(config)
         self.rl_tuner = ReinforcementTuner()
         self.orderbook = OrderBookOverlay(config)
+        self.rl_agent = RLTrader(config)
         self.symbols = symbols or []
         self._caption_lock = asyncio.Lock()
 
@@ -89,7 +91,7 @@ class AlphaSignalAgent:
         self.token_auditor = TokenAuditor(config)
         self.token_guardian = TokenGuardian(config)
         # Adaptive TP/SL
-        self.tpsl_agent = AdaptiveTPSL(config)
+        self.tpsl_agent = AdaptiveTPSL(config, memory=self.memory, rl_agent=self.rl_agent)
 
     async def connect(self):
         """Initialize Redis (DLQ storage, caching)."""
@@ -212,7 +214,7 @@ class AlphaSignalAgent:
             weighted_scores = {}
             trust_map = {}
             memory_rate = await asyncio.get_event_loop().run_in_executor(
-                None, self.trade_memory.get_win_rate, symbol
+                None, self.memory.get_win_rate, symbol
             )
             for sig in agent_signals:
                 src = sig["source"]
@@ -236,18 +238,26 @@ class AlphaSignalAgent:
             risk = 1.0 - min(trust_map.values()) if trust_map else 1.0
             entry = float(agent_signals[0].get("entry", 0.0)) if agent_signals else 0.0
 
-            # 4) Dynamic TP/SL calculation via AdaptiveTPSL
-            tpsl_result = await self.tpsl_agent.calculate_tp_sl(
+            # 4) Dynamic TP/SL calculation via your advanced AdaptiveTPSL
+            signal_context = {
+                "volatility": ob.get("volatility", 0.02),
+                "trend_strength": ob.get("trend_strength", 0.5),
+                "whale_pressure": ob.get("whale_pressure", 0.0),
+                "spread": ob.get("spread", 0.001),
+                "gas_cost": ob.get("gas_cost", 0.0),
+                "orderbook_bias": ob.get("orderbook_bias", 0.0),
+                "rug_score": audit_details.get("TokenAuditor", {}).get("rug_score", 0.0),
+                "cycle_phase": ob.get("cycle_phase", 0.5),
+                "user_risk": user_context.get("risk_val", 0.0) if user_context else 0.0,
+            }
+            tpsl = await self.tpsl_agent.compute(
                 symbol=symbol,
-                entry=entry,
-                score=score,
-                liquidity=liquidity,
-                whale_pressure=whale_pressure,
-                user_context=user_context,
-                audit_details=audit_details,
+                price=entry,
+                signal_context=signal_context,
+                user=None  # Extend if user-specific RL/memory needed
             )
-            take_profit = float(tpsl_result.get("tp", 0.0))
-            stop_loss = float(tpsl_result.get("sl", 0.0))
+            take_profit = float(tpsl["tp"])
+            stop_loss = float(tpsl["sl"])
 
             # 5) Flavor & caption
             flavor = self._choose_flavor(avg, user_context)
