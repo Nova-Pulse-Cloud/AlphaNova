@@ -1,23 +1,34 @@
-import asyncio
-import logging
+# core/utils/token_scanner.py
+
 import time
+import json
+import logging
 from typing import List, Dict, Any, Optional
 
-import aiohttp
 import httpx
-import aioredis
-from pydantic import BaseModel
+import redis.asyncio as redis_client
 from prometheus_client import Counter, Histogram
-from utils.config import Config
+from pydantic import BaseModel
 
-logger = logging.getLogger("token_scanner")
+from core.utils.config import config
+from core.data_collection.whale_detector import get_recent_whale_activity
+from core.data_collection.social_sentiment import score_token_sentiment
+from core.utils.risk_signals import is_rug
 
-# ─── Prometheus Metrics ──────────────────────────────────────────
-token_scan_requests = Counter("token_scanner_requests_total", "Total token scan requests")
-token_scan_latency = Histogram("token_scanner_latency_seconds", "Latency of token scan operations")
-token_scan_errors = Counter("token_scanner_errors_total", "Total errors in token scanning")
+logger = logging.getLogger("nova.token_scanner")
+logger.setLevel(logging.INFO)
 
-# ─── Data Model ─────────────────────────────────────────────────
+# Prometheus metrics
+TOKEN_SCAN_REQUESTS = Counter(
+    "token_scanner_requests_total", "Total token scan requests"
+)
+TOKEN_SCAN_LATENCY = Histogram(
+    "token_scanner_latency_seconds", "Latency of token scan operations"
+)
+TOKEN_SCAN_ERRORS = Counter(
+    "token_scanner_errors_total", "Total errors in token scanning"
+)
+
 class TokenStats(BaseModel):
     symbol: str
     chain: str
@@ -26,140 +37,113 @@ class TokenStats(BaseModel):
     holder_count: int
     volume_24h: float
     timestamp: int
-    whale_flag: Optional[bool] = False
-    social_viral_score: Optional[float] = None
-    rug_flag: Optional[bool] = False
+    whale_flag: bool = False
+    social_score: float = 0.0
+    rug_flag: bool = False
 
 class TokenScanner:
-    def __init__(self, redis_url: str, cmc_api_key: str, redis_ttl: int = 86400):
-        """
-        Initializes the TokenScanner with configuration settings.
+    """
+    Scans tokens on a blockchain via Dexscreener, applies whale, social, and rug overlays,
+    and caches results in Redis for high-performance reuse.
+    """
+    def __init__(self, chain: str = "solana", cache_ttl: int = 86400) -> None:
+        self.chain = chain
+        self.cache_ttl = cache_ttl
+        self.redis_url = config.REDIS_URL
+        self.http = httpx.AsyncClient(timeout=15)
+        self.redis: Optional[redis_client.Redis] = None
+        self.dexscreener_url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}"
 
-        :param redis_url: URL for the Redis cache.
-        :param cmc_api_key: CoinMarketCap API key.
-        :param redis_ttl: Cache expiration time (default: 86400 seconds).
-        """
-        self.redis_url = redis_url
-        self.cmc_api_key = cmc_api_key
-        self.redis = None
-        self.http = httpx.AsyncClient()
-        self.redis_ttl = redis_ttl
+    async def connect(self) -> None:
+        """Initialize Redis connection."""
+        try:
+            self.redis = redis_client.from_url(self.redis_url, decode_responses=True)
+            await self.redis.ping()
+            logger.info("[TokenScanner] Connected to Redis")
+        except Exception as e:
+            logger.error(f"[TokenScanner] Redis connection failed: {e}")
+            self.redis = None
 
-    async def connect(self):
-        """Connects to Redis."""
-        if not self.redis:
-            self.redis = await aioredis.from_url(self.redis_url)
-            logger.info("TokenScanner connected to Redis.")
-
-    async def disconnect(self):
-        """Disconnects from Redis and HTTP client."""
+    async def disconnect(self) -> None:
+        """Close HTTP and Redis connections."""
         await self.http.aclose()
         if self.redis:
             await self.redis.close()
 
-    async def get_all_tokens(self, chain: str = "solana", filter_rugs: bool = True) -> List[TokenStats]:
+    async def get_all_tokens(self, filter_rugs: bool = True) -> List[TokenStats]:
         """
-        Retrieves all tokens from the specified chain and applies various overlays like whale tracking, social scores, and rug checks.
-        
-        :param chain: The blockchain (e.g., "solana").
-        :param filter_rugs: Whether to filter out rug-pulled tokens.
-        :return: A list of TokenStats with additional metadata like whale flags, social viral score, and rug flags.
+        Retrieve token stats, apply overlays, and cache results.
         """
-        token_scan_requests.inc()
-        async with token_scan_latency.time():
-            await self.connect()
-            cache_key = f"token_list:{chain}"
-            cached = await self.redis.get(cache_key)
-            if cached:
-                logger.info(f"Cache hit for token list from chain: {chain}")
-                return [TokenStats.parse_raw(item) for item in eval(cached)]
-
-            tokens = await self._fetch_tokens_dexscreener(chain)
-            # Apply overlays (whale, social, rug)
-            whale_tokens = await self._whale_overlay(tokens, chain)
-            viral_scores = await self._social_overlay([t['mint'] for t in tokens])
-            for t in tokens:
-                t['whale_flag'] = t['mint'] in whale_tokens
-                t['social_viral_score'] = viral_scores.get(t['mint'], 0)
-                t['rug_flag'] = await self._is_rug(t['mint']) if filter_rugs else False
-
-            # Filter out rug-pulled tokens
-            token_stats = [TokenStats(**t) for t in tokens if not t.get('rug_flag', False)]
-            await self.redis.set(cache_key, str([t.json() for t in token_stats]), ex=self.redis_ttl)
-            return token_stats
-
-    async def _fetch_tokens_dexscreener(self, chain: str) -> List[Dict[str, Any]]:
-        """
-        Fetches token data from DEXScreener API for a specific blockchain.
-        
-        :param chain: The blockchain (e.g., "solana").
-        :return: A list of token metadata.
-        """
-        url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}"
+        TOKEN_SCAN_REQUESTS.inc()
+        start = time.time()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=12) as resp:
-                    data = await resp.json()
-                    tokens = []
-                    for pair in data.get("pairs", []):
-                        base = pair.get("baseToken", {})
-                        tokens.append({
-                            "symbol": base.get("symbol", base.get("address")[:4]),
-                            "chain": chain,
-                            "mint": base.get("address"),
-                            "total_supply": float(pair.get("liquidity", 0)),
-                            "holder_count": int(pair.get("txCount", 0)),
-                            "volume_24h": float(pair.get("volume", 0)),
-                            "timestamp": int(time.time()),
-                        })
-                    return tokens
+            await self.connect()
+            cache_key = f"token_list:{self.chain}"
+            # Return cached if available
+            if self.redis:
+                raw = await self.redis.get(cache_key)
+                if raw:
+                    stats = [TokenStats.parse_raw(item) for item in json.loads(raw)]
+                    TOKEN_SCAN_LATENCY.observe(time.time() - start)
+                    return stats
+
+            # Fetch fresh token data
+            tokens_data = await self._fetch_tokens_dexscreener()
+            mints = [t["mint"] for t in tokens_data]
+            whales = get_recent_whale_activity(self.chain, mints)
+            social_scores = {mint: score_token_sentiment(mint) for mint in mints}
+
+            results: List[TokenStats] = []
+            for t in tokens_data:
+                mint = t["mint"]
+                stat = TokenStats(
+                    symbol=t["symbol"],
+                    chain=self.chain,
+                    mint=mint,
+                    total_supply=t["total_supply"],
+                    holder_count=t["holder_count"],
+                    volume_24h=t["volume_24h"],
+                    timestamp=int(time.time()),
+                    whale_flag=mint in whales,
+                    social_score=social_scores.get(mint, 0.0),
+                    rug_flag=is_rug(mint) if filter_rugs else False,
+                )
+                if not stat.rug_flag:
+                    results.append(stat)
+
+            # Cache for future
+            if self.redis:
+                await self.redis.set(
+                    cache_key,
+                    json.dumps([r.json() for r in results]),
+                    ex=self.cache_ttl,
+                )
+
+            TOKEN_SCAN_LATENCY.observe(time.time() - start)
+            return results
         except Exception as e:
-            token_scan_errors.inc()
-            logger.warning(f"[TokenScanner] DEX fetch error: {e}")
+            TOKEN_SCAN_ERRORS.inc()
+            logger.error(f"[TokenScanner] get_all_tokens error: {e}")
+            raise
+
+    async def _fetch_tokens_dexscreener(self) -> List[Dict[str, Any]]:
+        """Fetch raw token data from Dexscreener API."""
+        try:
+            resp = await self.http.get(self.dexscreener_url)
+            resp.raise_for_status()
+            data = resp.json()
+            tokens: List[Dict[str, Any]] = []
+            for pair in data.get("pairs", []):
+                base = pair.get("baseToken", {})
+                tokens.append({
+                    "symbol": base.get("symbol", base.get("address")[:4].upper()),
+                    "mint": base.get("address"),
+                    "total_supply": float(pair.get("liquidity", 0)),
+                    "holder_count": int(pair.get("txCount", 0)),
+                    "volume_24h": float(pair.get("volume", 0)),
+                })
+            return tokens
+        except Exception as e:
+            TOKEN_SCAN_ERRORS.inc()
+            logger.error(f"[TokenScanner] _fetch_tokens_dexscreener error: {e}")
             return []
-
-    async def _whale_overlay(self, tokens: List[Dict], chain: str) -> List[str]:
-        """
-        Flags tokens bought by top wallets within the last N minutes. This function is currently a placeholder and can be extended to integrate with real whale detection.
-        
-        :param tokens: List of token metadata.
-        :param chain: The blockchain (e.g., "solana").
-        :return: A list of token mints identified as being bought by whales.
-        """
-        # For demo purposes, we return an empty list. This should integrate with real whale detection logic.
-        return []
-
-    async def _social_overlay(self, mints: List[str]) -> Dict[str, float]:
-        """
-        Scans social platforms (e.g., X, Telegram, Reddit) for viral token mentions. This function is a placeholder for future integration.
-        
-        :param mints: List of token mints to scan.
-        :return: A dictionary of token mints and their associated social media viral score.
-        """
-        # For demo purposes, all tokens are assigned a score of 0.
-        return {mint: 0.0 for mint in mints}
-
-    async def _is_rug(self, mint: str) -> bool:
-        """
-        Determines if a token is a potential rug-pull using core risk signals or known rug lists.
-        
-        :param mint: The token's mint address.
-        :return: True if the token is flagged as a rug, False otherwise.
-        """
-        # This function should be connected to a live risk signal module.
-        # For demo purposes, it always returns False.
-        return False
-
-    async def get_token_by_mint(self, mint: str, chain: str = "solana") -> Optional[TokenStats]:
-        """
-        Retrieves a token's details based on its mint address.
-
-        :param mint: The mint address of the token.
-        :param chain: The blockchain (default: "solana").
-        :return: A TokenStats object or None if the token is not found.
-        """
-        tokens = await self.get_all_tokens(chain)
-        for token in tokens:
-            if token.mint == mint:
-                return token
-        return None
