@@ -1,11 +1,20 @@
+# core/utils/recovery_shard_manager.py
+
 import asyncio
 import logging
 import hashlib
 import json
 from datetime import datetime
-from typing import Dict, Any, Optional, Callable
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import redis.asyncio as redis_client
 from prometheus_client import Counter, Histogram
-import aioredis
+
+from core.utils.config import config
+
+logger = logging.getLogger("nova.recovery_shard_manager")
+logger.setLevel(logging.INFO)
 
 # Prometheus metrics
 SHARD_SET_CALLS = Counter("shard_set_calls_total", "Total shard set calls")
@@ -13,97 +22,123 @@ SHARD_ERRORS = Counter("shard_errors_total", "Total shard errors")
 SHARD_LATENCY = Histogram("shard_latency_seconds", "Shard set latency")
 SHARD_DLQ = Counter("shard_dlq_total", "Shard DLQ events")
 
-# Dead letter queue for failed shard sets
-FAILED_SHARD_DLQ = []
+# Dead-letter queue for failed shard operations
+FAILED_SHARD_DLQ: List[Dict[str, Any]] = []
 
-# Logging setup
-logger = logging.getLogger("recovery_shard_manager")
+# Event hooks
+shard_event_hooks: List = []
 
-# Audit hash function for traceability
-def shard_hash(shard: dict) -> str:
-    m = hashlib.sha256()
-    m.update(json.dumps(shard, sort_keys=True).encode())
-    return m.hexdigest()
+def register_shard_event_hook(fn: Any) -> None:
+    """Register a callback for shard events."""
+    shard_event_hooks.append(fn)
 
-# Event handler for shard events (e.g., audit, failure)
-async def fire_shard_event(event_name, data):
-    # This is just a placeholder for actual event hook processing (e.g., Prometheus, DLQ)
-    logger.info(f"Event triggered: {event_name} with data: {data}")
+async def fire_shard_event(event: str, data: Dict[str, Any]) -> None:
+    """Invoke all registered shard event hooks."""
+    for hook in shard_event_hooks:
+        try:
+            await hook(event, data)
+        except Exception as e:
+            logger.error(f"[ShardManager] Hook error: {e}")
+
+
+def shard_hash(shard: Dict[str, Any]) -> str:
+    """Compute a SHA256 hash for a shard record."""
+    return hashlib.sha256(json.dumps(shard, sort_keys=True).encode()).hexdigest()
 
 class RecoveryShardManager:
-    def __init__(self, redis_url: str, max_versions: int = 6, redis=None, backup_callback=None):
-        self.redis_url = redis_url
-        self.max_versions = max_versions
-        self.redis = redis
-        self.shard_versions = {}
-        self.backup_callback = backup_callback or self.backup_shard_external
+    """
+    Async manager for versioned data shards with DLQ, pruning, and backup.
+    """
+    def __init__(self) -> None:
+        self.redis_url = config.REDIS_URL
+        self.redis: Optional[redis_client.Redis] = None
+        self.max_versions = int(getattr(config, "SHARD_MAX_VERSIONS", 6))
+        artifact = getattr(config, "SHARD_ARTIFACT_PATH", "artifacts/shards")
+        self.artifact_path = Path(artifact)
+        self.backup_callback = self._backup_to_disk
 
-    async def connect(self):
-        """Connect to Redis."""
-        if not self.redis:
-            self.redis = await aioredis.from_url(self.redis_url, decode_responses=True)
-        logger.info("RecoveryShardManager connected to Redis.")
+    async def connect(self) -> None:
+        """Initialize Redis connection."""
+        try:
+            self.redis = redis_client.from_url(self.redis_url, decode_responses=True)
+            await self.redis.ping()
+            logger.info("[ShardManager] Connected to Redis")
+        except Exception as e:
+            logger.error(f"[ShardManager] Redis connection failed: {e}")
+            self.redis = None
 
-    async def set_shard(self, group: str, shard: dict, user: Optional[str] = None, version: Optional[int] = None, trace_id: Optional[str] = None):
-        """Sets a shard and manages version history with DLQ and backup."""
+    async def set_shard(
+        self,
+        group: str,
+        shard: Dict[str, Any],
+        user: Optional[str] = None,
+        version: Optional[int] = None,
+    ) -> None:
+        """
+        Store a shard with versioning, pruning, and backup.
+        """
         SHARD_SET_CALLS.inc()
-        async with SHARD_LATENCY.time():
+        start_ts = int(datetime.utcnow().timestamp())
+        key_user = user or "global"
+        ver = version or start_ts
+        trace_id = shard.get("trace_id") or shard_hash(shard)
+        shard["trace_id"] = trace_id
+
+        try:
+            async with SHARD_LATENCY.time():
+                if not self.redis:
+                    raise RuntimeError("Redis unavailable")
+                key = f"shard:{group}:{key_user}:{ver}"
+                await self.redis.set(key, json.dumps(shard))
+                await self._prune_old_shards(group, key_user)
+                await fire_shard_event("shard_set", {"group": group, "user": user, "version": ver, "trace_id": trace_id})
+                self.backup_callback(key, shard)
+        except Exception as e:
+            SHARD_ERRORS.inc()
+            SHARD_DLQ.inc()
+            failed_entry = {"group": group, "user": user, "version": ver, "shard": shard, "error": str(e), "trace_id": trace_id}
+            FAILED_SHARD_DLQ.append(failed_entry)
+            await fire_shard_event("shard_set_failed", failed_entry)
+            logger.error(f"[ShardManager] Failed to set shard for {group}/{key_user}: {e}")
+
+    async def _prune_old_shards(self, group: str, user: str) -> None:
+        """Remove oldest shards to enforce max_versions."""
+        if not self.redis:
+            return
+        pattern = f"shard:{group}:{user}:*"
+        keys = await self.redis.keys(pattern)
+        entries: List[Tuple[int, str]] = []
+        for k in keys:
             try:
-                ts = int(datetime.utcnow().timestamp())
-                ver = version or ts
-                shard_key = f"shard:{group}:{user or 'global'}:{ver}"
+                ver = int(k.rsplit(":", 1)[-1])
+                entries.append((ver, k))
+            except ValueError:
+                continue
+        entries.sort(reverse=True)
+        for _, k in entries[self.max_versions:]:
+            await self.redis.delete(k)
+            logger.info(f"[ShardManager] Pruned shard: {k}")
 
-                # Add audit hash for traceability
-                shard["audit_hash"] = shard_hash(shard)
+    def _backup_to_disk(self, key: str, shard: Dict[str, Any]) -> None:
+        """Backup shard data to filesystem as JSON."""
+        self.artifact_path.mkdir(parents=True, exist_ok=True)
+        safe_key = key.replace(':', '_')
+        path = self.artifact_path / f"{safe_key}.json"
+        try:
+            with open(path, "w") as f:
+                json.dump(shard, f)
+        except Exception as e:
+            logger.error(f"[ShardManager] Backup to disk failed: {e}")
 
-                # Store the shard in Redis
-                await self.redis.set(shard_key, json.dumps(shard))
-
-                # Prune old versions of shards based on max_versions
-                await self._prune_old_shards(group, user)
-
-                # Event with trace_id/audit
-                await fire_shard_event("shard_set", {"group": group, "user": user, "ver": ver, "shard": shard, "trace_id": shard["audit_hash"]})
-
-                # Backup shard to external service
-                await self.backup_callback(shard_key, shard)
-
-            except Exception as e:
-                # Handle errors and push failed events to DLQ
-                SHARD_ERRORS.inc()
-                SHARD_DLQ.inc()
-                failed_data = {"group": group, "shard": shard, "error": str(e), "user": user, "trace_id": shard.get("audit_hash")}
-                FAILED_SHARD_DLQ.append(failed_data)
-                await fire_shard_event("shard_set_failed", failed_data)
-                logger.error(f"Failed to set shard for group {group}: {e}")
-
-    async def _prune_old_shards(self, group: str, user: Optional[str] = None):
-        """Prunes old shards to maintain the max_versions limit."""
-        keys = await self.redis.keys(f"shard:{group}:{user or 'global'}:*")
-        if len(keys) > self.max_versions:
-            keys.sort(reverse=True)  # Sort by version, most recent first
-            to_delete = keys[self.max_versions:]
-            for key in to_delete:
-                await self.redis.delete(key)
-                logger.info(f"Pruned shard: {key}")
-
-    async def backup_shard_external(self, shard_key: str, shard: dict):
-        """Simulate an external backup process for the shard."""
-        # External backup logic (e.g., S3, database, etc.)
-        logger.info(f"Backing up shard {shard_key} to external storage.")
-        # Placeholder backup operation (should be implemented based on requirements)
-        await asyncio.sleep(0.5)  # Simulate a delay for the backup process
-
-    async def replay_dlq(self):
-        """Attempts to reprocess failed DLQ items."""
-        for failed in FAILED_SHARD_DLQ[:]:
+    async def replay_dlq(self) -> None:
+        """Retry failed shard operations from DLQ."""
+        for entry in FAILED_SHARD_DLQ[:]:
             try:
-                # Attempt to retry the failed shard
-                await self.set_shard(failed["group"], failed["shard"], failed["user"], trace_id=failed.get("trace_id"))
-                FAILED_SHARD_DLQ.remove(failed)
+                await self.set_shard(entry["group"], entry["shard"], entry.get("user"), entry.get("version"))
+                FAILED_SHARD_DLQ.remove(entry)
             except Exception as e:
-                logger.error(f"Failed to replay DLQ item: {e}")
+                logger.error(f"[ShardManager] Replay DLQ failed: {e}")
 
-    def get_dlq(self):
-        """Returns the DLQ for failed shard operations."""
-        return FAILED_SHARD_DLQ.copy()
+    def get_dlq(self) -> List[Dict[str, Any]]:
+        """Return current DLQ entries."""
+        return list(FAILED_SHARD_DLQ)
