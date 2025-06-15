@@ -1,114 +1,144 @@
-import os
-import time
+# core/utils/token_utils.py
+
 import logging
-import aiohttp
-from typing import Dict, Optional, Union
-from dotenv import load_dotenv
+import json
+from datetime import datetime
+from typing import Any, Dict, Optional
 
-load_dotenv()
+import httpx
+import redis.asyncio as redis_client
+from pydantic import BaseModel, Field
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter
+from prometheus_client import Counter, Histogram
 
-# ─── Config ─────────────────────────────────────────────────────
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-HELIUS_BASE_URL = "https://api.helius.xyz/v0"
-BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/public/price"
-HEADERS = {"Content-Type": "application/json"}
-CACHE_DURATION = 300  # seconds
+from core.utils.config import config
 
-# ─── Logger ─────────────────────────────────────────────────────
-log = logging.getLogger("token_utils")
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("nova.token_utils")
+logger.setLevel(logging.INFO)
 
-# ─── In-Memory Cache ────────────────────────────────────────────
-_cache: Dict[str, Dict[str, Union[float, dict]]] = {}
+# ────────────────────────────────────────────────────────────────────────────────
+# Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+CACHE_HITS = Counter("token_utils_cache_hits_total", "Cache hits for token utils")
+CACHE_MISSES = Counter("token_utils_cache_misses_total", "Cache misses for token utils")
+TOKEN_ERRORS = Counter("token_utils_errors_total", "Errors in token utils")
+CACHE_LATENCY = Histogram("token_utils_cache_latency_seconds", "Latency of cache operations")
+HTTP_LATENCY = Histogram("token_utils_http_latency_seconds", "Latency of HTTP requests")
 
-# ─── Internal GET with Cache ────────────────────────────────────
-async def cached_get(url: str, params: Optional[dict] = None) -> dict:
+# ────────────────────────────────────────────────────────────────────────────────
+# Data Models
+# ────────────────────────────────────────────────────────────────────────────────
+class TokenMetadata(BaseModel):
+    name: str
+    symbol: str
+    decimals: int = Field(..., ge=0)
+
+class TokenPrice(BaseModel):
+    mint: str
+    price: float = Field(..., gt=0)
+    timestamp: int
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Token Utilities
+# ────────────────────────────────────────────────────────────────────────────────
+class TokenUtils:
     """
-    Fetches data from the given URL and caches it for the specified duration.
-    Returns cached data if it exists and is still valid.
+    Fetches and caches token metadata and prices using Helius and Birdeye APIs.
+    Async, retry-enabled HTTP calls, Redis caching, and Prometheus metrics.
     """
-    key = f"{url}:{str(params)}"
-    now = time.time()
+    def __init__(self, cache_ttl: int = 300):
+        self.redis_url = config.REDIS_URL
+        self.helius_key = config.HELIUS_API_KEY
+        self.helius_base = config.HELIUS_RPC  # use RPC for on-chain flows or adjust API URL
+        self.birdeye_url = config.GECKO_API_URL.rstrip('/') + "/public/price"
+        self.cache_ttl = cache_ttl
+        self.redis: Optional[redis_client.Redis] = None
+        self.http = httpx.AsyncClient(timeout=10)
 
-    # Check if cache is available and not expired
-    if key in _cache and now - _cache[key]["ts"] < CACHE_DURATION:
-        log.info(f"Cache hit for {key}")
-        return _cache[key]["data"]
+    async def connect(self) -> None:
+        try:
+            self.redis = redis_client.from_url(self.redis_url, decode_responses=True)
+            await self.redis.ping()
+            logger.info("[TokenUtils] Redis connected")
+        except Exception as e:
+            logger.error(f"[TokenUtils] Redis connection failed: {e}")
+            self.redis = None
 
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(url, headers=HEADERS, params=params) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
-                data = await resp.json()
-                _cache[key] = {"ts": now, "data": data}
-                log.info(f"Cache miss for {key}, data fetched")
-                return data
-    except Exception as e:
-        log.error(f"[cached_get] Request failed for {url}: {e}")
-        return {}
+    async def disconnect(self) -> None:
+        await self.http.aclose()
+        if self.redis:
+            await self.redis.close()
+        logger.info("[TokenUtils] Shutdown complete")
 
-# ─── Get Token Metadata ─────────────────────────────────────────
-async def get_token_metadata(mint: str) -> Dict[str, Union[str, int]]:
-    """
-    Fetches metadata for a token using the Helius API and caches the result.
+    async def get_token_metadata(self, mint: str) -> TokenMetadata:
+        key = f"token_meta:{mint}"
+        start = datetime.utcnow().timestamp()
+        try:
+            # Cache lookup
+            with CACHE_LATENCY.time():
+                if self.redis:
+                    cached = await self.redis.get(key)
+                    if cached:
+                        CACHE_HITS.inc()
+                        return TokenMetadata.parse_raw(cached)
+            CACHE_MISSES.inc()
 
-    :param mint: The mint address of the token.
-    :return: A dictionary containing the token's name, symbol, and decimals.
-    """
-    try:
-        url = f"{HELIUS_BASE_URL}/tokens/metadata?api-key={HELIUS_API_KEY}"
-        params = {"mintAccounts": [mint]}
-        data = await cached_get(url, params)
+            # Fetch via Helius API
+            url = f"{config.HELIUS_RPC}/tokens/metadata"
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.helius_key}"}
+            payload = {"mintAccounts": [mint]}
+            async with HTTP_LATENCY.time():
+                resp = await self.http.post(url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
 
-        meta = data[0] if isinstance(data, list) and data else {}
-        return {
-            "name": meta.get("name", "Unknown Token"),
-            "symbol": meta.get("symbol", "???"),
-            "decimals": meta.get("decimals", 6),
-        }
-    except Exception as e:
-        log.error(f"[Token Metadata Error] mint={mint} | {e}")
-        return {"name": "Unknown", "symbol": "???", "decimals": 6}
+            item = data[0] if isinstance(data, list) and data else {}
+            meta = TokenMetadata(
+                name=item.get("name", ""),
+                symbol=item.get("symbol", mint[:4].upper()),
+                decimals=item.get("decimals", 6),
+            )
+            if self.redis:
+                await self.redis.set(key, meta.json(), ex=self.cache_ttl)
+            return meta
+        except Exception as e:
+            TOKEN_ERRORS.inc()
+            logger.error(f"[TokenUtils] Metadata fetch failed for {mint}: {e}")
+            # Return fallback metadata
+            return TokenMetadata(name="Unknown", symbol=mint[:4].upper(), decimals=6)
 
-# ─── Get Token Price ────────────────────────────────────────────
-async def get_token_price(mint: str) -> float:
-    """
-    Fetches the current price of a token from Birdeye API and caches the result.
+    async def get_token_price(self, mint: str) -> TokenPrice:
+        key = f"token_price:{mint}"
+        with CACHE_LATENCY.time():
+            if self.redis:
+                cached = await self.redis.get(key)
+                if cached:
+                    CACHE_HITS.inc()
+                    return TokenPrice.parse_raw(cached)
+        CACHE_MISSES.inc()
 
-    :param mint: The mint address of the token.
-    :return: The token's price or 0.0 if the price cannot be fetched.
-    """
-    try:
-        # Primary source: Birdeye
+        # Fetch price via Birdeye API with retries
+        url = self.birdeye_url
         params = {"address": mint}
-        data = await cached_get(BIRDEYE_PRICE_URL, params)
-
-        price = float(data.get("data", {}).get("value", 0.0))
-        if price <= 0:
-            raise ValueError("Invalid price received.")
-
-        return price
-
-    except Exception as e:
-        log.warning(f"[Token Price Warning] Birdeye failed: {e}")
-        return 0.0
-
-# ─── Cache Expiry Management ───────────────────────────────────
-def clear_cache() -> None:
-    """
-    Clears the in-memory cache manually.
-    This can be useful for ensuring that the cache is refreshed on demand.
-    """
-    global _cache
-    _cache = {}
-    log.info("Cache cleared")
-
-# ─── Cache Metrics ─────────────────────────────────────────────
-def cache_metrics() -> Dict[str, int]:
-    """
-    Returns the current cache statistics, including the number of cache hits and misses.
-    """
-    cache_hits = sum(1 for key in _cache if time.time() - _cache[key]["ts"] < CACHE_DURATION)
-    cache_misses = len(_cache) - cache_hits
-    return {"hits": cache_hits, "misses": cache_misses}
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 5), reraise=True
+            ):
+                with HTTP_LATENCY.time():
+                    resp = await self.http.get(url, params=params)
+                    resp.raise_for_status()
+                    payload = resp.json()
+                    value = payload.get("data", {}).get("value", 0)
+                    if not value or value <= 0:
+                        raise RuntimeError("Invalid price data")
+                    price = float(value)
+                    ts = int(datetime.utcnow().timestamp())
+                    quote = TokenPrice(mint=mint, price=price, timestamp=ts)
+                    if self.redis:
+                        await self.redis.set(key, quote.json(), ex=self.cache_ttl)
+                    return quote
+        except Exception as e:
+            TOKEN_ERRORS.inc()
+            logger.error(f"[TokenUtils] Price fetch failed for {mint}: {e}")
+            # Fallback: zero price
+            return TokenPrice(mint=mint, price=0.0, timestamp=int(datetime.utcnow().timestamp()))
