@@ -1,11 +1,3 @@
-"""
-Nova Pulse ALPHA – Elite Trade‑Memory Module
-===========================================
-Persistent, thread‑safe trade ledger with win‑rate / PnL analytics and
-Prometheus instrumentation. Designed for *live* operation – no mocks, no
-place‑holders.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -21,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from prometheus_client import Counter, Gauge
 
-from utils.config import Config
+from core.utils.config import config
 
 logger = logging.getLogger("nova.trade_memory")
 logger.setLevel(logging.INFO)
@@ -29,12 +21,12 @@ logger.setLevel(logging.INFO)
 # ────────────────────────────────────────────────────────────────────────────────
 # Prometheus Metrics
 # ────────────────────────────────────────────────────────────────────────────────
-TRADE_ADDED         = Counter("trade_memory_add_total", "Trades recorded")
-TRADE_PNL_TOTAL     = Gauge("trade_memory_pnl_total", "Aggregate PnL per symbol", ["symbol"])
-TRADE_WINRATE_GAUGE = Gauge("trade_memory_win_rate", "Win‑rate per symbol", ["symbol"])
+TRADE_ADDED = Counter("trade_memory_add_total", "Trades recorded")
+TRADE_PNL_TOTAL = Gauge("trade_memory_pnl_total", "Aggregate PnL per symbol", ["symbol"])
+TRADE_WINRATE_GAUGE = Gauge("trade_memory_win_rate", "Win rate per symbol", ["symbol"])
 
 # ────────────────────────────────────────────────────────────────────────────────
-# SQLite Schema (single table – append‑only)
+# SQLite Schema (single table – append-only)
 # ────────────────────────────────────────────────────────────────────────────────
 DDL = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -49,30 +41,26 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 class TradeMemory:
-    """Thread‑safe in‑memory cache **plus** persistent SQLite ledger."""
+    """
+    Thread-safe in-memory cache plus persistent SQLite ledger for
+    real trades with win-rate and PnL analytics, fully instrumented.
+    """
 
-    def __init__(self, cfg: Optional[Config] = None):
-        self._cfg: Config = cfg or Config()
-        self._db_path: Path = Path(getattr(self._cfg, "TRADE_MEMORY_DB_PATH", "trade_memory.db"))
-
-        # RLock because public getters may be called recursively by metrics
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        self._db_path = Path(db_path or getattr(config, "TRADE_MEMORY_DB_PATH", "trade_memory.db"))
         self._lock = threading.RLock()
-
-        # in‑memory mirrors (kept in sync with DB)
         self._history: List[Dict[str, Any]] = []
         self._by_symbol: Dict[str, List[Dict[str, Any]]] = {}
 
-        # SQLite connection (allow cross‑thread, autocommit)
+        # Initialize SQLite connection
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False, isolation_level=None)
         self._conn.execute(DDL)
         self._bootstrap_from_db()
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Bootstrap & persistence helpers
-    # ────────────────────────────────────────────────────────────────────────
     def _bootstrap_from_db(self) -> None:
-        cur = self._conn.execute("SELECT * FROM trades ORDER BY timestamp ASC")
-        for row in cur.fetchall():
+        cur = self._conn.execute("SELECT id, symbol, entry, exit, size, pnl, timestamp FROM trades ORDER BY timestamp ASC")
+        rows = cur.fetchall()
+        for row in rows:
             rec = {
                 "id": row[0],
                 "symbol": row[1],
@@ -83,34 +71,39 @@ class TradeMemory:
                 "timestamp": row[6],
             }
             self._ingest_record(rec, persist=False)
-        logger.info("[TradeMemory] Bootstrapped %d historical trades from %s", len(self._history), self._db_path)
+        logger.info(
+            "[TradeMemory] Bootstrapped %d trades from %s", len(self._history), self._db_path
+        )
 
     def _persist_trade(self, rec: Dict[str, Any]) -> None:
         self._conn.execute(
             "INSERT INTO trades (id, symbol, entry, exit, size, pnl, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
-                rec["id"],
-                rec["symbol"],
-                rec.get("entry"),
-                rec.get("exit"),
-                rec.get("size"),
-                rec.get("pnl"),
-                rec["timestamp"],
+                rec["id"], rec["symbol"], rec.get("entry"), rec.get("exit"),
+                rec.get("size"), rec.get("pnl"), rec["timestamp"],
             ),
         )
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ────────────────────────────────────────────────────────────────────────
-    def add_trade(self, symbol: str, trade: Dict[str, Any]) -> None:
-        """Append a *live* trade and update metrics."""
-        trade = trade.copy()
-        trade["symbol"] = symbol
-        trade.setdefault("timestamp", int(time.time()))
-        trade["id"] = trade.get("id") or self._hash_trade(trade)
+    def add_trade(self, symbol: str, entry: float, size: float, exit: Optional[float] = None) -> None:
+        """
+        Record a new trade and update metrics.
+        :param symbol: Trading symbol
+        :param entry: Entry price
+        :param size: Trade size in SOL
+        :param exit: Exit price (None if still open)
+        """
+        rec: Dict[str, Any] = {
+            "symbol": symbol,
+            "entry": entry,
+            "exit": exit or 0.0,
+            "size": size,
+            "pnl": ((exit - entry) * size) if exit is not None else 0.0,
+            "timestamp": int(time.time()),
+        }
+        rec["id"] = rec.get("id") or self._hash_trade(rec)
 
         with self._lock:
-            self._ingest_record(trade, persist=True)
+            self._ingest_record(rec, persist=True)
 
         TRADE_ADDED.inc()
         self._update_metrics(symbol)
@@ -138,7 +131,7 @@ class TradeMemory:
         return trades[-1] if trades else {}
 
     def export_csv(self) -> str:
-        headers = ["symbol", "entry", "exit", "size", "pnl", "timestamp"]
+        headers = ["id", "symbol", "entry", "exit", "size", "pnl", "timestamp"]
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=headers)
         writer.writeheader()
@@ -147,10 +140,7 @@ class TradeMemory:
                 writer.writerow({h: t.get(h, "") for h in headers})
         return buf.getvalue()
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Internal helpers
-    # ────────────────────────────────────────────────────────────────────────
-    def _ingest_record(self, rec: Dict[str, Any], *, persist: bool) -> None:
+    def _ingest_record(self, rec: Dict[str, Any], persist: bool) -> None:
         sym = rec["symbol"]
         self._history.append(rec)
         self._by_symbol.setdefault(sym, []).append(rec)
@@ -159,7 +149,7 @@ class TradeMemory:
 
     def _update_metrics(self, symbol: str) -> None:
         pnl = self.total_pnl(symbol)
-        wr  = self.win_rate(symbol)
+        wr = self.win_rate(symbol)
         TRADE_PNL_TOTAL.labels(symbol=symbol).set(pnl)
         TRADE_WINRATE_GAUGE.labels(symbol=symbol).set(wr)
 
@@ -168,9 +158,6 @@ class TradeMemory:
         core = f"{trade.get('symbol')}:{trade.get('entry')}:{trade.get('exit')}:{trade.get('size')}:{trade.get('pnl')}:{trade.get('timestamp')}"
         return hashlib.sha256(core.encode()).hexdigest()
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Debug helper – JSON dump (non‑prod)
-    # ────────────────────────────────────────────────────────────────────────
     def to_json(self, pretty: bool = False) -> str:
         with self._lock:
             return json.dumps(self._history, indent=2 if pretty else None)
