@@ -1,72 +1,95 @@
-import logging
-from typing import List, Dict
+```python
+# core/utils/dlq_manager.py
+
 import asyncio
+import logging
+from typing import Any, Dict, List
 
-from core.execution_router import FAILED_EXEC_DLQ
-from core.plugin_manager import FAILED_PLUGIN_DLQ
+from core.execution.execution_router import FAILED_EXEC_DLQ
+from core.utils.plugin_manager import FAILED_PLUGIN_DLQ
 
-logger = logging.getLogger("dlq_manager")
+# ────────────────────────────────────────────────────────────────────────────────
+# Logger & Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+logger = logging.getLogger("nova.dlq_manager")
+logger.setLevel(logging.INFO)
 
-# === DLQ Inspector ===
-def get_all_dlq() -> Dict[str, List[Dict]]:
-    """Returns the current state of all failed execution and plugin DLQs."""
+# ────────────────────────────────────────────────────────────────────────────────
+# Dead-letter queue accessors
+# ────────────────────────────────────────────────────────────────────────────────
+def get_all_dlq() -> Dict[str, List[Dict[str, Any]]]:
+    """Get current state of execution & plugin DLQs."""
     return {
-        "execution": FAILED_EXEC_DLQ.copy(),
-        "plugins": FAILED_PLUGIN_DLQ.copy()
+        "execution": list(FAILED_EXEC_DLQ),
+        "plugins": list(FAILED_PLUGIN_DLQ),
     }
 
+
 def get_dlq_summary() -> Dict[str, int]:
-    """Returns a summary of the count of failed executions and plugins."""
+    """Count of failed items in each DLQ."""
     return {
         "execution_count": len(FAILED_EXEC_DLQ),
         "plugin_count": len(FAILED_PLUGIN_DLQ),
     }
 
-# === DLQ Replay ===
-async def replay_execution_dlq(execution_router) -> List[Dict]:
-    """Attempts to replay all failed execution tasks from the DLQ asynchronously."""
-    results = []
-    errors = []
-    to_remove = []  # To avoid modifying the list while iterating
+# ────────────────────────────────────────────────────────────────────────────────
+# DLQ Replay
+# ────────────────────────────────────────────────────────────────────────────────
+async def replay_execution_dlq(execution_router) -> List[Dict[str, Any]]:
+    """
+    Replay all failed execution tasks via the provided ExecutionRouter.
+    Returns a list of successful replay results.
+    """
+    results: List[Dict[str, Any]] = []
+    tasks = [
+        _process_failed_execution(entry, execution_router)
+        for entry in list(FAILED_EXEC_DLQ)
+    ]
 
-    # Create tasks for each failed item in the DLQ for concurrent execution
-    tasks = []
-    for failed in FAILED_EXEC_DLQ:
-        tasks.append(process_failed_task(failed, execution_router, results, to_remove, errors))
-    
-    # Wait for all tasks to complete
-    await asyncio.gather(*tasks)
-    
-    # After all tasks, remove successfully processed items from the DLQ
-    for item in to_remove:
-        FAILED_EXEC_DLQ.remove(item)
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
-    if errors:
-        logger.error(f"[DLQ Replay] Errors occurred during replay: {errors}")
-    else:
-        logger.info(f"[DLQ Replay] Successfully processed all failed executions.")
-    
+    # Evaluate outcomes and clean up DLQ
+    for entry, outcome in zip(list(FAILED_EXEC_DLQ), outcomes):
+        if isinstance(outcome, Exception):
+            logger.error(f"[DLQ Replay] Error replaying entry {entry}: {outcome}")
+        elif outcome.get("success"):
+            FAILED_EXEC_DLQ.remove(entry)
+            results.append(outcome)
+        else:
+            logger.warning(f"[DLQ Replay] Execution still failing for entry {entry}")
+
+    logger.info(f"[DLQ Replay] Completed. Successes: {len(results)}")
     return results
 
-async def process_failed_task(failed, execution_router, results, to_remove, errors):
-    """Processes a single failed task."""
-    try:
-        signal = failed.get("signal")
-        user_id = failed.get("user_id")
-        if signal:
-            logger.info(f"[DLQ Replay] Attempting to recover execution for signal: {signal.get('symbol')}")
-            result = await execution_router.execute_trade(signal, user_id)
-            if result.get("success"):
-                to_remove.append(failed)
-                logger.info(f"[DLQ Replay] Recovered execution for signal: {signal.get('symbol')}")
-                results.append(result)
-            else:
-                logger.warning(f"[DLQ Replay] Failed to recover execution for signal: {signal.get('symbol')}")
-        else:
-            logger.warning(f"[DLQ Replay] Missing signal for failed execution: {failed}")
-    except Exception as e:
-        error_message = f"[DLQ Replay] Failed to replay trade for signal: {failed.get('signal', 'N/A')}. Error: {e}"
-        logger.error(error_message)
-        errors.append(error_message)
 
-# === Future: Replay plugins if plugin DLQ ever becomes actionable ===
+async def _process_failed_execution(
+    failed: Dict[str, Any], execution_router
+) -> Dict[str, Any]:
+    """
+    Attempt to re-execute a single failed execution entry.
+    Raises on missing signal data.
+    """
+    signal = failed.get("signal")
+    user_id = failed.get("user_id")
+    if not signal:
+        raise ValueError(f"Missing 'signal' in DLQ entry: {failed}")
+
+    logger.info(f"[DLQ Replay] Replaying signal for {signal.get('symbol')}")
+    return await execution_router.execute_trade(signal, user_id=user_id)
+
+async def replay_plugin_dlq(plugin_manager) -> List[Any]:
+    """
+    Placeholder for future plugin DLQ replay, using the provided PluginManager.
+    """
+    results = []
+    for entry in list(FAILED_PLUGIN_DLQ):
+        try:
+            res = await plugin_manager.process_failed_plugin(entry)
+            if res.get("success"):
+                FAILED_PLUGIN_DLQ.remove(entry)
+                results.append(res)
+        except Exception as e:
+            logger.error(f"[DLQ Replay] Plugin replay error for {entry}: {e}")
+    logger.info(f"[DLQ Replay] Plugin DLQ replay completed. Successes: {len(results)}")
+    return results
+```
