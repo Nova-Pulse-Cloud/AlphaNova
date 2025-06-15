@@ -1,10 +1,18 @@
 # core/execution/execution_router.py
 
+"""
+Nova Pulse ALPHA – ExecutionRouter (Elite)
+───────────────────────────────────────────────────────────────────────────────
+- RL-optimized async routing
+- Risk/cap enforcement (.1/.5 SOL, no dupes)
+- Plugin-based wallet execution (Phantom-ready)
+- Prometheus+Otel metrics
+- Audit hash & DLQ
+"""
 import asyncio
 import hashlib
 import logging
 import uuid
-import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
@@ -15,7 +23,7 @@ from core.utils.config import config
 from core.utils.plugin_manager import PluginManager, fire_plugin_event
 from core.wallet_management.wallet_manager import WalletManager
 from core.signal_generation.reinforcement_learning import RLTrader
-from core.execution.tpsl_jupiter_plugin import JupiterTPSLPlugin
+from core.utils.tpsl_jupiter_plugin import JupiterTPSLPlugin
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from core.utils.trade_logger import log_trade
 from core.utils.token_utils import TokenUtils
@@ -116,23 +124,18 @@ class ExecutionRouter:
         async with self._sem, tracer.start_as_current_span("execute_trade"):
             try:
                 signal.setdefault("trace_id", f"tx-{uuid.uuid4().hex[:8]}")
-
                 # Confidence & size
                 if signal.get("score", 0) < float(getattr(config, "MIN_CONFIDENCE", 0.5)):
                     return {"status":"skipped","reason":"low confidence","trace_id": signal["trace_id"]}
                 signal["size"] = self.rl_trader.act(signal)
-
                 # Risk
                 if err := await self._risk_checks(signal):
                     return {"status":"rejected","reason":err,"trace_id": signal["trace_id"]}
-
                 # Slippage overlay
                 imbalance, _ = await get_orderbook_imbalance(signal["symbol"])
                 signal["slippage"] = imbalance
-
                 # Pre-trade plugin hooks
                 await self.plugin_mgr.pre_trade(signal)
-
                 # TP/SL
                 tp, sl, sl_meta = await self.tp_sl_plugin.compute(
                     symbol=signal["symbol"],
@@ -142,19 +145,15 @@ class ExecutionRouter:
                     user=user_id,
                 )
                 signal.update({"tp":tp, "sl":sl})
-
                 # Choose RPC
                 rpc = await self._choose_rpc(signal)
-
                 # Route execution via plugin (e.g. phantom)
                 router = self.plugin_mgr.get_router("phantom")
                 result = await router(signal=signal, rpc_url=rpc)
-
                 # Post-trade feedback
                 await self.tp_sl_plugin.compute  # ensure any side-effects
                 # RL reward
                 await self.rl_trader.reward(signal, result)
-
                 # Trade logging
                 result.update({
                     "audit_hash": _execution_hash(signal, result),
@@ -169,11 +168,9 @@ class ExecutionRouter:
                     pnl=result.get("pnl"),
                     user=user_id,
                 )
-
                 # Notify and fire events
                 await fire_plugin_event("trade_success", {"signal":signal,"result":result})
                 return result
-
             except Exception as e:
                 RPC_ERRORS.inc()
                 EXEC_DLQ.inc()
