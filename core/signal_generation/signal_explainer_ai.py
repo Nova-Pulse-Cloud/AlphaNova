@@ -1,12 +1,13 @@
-# File: core/signal_generation/signal_explainer_ai.py
+# core/signal_generation/signal_explainer_ai.py
 """
-Nova Pulse ALPHA – SignalExplainerAI 4.0
+Nova Pulse ALPHA – SignalExplainerAI 4.1 (Elite, fully-wired)
 ────────────────────────────────────────────────────────────────────
 • Async, Redis-cached LLM explanations with per-signal TTL
 • Adaptive TP/SL & OrderBookOverlay integration for live trade management
 • Prometheus metrics (calls, latency, errors, cache hits/misses, alerts)
 • DLQ for failed explainers with replay support
 • Pydantic models for type safety
+• All imports fixed to gold standard repo structure
 """
 import asyncio
 import hashlib
@@ -21,7 +22,7 @@ import redis.asyncio as redis_client
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
-from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
+from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.data_collection.orderbook_overlay import OrderBookOverlay
 from core.utils.config import config
 
@@ -91,7 +92,7 @@ class SignalExplainerAI:
     async def _ensure_redis(self):
         if not self.redis:
             try:
-                self.redis = redis_client.from_url(self.redis_url, decode_responses=True)
+                self.redis = await redis_client.from_url(self.redis_url, decode_responses=True)
                 await self.redis.ping()
                 logger.info("[SignalExplainerAI] Redis connected")
             except Exception as e:
