@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter
 from prometheus_client import Counter, Histogram
 
-from core.utils.config import config
+from core.utils.config import config  # <-- Corrected import
 
 logger = logging.getLogger("nova.pricing_utils")
 logger.setLevel(logging.INFO)
