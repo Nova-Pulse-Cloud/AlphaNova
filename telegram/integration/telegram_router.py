@@ -1,17 +1,16 @@
 # File: telegram/integration/telegram_router.py
 
-import os
 import logging
 from aiogram import Router, types, Bot, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-from utils.config import Config
-from utils.plugin_manager import fire_plugin_event
-from utils.pnl_card import generate_pnl_card
-from utils.token_logo import fetch_token_logo
-from utils.pnl_tracker import get_wallet_snapshot
-from utils.trade_logger import get_trade_log, register_trade_log_hook
+from core.utils.config import config
+from core.utils.plugin_manager import fire_plugin_event
+from core.utils.pnl_card import generate_pnl_card
+from core.utils.token_logo import fetch_token_logo
+from core.utils.pnl_tracker import get_wallet_snapshot
+from core.utils.trade_logger import get_trade_log, register_trade_log_hook
 from core.signal_generation.signal_sources import get_top_signals
 from core.alpha_memory_mesh import get_token_stats
 from core.top_wallet_tracer import get_recent_whale_tokens
@@ -19,12 +18,10 @@ from core.signal_generation.signal_explainer_ai import SignalExplainerAI
 from core.signal_generation.signal_engine_v3 import get_latest_signal  # assumed
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine  # assumed
 
-# Import command routers
 from telegram.commands.commands import router as commands_router
 from telegram.commands.pnl_commands import router as pnl_cmd_router
 from telegram.commands.streak_cmd import router as streak_router
 
-config = Config()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 router = Router()
@@ -36,13 +33,12 @@ bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
 
 def admin_only(func):
     async def wrapper(message: Message, *args, **kwargs):
-        if message.from_user.id != int(config.TELEGRAM_CHAT_ID):
+        if str(message.from_user.id) != str(config.TELEGRAM_CHAT_ID):
             await message.reply("❌ Access denied. This bot is private.")
             return
         return await func(message, *args, **kwargs)
     return wrapper
 
-# Welcome/help
 @router.message(Command(commands=["start", "help"]))
 @admin_only
 async def start_handler(message: Message):
@@ -68,7 +64,6 @@ async def start_handler(message: Message):
     )
     await message.answer(welcome, parse_mode="Markdown")
 
-# AI explanation
 @router.message(Command("explain"))
 @admin_only
 async def explain_handler(message: Message):
@@ -78,17 +73,16 @@ async def explain_handler(message: Message):
         return
     symbol = args[1].upper()
     ai = SignalExplainerAI()
-    result = await ai.explain_signal({"symbol": symbol, "components": {}})
-    narrative = result.get("narrative", "No explanation available.")
-    confidence = result.get("confidence", 0.0)
-    alert = result.get("alert", False)
+    result = await ai.explain({"symbol": symbol, "components": {}})
+    narrative = result.narrative if hasattr(result, "narrative") else result.get("narrative", "No explanation available.")
+    confidence = result.confidence if hasattr(result, "confidence") else result.get("confidence", 0.0)
+    alert = result.alert if hasattr(result, "alert") else result.get("alert", False)
     msg = f"🧠 *{symbol} AI Insight:*\n{narrative}\n_Confidence: {confidence:.2f}_"
     if alert:
         msg += "\n🚨 *High-confidence alert!*"
     await message.answer(msg, parse_mode="Markdown")
     await fire_plugin_event("cmd_explain_signal", {"symbol": symbol, "narrative": narrative, "confidence": confidence, "alert": alert})
 
-# Inline trade buttons
 def mirror_trade_buttons(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Mirror Trade", callback_data=f"mirror:{symbol}")],
@@ -107,13 +101,10 @@ def exec_trade_buttons(symbol: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📉 Skip", callback_data=f"skip:{symbol}")]
     ])
 
-# Push PnL card on trade log events
 async def push_trade_pnl_card(event_name: str, data: dict):
     if event_name != "trade_logged":
         return
     symbol = data.get("symbol")
-    entry = data.get("entry")
-    exit_ = data.get("exit")
     pnl = data.get("pnl")
     side = data.get("side")
     img = await generate_pnl_card(symbol)
@@ -122,9 +113,7 @@ async def push_trade_pnl_card(event_name: str, data: dict):
 
 register_trade_log_hook(push_trade_pnl_card)
 
-# Signal card push (example: auto or manual)
 async def push_signal_card(symbol: str, signal: dict):
-    # Advanced: add emoji, TP/SL, flavor, caption, leaderboard button
     caption = (
         f"🚨 *Nova Pulse Signal*\n"
         f"Token: ${symbol}\n"
@@ -144,19 +133,15 @@ async def push_signal_card(symbol: str, signal: dict):
     )
     await bot.send_photo(chat_id=int(config.TELEGRAM_CHAT_ID), photo=logo, caption=caption, parse_mode="Markdown", reply_markup=kb)
 
-# Callback router for all inline actions
 @router.callback_query(F.data.startswith("exec:"))
 async def exec_trade_cb(query: CallbackQuery):
     symbol = query.data.split(":")[1]
-    # TODO: Actually dispatch trade using backend
     await query.answer("🚀 Executing trade...")
     await query.message.edit_reply_markup(reply_markup=None)
     await fire_plugin_event("telegram_exec_trade", {"symbol": symbol, "user": query.from_user.id})
 
 @router.callback_query(F.data == "auto_toggle")
 async def auto_toggle_cb(query: CallbackQuery):
-    # TODO: Wire to backend state; here, just demo toggling
-    # Store in Redis or config: is_auto = not is_auto
     await query.answer("🔁 Auto mode toggled.")
     await query.message.edit_reply_markup(reply_markup=None)
     await fire_plugin_event("telegram_auto_toggle", {"user": query.from_user.id})
@@ -174,11 +159,9 @@ async def skip_trade_cb(query: CallbackQuery):
     await query.message.edit_reply_markup(reply_markup=None)
     await fire_plugin_event("telegram_skip_trade", {"symbol": symbol, "user": query.from_user.id})
 
-# --- Optionally: Add healthcheck/status endpoint for Render
 @router.message(Command("status"))
 @admin_only
 async def status_handler(message: Message):
-    # Example: Query current auto state, last trade, bot health, etc.
     auto_status = "ON"  # TODO: Wire to actual Redis/config
     msg = (
         f"🛰️ *Nova Pulse Status*\n"
@@ -189,16 +172,11 @@ async def status_handler(message: Message):
     )
     await message.answer(msg, parse_mode="Markdown")
 
-# --- Optionally: Register future event pushers here as well
-
-# Any additional background push (example: on alpha signal event)
 async def push_alpha_signal_event(event_name: str, data: dict):
     if event_name != "alpha_signal":
         return
     await push_signal_card(data.get("symbol", "?"), data)
 
 register_trade_log_hook(push_alpha_signal_event)
-
-# All other command and push logic should remain in the sub-routers as per your structure.
 
 # --- End of file ---
