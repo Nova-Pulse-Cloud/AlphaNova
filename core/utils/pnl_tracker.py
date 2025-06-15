@@ -1,147 +1,199 @@
+# core/utils/pnl_tracker.py
+
 import os
 import sqlite3
+import logging
+import io
 import matplotlib.pyplot as plt
 from datetime import datetime
 from typing import List, Dict, Optional
-from io import BytesIO
-import logging
 
-logger = logging.getLogger("pnl_tracker")
+from prometheus_client import Counter, Histogram
 
-DB_PATH = os.getenv("PNL_DB_PATH", "pnl_tracker.db")
+from core.utils.config import config
 
-def _get_conn():
-    """Get a connection to the SQLite database with safe parameterized queries."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row  # Return rows as dictionaries
-        return conn
-    except sqlite3.DatabaseError as e:
-        logger.error(f"Database connection error: {e}")
-        raise
+logger = logging.getLogger("nova.pnl_tracker")
+logger.setLevel(logging.INFO)
 
-def setup_db():
-    """Initialize the database with the required tables and indexes."""
-    try:
-        with _get_conn() as conn:
-            conn.execute("""
+# ────────────────────────────────────────────────────────────────────────────────
+# Prometheus metrics
+# ────────────────────────────────────────────────────────────────────────────────
+PNL_FILL_COUNT = Counter("pnl_fills_total", "Total PnL fill records inserted")
+PNL_FILL_ERRORS = Counter("pnl_fill_errors_total", "Errors inserting PnL fill record")
+PNL_QUERY_LATENCY = Histogram("pnl_query_latency_seconds", "Latency of PnL history queries")
+PNL_IMAGE_LATENCY = Histogram("pnl_image_latency_seconds", "Latency of PnL curve image generation")
+PNL_IMAGE_ERRORS = Counter("pnl_image_errors_total", "Errors generating PnL curve image")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Database setup
+# ────────────────────────────────────────────────────────────────────────────────
+DB_PATH = getattr(config, "PNL_DB_PATH", "pnl_tracker.db")
+
+def _get_conn() -> sqlite3.Connection:
+    """Return a SQLite connection to the PnL database."""
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def setup_db() -> None:
+    """Initialize the PnL database schema."""
+    with _get_conn() as conn:
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS fills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user TEXT,
-                symbol TEXT,
-                side TEXT,
-                size REAL,
-                entry REAL,
-                exit REAL,
-                pnl REAL,
+                user TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                size REAL NOT NULL,
+                entry REAL NOT NULL,
+                exit REAL NOT NULL,
+                pnl REAL NOT NULL,
                 cycle TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-            """)
-            conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_fills_user_symbol ON fills(user, symbol)
-            """)
-            conn.commit()
-    except sqlite3.DatabaseError as e:
-        logger.error(f"Error setting up database: {e}")
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_fills_user_symbol on fills(user, symbol)
+            """
+        )
+        conn.commit()
+    logger.info("[PnLTracker] Database initialized at %s", DB_PATH)
 
-def add_fill(symbol: str, side: str, size: float, entry: float, exit: float, pnl: float, user: str = "global", cycle: Optional[str] = None):
-    """Add a new fill (trade) entry into the database."""
+# ────────────────────────────────────────────────────────────────────────────────
+# PnL Data API
+# ────────────────────────────────────────────────────────────────────────────────
+
+def add_fill(
+    symbol: str,
+    side: str,
+    size: float,
+    entry: float,
+    exit: float,
+    pnl: float,
+    user: str = "global",
+    cycle: Optional[str] = None,
+) -> None:
+    """Insert a new trade fill record into the database."""
     try:
         with _get_conn() as conn:
-            conn.execute("""
-            INSERT INTO fills (user, symbol, side, size, entry, exit, pnl, cycle)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (user, symbol, side, size, entry, exit, pnl, cycle))
+            conn.execute(
+                """
+                INSERT INTO fills (user, symbol, side, size, entry, exit, pnl, cycle)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user, symbol, side, size, entry, exit, pnl, cycle),
+            )
             conn.commit()
-    except sqlite3.DatabaseError as e:
-        logger.error(f"Error inserting fill data: {e}")
+        PNL_FILL_COUNT.inc()
+    except Exception as e:
+        PNL_FILL_ERRORS.inc()
+        logger.error("[PnLTracker] Failed to add fill: %s", e)
+        raise
+
 
 def get_pnl_history(user: str = "global", symbol: Optional[str] = None) -> List[Dict]:
-    """Fetch the trade history and PnL data for a given user and symbol."""
+    """Fetch PnL history rows for a user and optional symbol."""
+    start = datetime.now().timestamp()
     try:
         with _get_conn() as conn:
-            query = "SELECT * FROM fills WHERE user=?"
-            params = [user]
             if symbol:
-                query += " AND symbol=? ORDER BY timestamp"
-                params.append(symbol)
+                rows = conn.execute(
+                    "SELECT * FROM fills WHERE user = ? AND symbol = ? ORDER BY timestamp",
+                    (user, symbol),
+                ).fetchall()
             else:
-                query += " ORDER BY timestamp"
-            rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
-    except sqlite3.DatabaseError as e:
-        logger.error(f"Error fetching PnL history: {e}")
-        return []
+                rows = conn.execute(
+                    "SELECT * FROM fills WHERE user = ? ORDER BY timestamp",
+                    (user,),
+                ).fetchall()
+        data = [dict(row) for row in rows]
+        return data
+    finally:
+        PNL_QUERY_LATENCY.observe(datetime.now().timestamp() - start)
 
-def get_streak_history(user: str = "global") -> Optional[Dict]:
-    """Fetch the current streak (wins and losses) for a user."""
-    data = get_pnl_history(user)
-    streak = {"wins": 0, "losses": 0}
-    for row in reversed(data):
-        if row["pnl"] > 0:
-            if streak["losses"] > 0: break
-            streak["wins"] += 1
-        elif row["pnl"] < 0:
-            if streak["wins"] > 0: break
-            streak["losses"] += 1
-    return streak if (streak["wins"] or streak["losses"]) else None
 
-def get_best_streak(user: str = "global") -> Optional[Dict]:
-    """Fetch the best streak (longest wins or losses) for a user."""
-    data = get_pnl_history(user)
-    best = {"wins": 0, "losses": 0}
-    win, loss = 0, 0
-    for row in data:
-        if row["pnl"] > 0:
-            win += 1
-            loss = 0
-        elif row["pnl"] < 0:
-            loss += 1
-            win = 0
-        best["wins"] = max(best["wins"], win)
-        best["losses"] = max(best["losses"], loss)
-    return best if (best["wins"] or best["losses"]) else None
+def get_current_streak(user: str = "global") -> Optional[Dict[str, int]]:
+    """Compute current consecutive wins or losses streak."""
+    history = get_pnl_history(user)
+    wins = losses = 0
+    for row in reversed(history):
+        if row['pnl'] > 0 and losses == 0:
+            wins += 1
+        elif row['pnl'] < 0 and wins == 0:
+            losses += 1
+        else:
+            break
+    return {'wins': wins, 'losses': losses} if (wins or losses) else None
 
-def get_cycle_stats(user: str = "global") -> Optional[Dict]:
-    """Fetch the most recent cycle stats, including win rate and total PnL."""
+
+def get_best_streak(user: str = "global") -> Optional[Dict[str, int]]:
+    """Compute the longest win and loss streaks."""
+    history = get_pnl_history(user)
+    best = {'wins': 0, 'losses': 0}
+    curr_w, curr_l = 0, 0
+    for row in history:
+        if row['pnl'] > 0:
+            curr_w += 1
+            curr_l = 0
+        elif row['pnl'] < 0:
+            curr_l += 1
+            curr_w = 0
+        best['wins'] = max(best['wins'], curr_w)
+        best['losses'] = max(best['losses'], curr_l)
+    return best if (best['wins'] or best['losses']) else None
+
+
+def get_cycle_stats(user: str = "global") -> Optional[Dict[str, Any]]:
+    """Fetch statistics for the most recent cycle: count, total PnL, win rate."""
     try:
         with _get_conn() as conn:
-            row = conn.execute("""
-            SELECT cycle, COUNT(*) as trades, SUM(pnl) as pnl,
-                SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END)*1.0/COUNT(*) as win_rate
-            FROM fills WHERE user=? GROUP BY cycle ORDER BY cycle DESC LIMIT 1
-            """, (user,)).fetchone()
-        if not row or not row["cycle"]:
-            return None
-        return dict(row)
-    except sqlite3.DatabaseError as e:
-        logger.error(f"Error fetching cycle stats: {e}")
+            row = conn.execute(
+                """
+                SELECT cycle, COUNT(*) AS trades, SUM(pnl) AS total_pnl,
+                    SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END)*1.0/COUNT(*) AS win_rate
+                FROM fills
+                WHERE user = ? AND cycle IS NOT NULL
+                GROUP BY cycle
+                ORDER BY cycle DESC
+                LIMIT 1
+                """,
+                (user,),
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error("[PnLTracker] get_cycle_stats error: %s", e)
         return None
 
-async def generate_pnl_image(user: str = "global", symbol: Optional[str] = None) -> BytesIO:
-    """Generate and return a PnL curve image for the user and symbol."""
+async def generate_pnl_image(user: str = "global", symbol: Optional[str] = None) -> io.BytesIO:
+    """Generate a PnL curve image for a user and optional symbol."""
+    buf = io.BytesIO()
+    start = datetime.now().timestamp()
     try:
         data = get_pnl_history(user, symbol)
-        if not data: return None
-        pnl_curve = [row['pnl'] for row in data]
-        cumsum = [sum(pnl_curve[:i+1]) for i in range(len(pnl_curve))]
+        if not data:
+            return buf
+        pnl_values = [row['pnl'] for row in data]
+        cumulative = [sum(pnl_values[:i+1]) for i in range(len(pnl_values))]
 
-        plt.figure(figsize=(6, 3))
-        plt.plot(cumsum, linewidth=3)
-        plt.title(f"PnL Curve ({symbol if symbol else 'All'})")
+        plt.figure(figsize=(8, 4))
+        plt.plot(cumulative, linewidth=2)
+        plt.title(f"PnL Curve: {symbol or 'All'}")
         plt.xlabel("Trade #")
-        plt.ylabel("PnL (USD)")
+        plt.ylabel("Cumulative PnL")
         plt.grid(True, linestyle="--", alpha=0.5)
         plt.tight_layout()
-        
-        buf = BytesIO()
-        plt.savefig(buf, format="png", dpi=300)  # High-quality output
+        plt.savefig(buf, format="png", dpi=300)
         plt.close()
         buf.seek(0)
-        return buf
     except Exception as e:
-        logger.error(f"Failed to generate PnL image for user: {user}, symbol: {symbol}. Error: {e}")
-        return None
+        PNL_IMAGE_ERRORS.inc()
+        logger.error("[PnLTracker] generate_pnl_image error: %s", e)
+    finally:
+        PNL_IMAGE_LATENCY.observe(datetime.now().timestamp() - start)
+        return buf
 
-# ----- Future Enhancements: Animated GIF equity curves, leaderboard overlays, challenge modes -----
+# End of PnL Tracker module
