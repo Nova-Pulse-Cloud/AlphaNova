@@ -6,8 +6,8 @@ World‑class unified execution pipeline:
 • Plugin‑based routing + post‑hooks
 • Prometheus metrics, DLQ, full audit hash
 • LLM rationale + PnL card attachment
--------------------------------------------------------------------------------"""
-
+-------------------------------------------------------------------------------
+"""
 import asyncio
 import hashlib
 import logging
@@ -16,15 +16,15 @@ from typing import Any, Dict, Optional
 
 from prometheus_client import Counter, Histogram
 
-from utils.config import Config
-from utils.token_auditor import TokenAuditor
+from core.utils.config import Config
+from core.utils.token_auditor import TokenAuditor
 from core.signal_generation.reinforcement_learning import DQNAgent, RLTrader
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
 from core.data_collection.market_conditions import MarketConditionsService
-from utils.trade_memory import TradeMemory
+from core.utils.trade_memory import TradeMemory
 from core.alpha_memory_mesh import MemoryMesh
-from utils.plugin_manager import PluginManager
-from utils.pnl_card import generate_pnl_card
+from core.utils.plugin_manager import PluginManager
+from core.utils.pnl_card import generate_pnl_card
 
 logger = logging.getLogger("nova.unified_trade_executor")
 logger.setLevel(logging.INFO)
@@ -108,7 +108,7 @@ class UnifiedTradeExecutor:
                 # ----------------------------------------------------------------
                 # 4️⃣ Post‑processing (LLM explanation + PnL card)
                 # ----------------------------------------------------------------
-                rationale = await self.explainer.explain_signal(signal)
+                rationale = await self.explainer.explain(signal)
                 pnl_card  = await generate_pnl_card(signal["symbol"])
                 # ----------------------------------------------------------------
                 # 5️⃣ Persistence / Rewards / Mesh / Plugins
