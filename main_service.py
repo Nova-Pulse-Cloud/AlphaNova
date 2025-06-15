@@ -17,10 +17,10 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-# Core imports
-from utils.config import Config
+# Core imports (always use core.utils, core.signal_generation, etc.)
+from core.utils.config import Config
 from core.wallet_management.wallet_manager import WalletManager
-from utils.trade_memory import TradeMemory
+from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.execution.execution_router import ExecutionRouter
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
@@ -30,20 +30,17 @@ from core.agents.quantum_fractal_agent import QuantumFractalAgent
 from core.data_collection.social_sentiment import SocialSentiment
 from core.data_collection.tech_indicator_agent import TechIndicatorAgent
 from core.signal_generation.sl_watchdog import start_sl_watchdog
-from core.plugin_manager import PluginManager  # legacy import replaced below, kept for backward compat
 from core.utils.plugin_manager import PluginManager as CorePluginManager
 from core.ws_endpoint import ws_manager, websocket_endpoint
 from core.rl_trainer_loop import RLTrainerLoop
 from core.auto_trader import AutoTrader
 from core.helius_hooks import register_helius_webhook
-from utils.token_auditor import TokenAuditor
-from utils.token_guardian import TokenGuardian
-from utils.trade_logger import log_trade
-from utils.dlq_manager import get_dlq_summary, replay_execution_dlq
-
-# --- Signal & PnL card renderers ---
-from utils.signal_card import generate_signal_card
-from utils.pnl_card import generate_pnl_card
+from core.utils.token_auditor import TokenAuditor
+from core.utils.token_guardian import TokenGuardian
+from core.utils.trade_logger import log_trade
+from core.utils.dlq_manager import get_dlq_summary, replay_execution_dlq
+from core.utils.signal_card import generate_signal_card
+from core.utils.pnl_card import generate_pnl_card
 from aiogram import Bot
 
 # === Settings ===
@@ -89,14 +86,13 @@ start_http_server(settings.METRICS_PORT)
 signals_counter = Counter('nova_signals_generated', 'Signals generated')
 agents_gauge    = Gauge('nova_agents_active', 'Active agents in mesh')
 
-# Initialize core subsystems
+# === Core subsystems ===
 wallet_manager   = WalletManager(config)
 trade_memory     = TradeMemory(config)
 rl_tuner         = ReinforcementTuner(config)
 execution_router = ExecutionRouter(
     wallet_manager=wallet_manager,
     rpc_nodes=[settings.HELIUS_RPC],
-    config=config
 )
 auditor          = TokenAuditor(config.REDIS_URL)
 guardian         = TokenGuardian(config.HELIUS_API_KEY)
@@ -110,25 +106,23 @@ auto_trader      = AutoTrader(
     telegram_chat_id=settings.TELEGRAM_CHAT_ID
 )
 
-# Agent registry\AGENT_REGISTRY: dict[str, Any] = {}
-def register_agent(name: str, agent_obj: Any):
+AGENT_REGISTRY = {}
+def register_agent(name: str, agent_obj):
     AGENT_REGISTRY[name] = agent_obj
 
-# Register analysis agents
 register_agent(
     "alpha_signal",
     AlphaSignalAgent(
         config=config,
         trade_memory=trade_memory,
         rl_tuner=rl_tuner,
-        orderbook_overlay=None  # injected dynamically if needed
+        orderbook_overlay=None
     )
 )
 register_agent("quantum_fractal", QuantumFractalAgent(config))
 register_agent("social_sentiment", SocialSentiment(config))
 register_agent("tech_indicators", TechIndicatorAgent(config))
 
-# Fusion logic
 async def adaptive_signal_fusion(symbol: str, agent_results: list[dict]) -> dict:
     weights = {res["source"]: rl_tuner.get_trust_score(res["source"], symbol) for res in agent_results}
     total = sum(weights.values()) or 1.0
@@ -142,13 +136,12 @@ async def adaptive_signal_fusion(symbol: str, agent_results: list[dict]) -> dict
         "meta": {"fusion": "adaptive_trust_entropy", "agents": list(weights.keys())}
     }
 
-# Plugin loading\async def load_plugins_from_dir(directory: str = "core/plugins"):
+async def load_plugins_from_dir(directory: str = "core/plugins"):
     mapping = {os.path.splitext(os.path.basename(f))[0]: f.replace('/', '.')[:-3]
                for f in glob.glob(f"{directory}/*.py")}
     await plugin_manager.initialize(mapping)
     logging.info("🔌 Loaded plugins: %s", list(mapping.keys()))
 
-# Logging & tracing
 def setup_logging():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -205,7 +198,6 @@ async def startup_event():
     setup_tracing()
     logging.info("Prometheus metrics on port %s", settings.METRICS_PORT)
 
-    # Connect subsystems
     for agent in AGENT_REGISTRY.values():
         if hasattr(agent, "connect"): await agent.connect()
     await auditor.connect()
@@ -216,7 +208,6 @@ async def startup_event():
     asyncio.create_task(RLTrainerLoop(rl_tuner).start())
     asyncio.create_task(start_sl_watchdog(wallet_manager, trade_memory, execution_router))
 
-    # Auto-trade loop
     async def trade_loop():
         while True:
             try:
