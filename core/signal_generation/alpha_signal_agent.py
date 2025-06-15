@@ -16,11 +16,11 @@ from prometheus_client import Counter, Histogram, Gauge
 from core.utils.config import config
 from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
+from core.signal_generation.reinforcement_learning import RLTrader
 from core.data_collection.orderbook_overlay import OrderBookOverlay
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.risk_signals import TokenAuditor, TokenGuardian, rug_pull_signal
 from core.agents.adaptive_tp_sl import AdaptiveTPSL
-from core.signal_generation.reinforcement_learning import RLTrader
 
 logger = logging.getLogger("nova.alpha_signal_agent")
 logger.setLevel(logging.INFO)
