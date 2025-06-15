@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, List
 from pydantic import BaseModel, Field, ValidationError
 from prometheus_client import Counter, Histogram
 
-from core.adaptive_tp_sl import AdaptiveTPSL
+from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.data_collection.orderbook_overlay import OrderBookOverlay
 from core.utils.config import config
 
@@ -220,3 +220,18 @@ class SignalSources:
 
     def get_last(self) -> Optional[Dict[str, Any]]:
         return self.cache.get(next(iter(self.cache)), {}).get("value")
+
+    @staticmethod
+    async def default_source(ctx: Dict[str, Any], user: Optional[str], simulation: bool) -> Dict[str, Any]:
+        # Fallback default plugin: returns safe dummy signal for symbol
+        now = int(time.time())
+        return {
+            "price": ctx.get("price", 1.0),
+            "volume": ctx.get("volume", 0.0),
+            "trend": ctx.get("trend", 0.0),
+            "sentiment": ctx.get("sentiment", 0.0),
+            "news": ctx.get("news", 0.0),
+            "alert": False,
+            "timestamp": now,
+            "simulation": simulation
+        }
