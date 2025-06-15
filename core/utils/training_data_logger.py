@@ -1,10 +1,12 @@
+# core/utils/training_data_logger.py
+
 import os
 import json
 import logging
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import redis.asyncio as redis_client
 from pydantic import BaseModel
@@ -20,20 +22,19 @@ logger.setLevel(logging.INFO)
 # ────────────────────────────────────────────────────────────────────────────────
 # Prometheus Metrics
 # ────────────────────────────────────────────────────────────────────────────────
-RL_UPDATES = Counter(
-    "training_rl_updates_total", "Total reinforcement-learning updates applied"
-)
-MEMORY_LATENCY = Histogram(
-    "training_memory_latency_seconds", "Latency of training memory operations"
-)
+RL_UPDATES       = Counter("training_rl_updates_total", "Total RL updates applied")
+MEMORY_LATENCY    = Histogram("training_memory_latency_seconds", "Latency of training memory operations")
+SIGNAL_STORED     = Counter("training_signals_stored_total", "Total training signals stored (Redis/disk)")
+FLUSH_COUNT       = Counter("training_flush_total", "Total federated memory flush operations")
+FLUSH_ERRORS      = Counter("training_flush_errors_total", "Errors during federated memory flush")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Dead-letter queue for failed operations
+# Dead-letter queue
 # ────────────────────────────────────────────────────────────────────────────────
 FAILED_TRADE_MEMORY_DLQ: List[Dict[str, Any]] = []
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Trade signal data model
+# Data Model
 # ────────────────────────────────────────────────────────────────────────────────
 class TradeRecord(BaseModel):
     symbol: str
@@ -46,7 +47,7 @@ class TradeRecord(BaseModel):
     timestamp: int
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Training Data Logger – production-grade
+# Training Data Logger
 # ────────────────────────────────────────────────────────────────────────────────
 class TrainingDataLogger:
     """
@@ -54,17 +55,16 @@ class TrainingDataLogger:
     Fully async, with Prometheus instrumentation and no placeholders.
     """
     def __init__(self) -> None:
-        self.redis_url = config.REDIS_URL
-        self.redis: redis_client.Redis | None = None
-        # Configurable artifact backup path
+        self.redis_url     = config.REDIS_URL
+        self.redis: Optional[redis_client.Redis] = None
         self.artifact_path = Path(getattr(config, "TRAINING_ARTIFACT_PATH", "artifacts"))
-        self.predictor = NeuralRegretPredictor()
-        self.federated_client = FederatedMemoryClient()
         self.export_interval = int(getattr(config, "TRAINING_EXPORT_INTERVAL", 100))
         self.buffer: List[TradeRecord] = []
+        self.predictor = NeuralRegretPredictor()
+        self.federated_client = FederatedMemoryClient()
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        """Initialize Redis connection."""
         try:
             self.redis = redis_client.from_url(self.redis_url, decode_responses=True)
             await self.redis.ping()
@@ -74,42 +74,40 @@ class TrainingDataLogger:
             self.redis = None
 
     async def disconnect(self) -> None:
-        """Close Redis connection."""
         if self.redis:
             await self.redis.close()
             logger.info("[TrainingDataLogger] Disconnected from Redis")
 
     async def record_signal(self, record: TradeRecord) -> None:
-        """
-        Store record in Redis or disk, update RL model, and flush when needed.
-        """
-        with MEMORY_LATENCY.time():
-            # Buffer in-memory
-            self.buffer.append(record)
-            # Primary store: Redis
-            if self.redis:
+        """Store record, update RL model, and flush when needed."""
+        async with self._lock:
+            with MEMORY_LATENCY.time():
+                rec_json = record.json()
                 try:
-                    await self.redis.set(
-                        f"trade:{record.symbol}:{record.timestamp}",
-                        record.json(),
-                        ex=86_400,
-                    )
+                    if self.redis:
+                        await self.redis.set(
+                            f"training:{record.symbol}:{record.timestamp}", rec_json,
+                            ex=86400
+                        )
+                    else:
+                        raise RuntimeError("Redis unavailable")
+                    SIGNAL_STORED.inc()
                 except Exception as e:
                     logger.warning(f"[TrainingDataLogger] Redis write failed: {e}")
                     self._write_to_disk(record)
-            else:
-                logger.warning("[TrainingDataLogger] Redis unavailable, writing to disk")
-                self._write_to_disk(record)
 
-        # Flush buffer to federated store
-        if len(self.buffer) >= self.export_interval:
-            await self.flush_memory()
+                # Buffer for federated upload
+                self.buffer.append(record)
 
-        # Update RL predictor
-        await self._update_rl(record)
+            # RL model update
+            await self._update_rl(record)
+
+            # Flush if threshold reached
+            if len(self.buffer) >= self.export_interval:
+                await self.flush_memory()
 
     async def _update_rl(self, record: TradeRecord) -> None:
-        """Trigger RL model updates for each agent in the record."""
+        """Trigger RL updates for each agent."""
         for agent, confidence in record.agents.items():
             try:
                 await self.predictor.update(
@@ -129,35 +127,32 @@ class TrainingDataLogger:
                 })
 
     async def flush_memory(self) -> None:
-        """Upload buffered records to federated memory and clear buffer."""
+        """Upload buffer to federated memory and clear buffer."""
+        FLUSH_COUNT.inc()
         try:
             await self.federated_client.upload(self.buffer)
-            logger.info(f"[TrainingDataLogger] Uploaded {len(self.buffer)} records to federated memory")
+            logger.info(f"[TrainingDataLogger] Uploaded {len(self.buffer)} records")
         except Exception as e:
+            FLUSH_ERRORS.inc()
             logger.error(f"[TrainingDataLogger] Federated upload failed: {e}")
-            # Disk‐backup on failure
             for rec in self.buffer:
                 try:
                     self._write_to_disk(rec)
-                except Exception as disk_e:
-                    FAILED_TRADE_MEMORY_DLQ.append({
-                        **rec.dict(),
-                        "error": str(disk_e),
-                    })
+                except Exception as de:
+                    FAILED_TRADE_MEMORY_DLQ.append({**rec.dict(), "error": str(de)})
         finally:
             self.buffer.clear()
 
     def _write_to_disk(self, record: TradeRecord) -> None:
-        """Append record JSON to artifact file as fallback storage."""
-        self.artifact_path.mkdir(parents=True, exist_ok=True)
+        """Append record JSON to local artifact file as fallback."""
         path = self.artifact_path / "training_backup.jsonl"
         try:
+            self.artifact_path.mkdir(parents=True, exist_ok=True)
             with open(path, "a") as f:
                 f.write(record.json() + "\n")
         except Exception as e:
             logger.error(f"[TrainingDataLogger] Disk write failed: {e}")
-            raise
 
     def get_dlq(self) -> List[Dict[str, Any]]:
-        """Return a copy of the dead‐letter queue."""
-        return FAILED_TRADE_MEMORY_DLQ.copy()
+        """Return current dead-letter queue items."""
+        return list(FAILED_TRADE_MEMORY_DLQ)
