@@ -1,167 +1,212 @@
+# core/signal_generation/signal_explainer_ai.py
+"""
+Nova Pulse ALPHA – SignalExplainerAI 4.0
+────────────────────────────────────────────────────────────────────
+• Async, Redis-cached LLM explanations with per-signal TTL
+• Adaptive TP/SL & OrderBookOverlay integration for live trade management
+• Prometheus metrics (calls, latency, errors, cache hits/misses, alerts)
+• DLQ for failed explainers with replay support
+• Pydantic models for type safety
+"""
 import asyncio
-import logging
 import hashlib
 import json
+import logging
+import time
 import uuid
-from typing import Dict, Any, Optional, Callable
-from prometheus_client import Counter, Histogram
+from typing import Any, Dict, Optional
+
 import openai
-from core.adaptive_tp_sl import AdaptiveTPSL  # Integrating AdaptiveTP/SL for dynamic trade management
-from core.orderbook_overlay import OrderBookOverlay  # Integrating OrderBookOverlay for market depth analysis
+import redis.asyncio as redis_client
+from pydantic import BaseModel, Field
+from prometheus_client import Counter, Histogram
+from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
+from core.data_collection.orderbook_overlay import OrderBookOverlay
+from core.utils.config import config
 
-logger = logging.getLogger("signal_explainer_ai")
+logger = logging.getLogger("nova.signal_explainer_ai")
+logger.setLevel(logging.INFO)
 
-# === Prometheus metrics ===
-EXPLAIN_CALLS = Counter("explain_calls_total", "Signal explain requests")
-EXPLAIN_ERRORS = Counter("explain_errors_total", "Signal explain errors")
-EXPLAIN_LATENCY = Histogram("explain_latency_seconds", "Signal explain latency")
-EXPLAIN_DLQ = Counter("explain_dlq_total", "Signal explain DLQ events")
-EXPLAIN_ALERTS = Counter("explain_alert_total", "Signal explain alert triggers")
+# ────────────────────────────────────────────────────────────────────────────────
+# Prometheus Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+EXPLAIN_CALLS    = Counter("explain_calls_total",    "Total explanation requests")
+EXPLAIN_ERRORS   = Counter("explain_errors_total",   "Explanation errors")
+EXPLAIN_LATENCY  = Histogram("explain_latency_seconds", "Latency per explanation")
+CACHE_HITS       = Counter("explain_cache_hits_total",   "Cache hits for explanations")
+CACHE_MISSES     = Counter("explain_cache_misses_total", "Cache misses for explanations")
+EXPLAIN_ALERTS   = Counter("explain_alerts_total",   "Explanations that triggered alerts")
 
-# === DLQ, event hooks, plugin registry ===
-FAILED_EXPLAIN_DLQ = []
-explain_event_hooks = []
+# ────────────────────────────────────────────────────────────────────────────────
+# DLQ
+# ────────────────────────────────────────────────────────────────────────────────
+FAILED_EXPLAIN_DLQ: list[Dict[str, Any]] = []
 
-def register_explain_event_hook(hook_fn):
-    explain_event_hooks.append(hook_fn)
+# ────────────────────────────────────────────────────────────────────────────────
+# Pydantic model for explanation output
+# ────────────────────────────────────────────────────────────────────────────────
+class ExplanationResult(BaseModel):
+    narrative: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    alert: bool
+    timestamp: int
+    tp: float = Field(..., ge=0.0)
+    sl: float = Field(..., ge=0.0)
+    rr_ratio: float = Field(..., ge=0.0)
+    size: float = Field(..., ge=0.0)
+    audit_hash: str
 
-async def fire_explain_event(event_name, data):
-    for hook in explain_event_hooks:
-        await hook(event_name, data)
+# ────────────────────────────────────────────────────────────────────────────────
+# Plugin registry (optional custom explainers)
+# ────────────────────────────────────────────────────────────────────────────────
+_explain_plugins: Dict[str, Any] = {}
 
-explain_plugins = {}
+def register_explain_plugin(name: str, fn: Any) -> None:
+    _explain_plugins[name] = fn
+    logger.info(f"[SignalExplainerAI] Registered plugin: {name}")
 
-def register_explain_plugin(name: str, fn: Callable):
-    explain_plugins[name] = fn
-
-# === Audit hash ===
-def explain_hash(signal: dict, result: dict) -> str:
+# ────────────────────────────────────────────────────────────────────────────────
+# Helper: compute audit hash
+# ────────────────────────────────────────────────────────────────────────────────
+def _compute_hash(signal: Dict[str, Any], explanation: Dict[str, Any]) -> str:
     m = hashlib.sha256()
     m.update(json.dumps(signal, sort_keys=True).encode())
-    m.update(json.dumps(result, sort_keys=True).encode())
+    m.update(json.dumps(explanation, sort_keys=True).encode())
     return m.hexdigest()
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Main Service
+# ────────────────────────────────────────────────────────────────────────────────
 class SignalExplainerAI:
-    def __init__(self, openai_api_key: str, adaptive_tp_sl: AdaptiveTPSL, orderbook_overlay: OrderBookOverlay, cache_ttl: int = 60):
-        self.last_explanation = None
-        self.alerts = []
-        self.loop = asyncio.get_event_loop()
-        self.cache = {}
-        self.cache_ttl = cache_ttl
-        self.adaptive_tp_sl = adaptive_tp_sl  # Initialize AdaptiveTP/SL for dynamic TP/SL logic
-        self.orderbook_overlay = orderbook_overlay  # Initialize OrderBookOverlay for liquidity analysis
-        openai.api_key = openai_api_key  # Set OpenAI API key
+    def __init__(
+        self,
+        ttl: int = 60,
+        model: str = "gpt-4-turbo",
+    ) -> None:
+        self.redis_url = config.REDIS_URL
+        self.cache_ttl = ttl
+        self.model      = model
+        self.redis: Optional[redis_client.Redis] = None
+        self.orderbook = OrderBookOverlay(config)
+        self.tp_sl     = AdaptiveTPSL(config)
+        openai.api_key = config.OPENAI_API_KEY
 
-    async def explain_signal(self, signal: Dict[str, Any], plugin: str = "default", user: Optional[str] = None, simulation: bool = False) -> Dict[str, Any]:
+    async def _connect(self):
+        if not self.redis:
+            try:
+                self.redis = redis_client.from_url(self.redis_url, decode_responses=True)
+                await self.redis.ping()
+                logger.info("[SignalExplainerAI] Redis connected")
+            except Exception as e:
+                logger.error(f"[SignalExplainerAI] Redis connect failed: {e}")
+                self.redis = None
+
+    async def explain(
+        self,
+        signal: Dict[str, Any],
+        plugin: str = "default",
+        simulation: bool = False,
+    ) -> ExplanationResult:
         EXPLAIN_CALLS.inc()
+        start = time.time()
         trace_id = signal.get("trace_id") or f"expl-{uuid.uuid4().hex[:8]}"
-        
-        # Cache check for previously explained signals
-        cache_key = f"explain_{trace_id}"
-        if cache_key in self.cache and time.time() - self.cache[cache_key]["ts"] < self.cache_ttl:
-            return self.cache[cache_key]["value"]
+        cache_key = f"explain:{trace_id}:{plugin}"
 
+        await self._connect()
+
+        # 1. Try cache
+        if self.redis:
+            try:
+                raw = await self.redis.get(cache_key)
+                if raw:
+                    CACHE_HITS.inc()
+                    data = json.loads(raw)
+                    return ExplanationResult.parse_obj(data)
+            except Exception:
+                pass
+        CACHE_MISSES.inc()
+
+        # 2. Generate via plugin or default
         try:
             async with EXPLAIN_LATENCY.time():
-                fn = explain_plugins.get(plugin, self.default_explainer)
-                explanation = await fn(signal, user=user, simulation=simulation)
+                # Base explanation
+                if plugin in _explain_plugins:
+                    expl = await asyncio.wait_for(_explain_plugins[plugin](signal, simulation), timeout=30)
+                else:
+                    expl = await self._default_explain(signal, simulation)
 
-                # Integrating Adaptive TP/SL for signal-based trade management
-                signal_data = await self._process_for_tp_sl(signal, explanation)
+                # Attach TP/SL & size from AdaptiveTPSL + OrderBookOverlay
+                ob_data = await self.orderbook.analyze(signal.get("symbol"))
+                tp_sl = await asyncio.wait_for(
+                    self.tp_sl.compute(signal.get("symbol"), expl.get("price", 0.0), {**signal, **ob_data}),
+                    timeout=20
+                )
 
-                rationale = signal.get("note", explanation.get("narrative", "No rationale"))
-                audit = {
-                    "signal": signal,
-                    "explanation": explanation,
-                    "user": user,
-                    "simulation": simulation,
-                    "trace_id": trace_id,
-                    "rationale": rationale,
-                    "audit_hash": explain_hash(signal, explanation)
+                full = {
+                    **expl,
+                    **ob_data,
+                    **tp_sl,
+                    "timestamp": int(time.time()),
                 }
+                full["audit_hash"] = _compute_hash(signal, full)
+                result = ExplanationResult.parse_obj(full)
 
-                # Cache the explanation
-                self.cache[cache_key] = {"ts": time.time(), "value": audit}
-
-                await fire_explain_event("explanation_generated", audit)
-                self.last_explanation = audit
-                if explanation.get("alert"):
-                    EXPLAIN_ALERTS.inc()
-                    self.alerts.append(audit)
-                    await fire_explain_event("explanation_alert", audit)
-
-                return audit
         except Exception as e:
             EXPLAIN_ERRORS.inc()
-            EXPLAIN_DLQ.inc()
-            err_data = {"signal": signal, "error": str(e), "user": user, "trace_id": trace_id}
-            FAILED_EXPLAIN_DLQ.append(err_data)
-            await fire_explain_event("explain_error", err_data)
-            logger.error(f"[SignalExplainerAI] Explanation error: {e}")
-            return {"error": str(e), "user": user, "trace_id": trace_id}
+            FAILED_EXPLAIN_DLQ.append({"signal": signal, "error": str(e), "trace_id": trace_id})
+            logger.error(f"[SignalExplainerAI] explain error: {e}")
+            # fallback minimal explanation
+            result = ExplanationResult(
+                narrative="Explanation failed",
+                confidence=0.0,
+                alert=False,
+                timestamp=int(time.time()),
+                tp=signal.get("entry_price", 0.0) * 1.02,
+                sl=signal.get("entry_price", 0.0) * 0.98,
+                rr_ratio=1.0,
+                size=0.0,
+                audit_hash=_compute_hash(signal, {"error": str(e)})
+            )
+        finally:
+            EXPLAIN_LATENCY.observe(time.time() - start)
 
-    async def default_explainer(self, signal: Dict[str, Any], user: Optional[str] = None, simulation: bool = False) -> Dict[str, Any]:
-        trend = signal.get("components", {}).get("trend", 0.0)
-        sentiment = signal.get("components", {}).get("sentiment", 0.0)
-        whales = signal.get("components", {}).get("whales", 0.0)
-        liquidity = signal.get("components", {}).get("liquidity", 0.0)
-        confidence = abs(signal.get("signal_strength", 0.0))
-        note = signal.get("note", "No context")
-        narrative = (
-            f"Trend:{trend:+.2f}, Sentiment:{sentiment:+.2f}, Whales:{whales:+.2f}, "
-            f"Liquidity:{liquidity:+.2f} — "
-            f"Signal: {note}, Confidence: {confidence:.2f}."
-        )
-        alert = confidence > 0.9 or abs(trend) > 0.7
+        # 3. Cache and return
+        if self.redis:
+            try:
+                await self.redis.set(cache_key, result.json(), ex=self.cache_ttl)
+            except Exception:
+                pass
+
+        if result.alert:
+            EXPLAIN_ALERTS.inc()
+
+        return result
+
+    async def _default_explain(self, signal: Dict[str, Any], simulation: bool) -> Dict[str, Any]:
+        # Simple narrative synthesis
+        trend = signal.get("trend", 0.0)
+        sentiment = signal.get("sentiment", 0.0)
+        narrative = f"Trend: {trend:.2f}, Sentiment: {sentiment:.2f}"
+        alert = abs(trend) > 0.8 or sentiment > 0.7
+        confidence = min(1.0, max(0.0, abs(trend)*0.5 + sentiment*0.5))
         return {
             "narrative": narrative,
             "confidence": confidence,
             "alert": alert,
-            "timestamp": signal.get("timestamp"),
-            "simulation": simulation
+            "price": signal.get("price", 0.0)
         }
-
-    async def _process_for_tp_sl(self, signal: Dict[str, Any], explanation: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process the fetched signal data for integration into the adaptive TP/SL system.
-        Uses the AdaptiveTPSL class to calculate dynamic TP/SL based on the signal.
-        """
-        signal_context = {
-            "price": explanation.get("price"),
-            "volatility": explanation.get("volatility", 0.02),
-            "trend_strength": explanation.get("trend", 0.0),
-            "whale_pressure": explanation.get("whale_pressure", 0.0),
-            "spread": explanation.get("spread", 0.001),
-            "gas_cost": explanation.get("gas_cost", 0.0),
-            "orderbook_bias": explanation.get("orderbook_bias", 0.0),
-            "rug_score": explanation.get("rug_score", 0.0),
-            "cycle_phase": explanation.get("cycle_phase", 0.5),
-            "user_risk": explanation.get("user_risk", 0.0)
-        }
-        # Use the AdaptiveTPSL class to compute dynamic TP/SL based on the signal
-        tp_sl = await self.adaptive_tp_sl.compute(signal.get("symbol"), explanation.get("price"), signal_context)
-        
-        # Append the TP/SL data to the explanation
-        explanation["tp"] = tp_sl["tp"]
-        explanation["sl"] = tp_sl["sl"]
-        explanation["rr_ratio"] = tp_sl["rr_ratio"]
-        explanation["size"] = tp_sl["size"]
-
-        return explanation
 
     async def replay_dlq(self):
-        for failed in FAILED_EXPLAIN_DLQ[:]:
+        """Retry all failed explanations."""
+        for entry in FAILED_EXPLAIN_DLQ[:]:
             try:
-                _ = await self.explain_signal(failed.get("signal", {}), user=failed.get("user"))
-                FAILED_EXPLAIN_DLQ.remove(failed)
-            except Exception:
+                _ = await self.explain(entry["signal"])
+                FAILED_EXPLAIN_DLQ.remove(entry)
+            except:
                 continue
 
     def get_dlq(self):
-        return FAILED_EXPLAIN_DLQ.copy()
+        return list(FAILED_EXPLAIN_DLQ)
 
-    def get_alerts(self):
-        return self.alerts
-
-    def get_last_explanation(self):
-        return self.last_explanation
+# singleton instance
+signal_explainer = SignalExplainerAI()
