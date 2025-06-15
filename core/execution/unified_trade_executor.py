@@ -1,4 +1,5 @@
-"""core/execution/unified_trade_executor.py
+# core/execution/unified_trade_executor.py
+"""
 -------------------------------------------------------------------------------
 World‑class unified execution pipeline:
 • Multi‑layer risk filters (Audit + MarketConditions)
@@ -25,19 +26,19 @@ from core.utils.trade_memory import TradeMemory
 from core.alpha_memory_mesh import MemoryMesh
 from core.utils.plugin_manager import PluginManager
 from core.utils.pnl_card import generate_pnl_card
+from utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.unified_trade_executor")
 logger.setLevel(logging.INFO)
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 # Prometheus Metrics
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 EXECUTIONS        = Counter("trade_executions_total", "Total trades executed")
 EXECUTION_LATENCY = Histogram("trade_execution_latency_seconds", "Execution latency")
 EXECUTION_SKIPS   = Counter("trade_skips_total", "Trades skipped")
 EXECUTION_ERRORS  = Counter("trade_execution_errors_total", "Trade execution failures")
 
-# DLQ (in‑mem)
 FAILED_EXEC_DLQ: list[Dict[str, Any]] = []
 
 class UnifiedTradeExecutor:
@@ -68,9 +69,6 @@ class UnifiedTradeExecutor:
         self.mesh          = mesh
         self.plugins       = plugin_manager
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # Public: execute_trade
-    # ────────────────────────────────────────────────────────────────────────────
     async def execute_trade(self, signal: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
         """End‑to‑end execution for **one** trading signal."""
         trace_id = signal.get("trace_id") or str(uuid.uuid4())
@@ -78,40 +76,45 @@ class UnifiedTradeExecutor:
         with EXECUTION_LATENCY.time():
             try:
                 # ----------------------------------------------------------------
-                # 1️⃣ Risk / Market Filters
+                # ① Risk / Market Filters
                 # ----------------------------------------------------------------
                 trust = await self.auditor.audit_token(signal["symbol"])
                 if trust.risk > self.cfg.MAX_RISK_THRESHOLD:
                     EXECUTION_SKIPS.inc()
+                    await fire_plugin_event("trade_skipped_risk", {"signal": signal, "trace_id": trace_id, "risk": trust.risk})
                     return {"status": "skipped", "reason": "risk", "trace_id": trace_id}
                 if not await self.market.is_favorable(signal["symbol"]):
                     EXECUTION_SKIPS.inc()
+                    await fire_plugin_event("trade_skipped_market", {"signal": signal, "trace_id": trace_id})
                     return {"status": "skipped", "reason": "market", "trace_id": trace_id}
                 # ----------------------------------------------------------------
-                # 2️⃣ RL Action
+                # ② RL Action
                 # ----------------------------------------------------------------
                 state_vec = self._build_state(signal, trust)
                 action = await self.dqn.act(state_vec)
                 if action in (0, "hold"):
+                    await fire_plugin_event("trade_held_rl", {"signal": signal, "trace_id": trace_id})
                     return {"status": "held", "trace_id": trace_id}
                 side = "buy" if action in (1, "enter") else "sell"
                 # ----------------------------------------------------------------
-                # 3️⃣ Routing & Execution
+                # ③ Routing & Execution
                 # ----------------------------------------------------------------
-                tx = await self.plugins.route_trade(
-                    symbol=signal["symbol"],
-                    side=side,
-                    wallet=self.wallet_mgr.get_wallet("solana"),
-                    trace_id=trace_id,
-                )
+                try:
+                    tx = await self.plugins.get_router(signal.get("dex", "phantom"))(
+                        signal, self.cfg.HELIUS_RPC
+                    )
+                except Exception as router_exc:
+                    EXECUTION_ERRORS.inc()
+                    await fire_plugin_event("trade_router_error", {"signal": signal, "trace_id": trace_id, "error": str(router_exc)})
+                    raise router_exc
                 EXECUTIONS.inc()
                 # ----------------------------------------------------------------
-                # 4️⃣ Post‑processing (LLM explanation + PnL card)
+                # ④ Post‑processing (LLM explanation + PnL card)
                 # ----------------------------------------------------------------
                 rationale = await self.explainer.explain(signal)
                 pnl_card  = await generate_pnl_card(signal["symbol"])
                 # ----------------------------------------------------------------
-                # 5️⃣ Persistence / Rewards / Mesh / Plugins
+                # ⑤ Persistence / Rewards / Mesh / Plugins
                 # ----------------------------------------------------------------
                 record = {
                     "symbol": signal["symbol"],
@@ -126,6 +129,7 @@ class UnifiedTradeExecutor:
                 if hasattr(self.plugins, "post_trade"):
                     await self.plugins.post_trade(signal, tx)
                 exec_hash = hashlib.sha256(f"{signal['symbol']}:{side}:{trace_id}".encode()).hexdigest()
+                await fire_plugin_event("trade_executed", {"signal": signal, "result": tx, "trace_id": trace_id, "side": side})
                 return {
                     "status"   : "executed",
                     "trace_id" : trace_id,
@@ -137,11 +141,9 @@ class UnifiedTradeExecutor:
                 EXECUTION_ERRORS.inc()
                 logger.exception(f"[UTE:{trace_id}] Fatal: {e}")
                 FAILED_EXEC_DLQ.append({"signal": signal, "error": str(e)})
+                await fire_plugin_event("trade_failed", {"signal": signal, "error": str(e), "trace_id": trace_id})
                 return {"status": "error", "reason": str(e), "trace_id": trace_id}
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # Private Helpers
-    # ────────────────────────────────────────────────────────────────────────────
     @staticmethod
     def _build_state(signal: Dict[str, Any], trust) -> list:
         """State vector for DQN agent."""
@@ -150,3 +152,21 @@ class UnifiedTradeExecutor:
             trust.risk,
             signal.get("volatility", 0.0),
         ]
+
+# ────────────────────────────────────────────────────────────
+# Factory Function (Example)
+# ────────────────────────────────────────────────────────────
+# To use in main_service or as a dependency:
+def create_unified_trade_executor(cfg: Config) -> UnifiedTradeExecutor:
+    return UnifiedTradeExecutor(
+        config=cfg,
+        wallet_manager=...,  # inject your WalletManager
+        memory=...,          # inject TradeMemory
+        auditor=...,         # inject TokenAuditor
+        explainer=...,       # inject SignalExplainerAI
+        market_filter=...,   # inject MarketConditionsService
+        rl_agent=...,        # inject DQNAgent
+        rl_trader=...,       # inject RLTrader
+        mesh=...,            # inject MemoryMesh
+        plugin_manager=...,  # inject PluginManager
+    )
