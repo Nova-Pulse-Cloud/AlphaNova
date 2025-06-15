@@ -1,6 +1,6 @@
 # core/signal_generation/sl_watchdog.py
 """
-Nova Pulse ALPHA – SL/TP Watchdog 2.0
+Nova Pulse ALPHA – SL/TP Watchdog 2.0 (Nuclear Version)
 ────────────────────────────────────────
 • Async, non-blocking sentinel for auto closing positions at TP/SL
 • Uses PricingUtils for live price feeds and WalletManager + ExecutionRouter
@@ -8,6 +8,7 @@ Nova Pulse ALPHA – SL/TP Watchdog 2.0
 • Prometheus metrics for errors, hits, and latency
 • Configurable poll interval via environment
 • Graceful shutdown and DLQ for failure replay
+• Now: event firing, closed/pending memory marking, full audit trail logging
 """
 import asyncio
 import logging
@@ -21,6 +22,7 @@ from core.utils.pricing_utils import PricingUtils
 from core.wallet_management.wallet_manager import WalletManager
 from core.execution.execution_router import ExecutionRouter
 from core.utils.trade_memory import TradeMemory
+from core.utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.sl_watchdog")
 logger.setLevel(logging.INFO)
@@ -43,6 +45,7 @@ class OpenTrade(BaseModel):
     tp: float = Field(..., ge=0)
     sl: float = Field(..., ge=0)
     user: str
+    status: str = "open"  # added for pending/closed tracking
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Watchdog Implementation
@@ -95,20 +98,34 @@ class SLWatchdog:
             return
 
         start = asyncio.get_event_loop().time()
+        current = None
         try:
             price = await self.pricing.fetch_price(trade.symbol)
             current = price.price
         except Exception as e:
             SL_WATCHDOG_ERRORS.inc()
+            logger.error(f"[SLWatchdog] Price fetch error for {trade.symbol}: {e}")
             return
 
+        # Log price every time for audit
+        logger.info(f"[SLWatchdog][AUDIT] {trade.symbol} side={trade.side} entry={trade.entry} TP={trade.tp} SL={trade.sl} cur={current} user={trade.user}")
+        
         hit_tp = (trade.side == "buy" and current >= trade.tp) or (trade.side == "sell" and current <= trade.tp)
         hit_sl = (trade.side == "buy" and current <= trade.sl) or (trade.side == "sell" and current >= trade.sl)
+
+        if trade.status == "closed":
+            logger.debug(f"[SLWatchdog] {trade.symbol} already closed (id={trade.id})")
+            return
+        if trade.status == "pending":
+            logger.debug(f"[SLWatchdog] {trade.symbol} already pending close (id={trade.id})")
+            return
 
         if hit_tp or hit_sl:
             reason = "tp" if hit_tp else "sl"
             logger.info(f"[SLWatchdog] {reason.upper()} hit for {trade.symbol} at {current}")
             SL_WATCHDOG_HITS.inc()
+            # Mark trade as pending close in memory
+            await self.trade_memory.mark_trade_pending(trade.id)
             signal = {
                 "symbol": trade.symbol,
                 "side": "sell" if trade.side == "buy" else "buy",
@@ -117,7 +134,21 @@ class SLWatchdog:
                 "reason": reason,
                 "price": current,
             }
+            await fire_plugin_event("sl_tp_triggered", {
+                "trade_id": trade.id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "trigger": reason,
+                "entry": trade.entry,
+                "tp": trade.tp,
+                "sl": trade.sl,
+                "current": current,
+                "user": trade.user,
+            })
+            # Execute close
             await self.execution_router.execute_trade(signal, user_id=trade.user)
+            # Mark as closed in memory after execution
+            await self.trade_memory.mark_trade_closed(trade.id)
         SL_WATCHDOG_LATENCY.observe(asyncio.get_event_loop().time() - start)
 
 # ────────────────────────────────────────────────────────────────────────────────
