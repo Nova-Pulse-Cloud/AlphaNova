@@ -11,25 +11,24 @@ from aiogram.types import Message
 import aioredis
 from prometheus_client import Counter, Histogram
 
-from utils.config import Config
+from core.utils.config import config
 from core.wallet_management.wallet_manager import WalletManager
-from utils.trade_memory import TradeMemory
+from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine
-from utils.trade_logger import get_trade_log
+from core.utils.trade_logger import get_trade_log
 from core.signal_generation.signal_sources import get_top_signals
 from core.alpha_memory_mesh import get_token_stats
 from core.top_wallet_tracer import get_recent_whale_tokens
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
-from utils.pnl_card import generate_pnl_card
-from utils.pnl_chart import generate_pnl_image
-from utils.signal_card import generate_signal_card
-from utils.plugin_manager import fire_plugin_event
+from core.utils.pnl_card import generate_pnl_card
+from core.utils.pnl_chart import generate_pnl_image
+from core.utils.signal_card import generate_signal_card
+from core.utils.plugin_manager import fire_plugin_event
 from core.signal_generation.reinforcement_learning import RLTrader
 
 # Initialize dependencies
-config = Config()
 wallet_manager = WalletManager()
 trade_memory = TradeMemory()
 rl_tuner = ReinforcementTuner()
@@ -49,14 +48,13 @@ ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", config.TELEGRAM_CHAT_ID or "75
 
 def admin_only(func):
     async def wrapper(message: Message, *args, **kwargs):
-        if message.from_user.id != ADMIN_CHAT_ID:
+        if int(message.from_user.id) != int(ADMIN_CHAT_ID):
             await message.reply("❌ Access denied. This bot is private.")
             COMMANDS_FAILED.inc()
             return
         return await func(message, *args, **kwargs)
     return wrapper
 
-# Rate limiting helper (per-command cooldown)
 async def rate_limit_check(user_id: str, command: str):
     last_used = await redis.get(f"{user_id}:{command}:last_used")
     if last_used and time.time() - float(last_used) < 30:
@@ -64,7 +62,6 @@ async def rate_limit_check(user_id: str, command: str):
     await redis.set(f"{user_id}:{command}:last_used", time.time(), ex=30)
     return True
 
-# === Wallet Command ===
 @router.message(Command("wallet"))
 @admin_only
 async def wallet_handler(message: Message):
@@ -75,7 +72,6 @@ async def wallet_handler(message: Message):
     await message.answer(f"💼 *Wallet Snapshot:*\n{snapshot}", parse_mode="Markdown")
     COMMANDS_EXECUTED.inc()
 
-# === PnL Command ===
 @router.message(Command("pnl"))
 @admin_only
 async def pnl_handler(message: Message):
@@ -86,7 +82,6 @@ async def pnl_handler(message: Message):
     await message.answer_photo(img, caption="📈 PnL Summary")
     COMMANDS_EXECUTED.inc()
 
-# === Logs Command ===
 @router.message(Command("logs"))
 @admin_only
 async def logs_handler(message: Message):
@@ -97,7 +92,6 @@ async def logs_handler(message: Message):
     await message.answer(f"📝 *Last 20 Trades:*\n{logs}", parse_mode="Markdown")
     COMMANDS_EXECUTED.inc()
 
-# === Signal Card Command ===
 @router.message(Command("signalcard"))
 @admin_only
 async def signalcard_handler(message: Message):
@@ -113,7 +107,6 @@ async def signalcard_handler(message: Message):
     await message.answer_photo(img, caption=f"🎴 Signal Card for {symbol}")
     COMMANDS_EXECUTED.inc()
 
-# === PnL Chart Command ===
 @router.message(Command("pnlchart"))
 @admin_only
 async def pnlchart_handler(message: Message):
@@ -127,7 +120,6 @@ async def pnlchart_handler(message: Message):
         await message.answer("No trade history available for chart.")
     COMMANDS_EXECUTED.inc()
 
-# === Stats Command ===
 @router.message(Command("stats"))
 @admin_only
 async def stats_handler(message: Message):
@@ -143,7 +135,6 @@ async def stats_handler(message: Message):
     await message.answer(f"📊 *Memory Stats for {symbol}:*\n{stats}", parse_mode="Markdown")
     COMMANDS_EXECUTED.inc()
 
-# === Social Command ===
 @router.message(Command("social"))
 @admin_only
 async def social_handler(message: Message):
@@ -154,7 +145,6 @@ async def social_handler(message: Message):
     await message.answer(f"🌐 *Trending Tokens on X:*\n{msg}", parse_mode="Markdown")
     COMMANDS_EXECUTED.inc()
 
-# === Whales Command ===
 @router.message(Command("whales"))
 @admin_only
 async def whales_handler(message: Message):
@@ -165,7 +155,6 @@ async def whales_handler(message: Message):
     await message.answer(f"🐋 *Latest Whale Token Swaps:*\n{msg}", parse_mode="Markdown")
     COMMANDS_EXECUTED.inc()
 
-# === Alpha Command (Upgraded: sends both signal and card) ===
 @router.message(Command("alpha"))
 @admin_only
 async def alpha_handler(message: Message):
@@ -177,21 +166,18 @@ async def alpha_handler(message: Message):
         return
     symbol = args[1].upper()
     result = await engine.generate_signal(symbol, user=message.from_user.id)
-    # Send the main signal result
     if "composite" in result and "signal_strength" in result["composite"]:
         s_strength = result["composite"]["signal_strength"]
         await message.answer(
             f"🚀 *Alpha Signal for {symbol}:* {s_strength:.2f}",
             parse_mode="Markdown"
         )
-        # Also send signal card (elite upgrade: pass full composite object)
         card_img = await generate_signal_card(result["composite"])
         await message.answer_photo(card_img, caption=f"🎴 Nova Pulse AI Card for {symbol}")
     else:
         await message.answer(f"⚠️ No alpha signal available for {symbol}")
     COMMANDS_EXECUTED.inc()
 
-# === Explain Command ===
 @router.message(Command("explain"))
 @admin_only
 async def explain_handler(message: Message):
@@ -203,12 +189,12 @@ async def explain_handler(message: Message):
         return
     symbol = args[1].upper()
     explainer = SignalExplainerAI()
-    result = await explainer.explain_signal({"symbol": symbol, "components": {}, "timestamp": str(uuid.uuid1())})
+    result = await explainer.explain({"symbol": symbol, "components": {}, "timestamp": str(uuid.uuid1())})
     await fire_plugin_event("cmd_explain", {"symbol": symbol})
-    await message.answer(f"🧠 *{symbol} AI Insight:*\n\n{result.get('narrative', '')}", parse_mode="Markdown")
+    narrative = result.narrative if hasattr(result, "narrative") else result.get("narrative", "")
+    await message.answer(f"🧠 *{symbol} AI Insight:*\n\n{narrative}", parse_mode="Markdown")
     COMMANDS_EXECUTED.inc()
 
-# === Auto-Trading Toggle ===
 @router.message(Command("auto"))
 @admin_only
 async def auto_toggle_handler(message: Message):
@@ -226,7 +212,6 @@ async def auto_toggle_handler(message: Message):
         await message.answer("🚀 Auto-Trading Enabled.")
     COMMANDS_EXECUTED.inc()
 
-# === Status Command ===
 @router.message(Command("status"))
 @admin_only
 async def status_handler(message: Message):
@@ -238,7 +223,6 @@ async def status_handler(message: Message):
     await message.answer(f"🤖 Auto-Trading Status: {status}")
     COMMANDS_EXECUTED.inc()
 
-# === Mode Command ===
 @router.message(Command("mode"))
 @admin_only
 async def mode_handler(message: Message):
@@ -255,7 +239,6 @@ async def mode_handler(message: Message):
     await message.answer(f"🎯 Trading mode set to: {selected.title()}")
     COMMANDS_EXECUTED.inc()
 
-# === Mirror Trade Command ===
 @router.message(Command("mirror"))
 @admin_only
 async def mirror_handler(message: Message):
@@ -266,23 +249,19 @@ async def mirror_handler(message: Message):
         COMMANDS_FAILED.inc()
         return
     symbol = args[1].upper()
-    # This should invoke backend trade logic and/or push inline keyboard
     await fire_plugin_event("cmd_mirror", {"symbol": symbol, "user": message.from_user.id})
     await message.answer(f"👥 Mirror trade for {symbol} submitted!")
     COMMANDS_EXECUTED.inc()
 
-# === Export Data Command ===
 @router.message(Command("exportdata"))
 @admin_only
 async def export_data_handler(message: Message):
     COMMANDS_RECEIVED.inc()
     user_id = message.from_user.id
-    # TODO: Implement logic to export all fills as CSV
     await fire_plugin_event("cmd_export_data", {"user_id": user_id})
     await message.answer("🗃️ Export function is coming soon!")
     COMMANDS_EXECUTED.inc()
 
-# === Help Command ===
 @router.message(Command("help"))
 @admin_only
 async def help_handler(message: Message):
