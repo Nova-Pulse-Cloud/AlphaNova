@@ -1,126 +1,145 @@
-import os
+# core/utils/token_logo.py
+
 import logging
+import os
 from pathlib import Path
 from io import BytesIO
+from typing import Optional
 
-import aiohttp
-from redis import asyncio as aioredis
+import httpx
+import redis.asyncio as redis_client
 from PIL import Image, ImageDraw, ImageFont
+from prometheus_client import Counter, Histogram
 
-logger = logging.getLogger("token_logo")
+from core.utils.config import config
 
-LOGO_DIR = Path("data/logos")
-LOGO_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_LOGO_PATH = "assets/placeholder.png"
+logger = logging.getLogger("nova.token_logo")
+logger.setLevel(logging.INFO)
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Metrics
+# ────────────────────────────────────────────────────────────────────────────────
+LOGO_CACHE_HITS = Counter("token_logo_cache_hits_total", "Cache hits for token logos")
+LOGO_CACHE_MISSES = Counter("token_logo_cache_misses_total", "Cache misses for token logos")
+LOGO_FETCH_ERRORS = Counter("token_logo_fetch_errors_total", "Errors fetching token logos")
+LOGO_LATENCY = Histogram("token_logo_latency_seconds", "Latency of token logo operations")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Trusted sources
+# ────────────────────────────────────────────────────────────────────────────────
 TRUSTED_LOGO_SOURCES = [
     "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/{mint}/logo.png",
-    "https://cdn.jsdelivr.net/gh/solana-labs/token-list/assets/mainnet/{mint}/logo.png"
+    "https://cdn.jsdelivr.net/gh/solana-labs/token-list/assets/mainnet/{mint}/logo.png",
 ]
 
+# Default placeholder asset
+DEFAULT_LOGO_PATH = Path("assets/mascot/Nova1.png")
+# Directory to persist fetched or generated logos
+LOGO_DIR = Path("data/logos")
+LOGO_DIR.mkdir(parents=True, exist_ok=True)
+
 class TokenLogoService:
-    def __init__(self, redis_url: str, logo_dir: Path = LOGO_DIR, ttl: int = 86400):
-        """
-        Initializes the TokenLogoService with Redis connection, logo directory, and TTL settings.
-        
-        :param redis_url: Redis URL for cache storage.
-        :param logo_dir: Directory to store logo files.
-        :param ttl: Cache expiration time (default: 86400 seconds).
-        """
-        self.redis_url = redis_url
-        self.logo_dir = logo_dir
-        self.redis = None
+    """
+    Fetches, resizes, caches, and serves token logos via Redis and disk.
+    """
+    def __init__(self, ttl: int = 86400, size: int = 128) -> None:
+        self.redis_url = config.REDIS_URL
         self.ttl = ttl
+        self.size = size
+        self.redis: Optional[redis_client.Redis] = None
+        self.http = httpx.AsyncClient(timeout=5)
 
-    async def connect(self):
-        """Connects to Redis."""
-        if not self.redis:
-            self.redis = await aioredis.from_url(self.redis_url, encoding="utf8", decode_responses=False)
-            logger.info("✅ TokenLogoService connected to Redis")
+    async def connect(self) -> None:
+        try:
+            self.redis = redis_client.from_url(self.redis_url, decode_responses=False)
+            await self.redis.ping()
+            logger.info("[TokenLogoService] Connected to Redis")
+        except Exception as e:
+            logger.error(f"[TokenLogoService] Redis connection failed: {e}")
+            self.redis = None
 
-    async def get_logo(self, mint: str, size: int = 128) -> bytes:
-        """
-        Retrieves the logo for the token. It first checks the Redis cache, then fetches from online sources if necessary.
-        
-        :param mint: The mint address of the token.
-        :param size: The desired logo size (default: 128).
-        :return: A byte string containing the logo image.
-        """
-        await self.connect()
+    async def get_logo(self, mint: str, size: Optional[int] = None) -> bytes:
+        size = size or self.size
         cache_key = f"token_logo:{mint}:{size}"
-        cached = await self.redis.get(cache_key)
-        if cached:
-            logger.info(f"✔️ Cache hit for logo: {mint}")
-            return cached
+        with LOGO_LATENCY.time():
+            # Check cache
+            if self.redis:
+                try:
+                    data = await self.redis.get(cache_key)
+                    if data:
+                        LOGO_CACHE_HITS.inc()
+                        return data
+                except Exception as e:
+                    logger.warning(f"[TokenLogoService] Redis get error: {e}")
+            LOGO_CACHE_MISSES.inc()
 
-        image_bytes = await self._fetch_logo_online(mint, size)
-        if not image_bytes:
-            logger.info(f"🔄 Fallback: Generating placeholder for logo: {mint}")
-            image_bytes = await self._get_or_generate_placeholder(mint, size)
+            # Try fetch online
+            img_bytes = await self._fetch_logo_online(mint, size)
+            if not img_bytes:
+                img_bytes = await self._generate_placeholder(mint, size)
 
-        await self.redis.set(cache_key, image_bytes, ex=self.ttl)
-        return image_bytes
+            # Cache in Redis
+            if self.redis:
+                try:
+                    await self.redis.set(cache_key, img_bytes, ex=self.ttl)
+                except Exception as e:
+                    logger.warning(f"[TokenLogoService] Redis set error: {e}")
 
-    async def _fetch_logo_online(self, mint: str, size: int) -> bytes:
-        """
-        Attempts to fetch the token logo from trusted online sources.
-        
-        :param mint: The mint address of the token.
-        :param size: The desired logo size.
-        :return: A byte string containing the resized logo, or None if not found.
-        """
-        for url_template in TRUSTED_LOGO_SOURCES:
-            url = url_template.format(mint=mint)
+            # Persist to disk
+            out_path = LOGO_DIR / f"{mint}_{size}.png"
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=4) as response:
-                        if response.status == 200:
-                            logger.info(f"✔️ Logo found at {url}")
-                            data = await response.read()
-                            resized = self._resize_logo(data, size)
-                            return resized
-                        else:
-                            logger.warning(f"⚠️ Logo not found at {url}")
+                with open(out_path, "wb") as f:
+                    f.write(img_bytes)
             except Exception as e:
-                logger.warning(f"⚠️ Logo fetch failed from {url}: {e}")
+                logger.warning(f"[TokenLogoService] Disk write failed: {e}")
+
+            return img_bytes
+
+    async def _fetch_logo_online(self, mint: str, size: int) -> Optional[bytes]:
+        for url_tpl in TRUSTED_LOGO_SOURCES:
+            url = url_tpl.format(mint=mint)
+            try:
+                resp = await self.http.get(url)
+                resp.raise_for_status()
+                return self._resize(resp.content, size)
+            except Exception as e:
+                logger.debug(f"[TokenLogoService] Fetch failed {url}: {e}")
+        LOGO_FETCH_ERRORS.inc()
         return None
 
-    def _resize_logo(self, img_bytes: bytes, size: int) -> bytes:
-        """
-        Resizes the logo to the specified size.
-
-        :param img_bytes: The raw image bytes.
-        :param size: The desired logo size.
-        :return: Resized logo as bytes.
-        """
-        with Image.open(BytesIO(img_bytes)) as img:
-            img = img.convert("RGBA")
+    def _resize(self, data: bytes, size: int) -> bytes:
+        try:
+            img = Image.open(BytesIO(data)).convert("RGBA")
             img = img.resize((size, size), Image.LANCZOS)
             buf = BytesIO()
             img.save(buf, format="PNG")
             return buf.getvalue()
+        except Exception as e:
+            LOGO_FETCH_ERRORS.inc()
+            logger.error(f"[TokenLogoService] Resize failed: {e}")
+            return data
 
-    async def _get_or_generate_placeholder(self, mint: str, size: int = 128) -> bytes:
-        """
-        Fetches the placeholder logo if no logo is found or if the fetch fails.
-        
-        :param mint: The mint address of the token (for placeholder text).
-        :param size: The desired logo size.
-        :return: The generated placeholder logo as bytes.
-        """
+    async def _generate_placeholder(self, mint: str, size: int) -> bytes:
+        # Attempt default asset
         try:
-            if Path(DEFAULT_LOGO_PATH).exists():
+            if DEFAULT_LOGO_PATH.exists():
                 with open(DEFAULT_LOGO_PATH, "rb") as f:
-                    return self._resize_logo(f.read(), size)
-        except Exception:
-            logger.warning("⚠️ Placeholder logo not found, generating synthetic.")
+                    return self._resize(f.read(), size)
+        except Exception as e:
+            logger.warning(f"[TokenLogoService] Default asset load failed: {e}")
 
-        # Generate fallback image dynamically
-        img = Image.new("RGB", (size, size), (50, 50, 50))
+        # Fallback dynamic placeholder
+        img = Image.new("RGBA", (size, size), (30, 30, 30, 255))
         draw = ImageDraw.Draw(img)
         font = ImageFont.load_default()
         text = mint[:4].upper()
-        draw.text((size//4, size//3), text, fill=(255, 255, 255), font=font)
+        w, h = draw.textsize(text, font=font)
+        draw.text(((size-w)/2, (size-h)/2), text, font=font, fill=(255,255,255,255))
         buf = BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
+
+    async def close(self) -> None:
+        await self.http.aclose()
+        if self.redis:
+            await self.redis.close()
