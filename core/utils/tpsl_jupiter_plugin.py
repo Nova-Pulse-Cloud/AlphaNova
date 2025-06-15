@@ -1,21 +1,22 @@
-# File: utils/tpsl_jupiter_plugin.py
+# core/utils/tpsl_jupiter_plugin.py
 
-import asyncio
 import logging
 from time import monotonic
-from typing import Dict, Any, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from prometheus_client import Counter, Histogram
 
-from utils.config import Config
+from core.utils.config import config
 from core.data_collection.market_conditions import MarketConditionsService
 from core.data_collection.whale_detector import get_recent_whale_activity
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 
-logger = logging.getLogger("utils.tpsl_jupiter_plugin")
+logger = logging.getLogger("nova.tpsl_jupiter_plugin")
 logger.setLevel(logging.INFO)
 
-# Prometheus metrics
+# ────────────────────────────────────────────────────────────────────────────────
+# Metrics
+# ────────────────────────────────────────────────────────────────────────────────
 PLUGIN_INVOCATIONS = Counter(
     "tpsl_plugin_invocations_total", "Total TPSL plugin invocations"
 )
@@ -30,15 +31,12 @@ class JupiterTPSLPlugin:
     """
     Jupiter TP/SL Plugin—fully dynamic.
 
-    Pulls live volatility, trend strength, whale pressure, and orderbook imbalance,
-    then combines with the alpha signal to compute a unique TP/SL for each trade.
+    Computes take-profit and stop-loss percentages based on live market data,
+    including volatility, trend strength, whale behavior, and orderbook imbalance.
     """
+    def __init__(self) -> None:
+        self.market_svc = MarketConditionsService(config)
 
-    def __init__(self, config: Optional[Config] = None):
-        self.config = config or Config()
-        # Services to fetch live data
-        self.market_svc = MarketConditionsService(self.config)
-    
     async def compute(
         self,
         symbol: str,
@@ -48,45 +46,39 @@ class JupiterTPSLPlugin:
         user: Optional[str] = None
     ) -> Tuple[float, float, Dict[str, Any]]:
         """
-        :param symbol:        token symbol (e.g. 'solana')
-        :param entry_price:   the price at which trade was signaled
-        :param alpha_signal:  dict with keys 'score', 'risk', 'flavor'
-        :param mode:          'live' or 'sim'
-        :returns:             (tp_pct, sl_pct, metadata)
+        :returns: (tp_pct, sl_pct, metadata)
         """
         PLUGIN_INVOCATIONS.inc()
         start = monotonic()
-
         try:
-            # --- Fetch live metrics ---
-            volatility    = await self.market_svc.get_volatility(symbol)
-            trend_strength= await self.market_svc.get_trend_strength(symbol)
-            whale_pressure= await get_recent_whale_activity(symbol)
-            spread, _     = await get_orderbook_imbalance(symbol)
+            # Fetch live metrics
+            volatility     = await self.market_svc.get_volatility(symbol)
+            trend_strength = await self.market_svc.get_trend_strength(symbol)
+            whale_pressure = await get_recent_whale_activity(symbol)
+            spread, _      = await get_orderbook_imbalance(symbol)
 
-            # --- Alpha inputs ---
-            score = float(alpha_signal.get("score", 0.5))
-            risk  = float(alpha_signal.get("risk", 0.5))
-            flavor= alpha_signal.get("flavor", "Moderate")
+            # Alpha inputs
+            score  = float(alpha_signal.get("score", 0.5))
+            risk   = float(alpha_signal.get("risk", 0.5))
+            flavor = alpha_signal.get("flavor", "Moderate")
 
-            # --- Dynamic formulas (example) ---
-            # Base percent multipliers evolve with live data instead of fixed defaults
+            # Dynamic calculations
             tp_factor = 1 + volatility * (1 + score + trend_strength - whale_pressure)
             sl_factor = 1 - volatility * (1 + risk + spread + whale_pressure)
 
             # Flavor adjustments
-            if flavor == "Safe":
+            if flavor.lower() == "safe":
                 tp_factor *= 1.2
                 sl_factor *= 0.8
-            elif flavor == "Degen":
+            elif flavor.lower() == "degen":
                 tp_factor *= 0.8
                 sl_factor *= 1.2
 
-            # Compute final percentages relative to entry
-            tp_pct = max(0, tp_factor - 1)
-            sl_pct = max(0, 1 - sl_factor)
+            # Final percentages
+            tp_pct = max(0.0, tp_factor - 1.0)
+            sl_pct = max(0.0, 1.0 - sl_factor)
 
-            metadata = {
+            metadata: Dict[str, Any] = {
                 "symbol": symbol,
                 "entry_price": entry_price,
                 "volatility": volatility,
@@ -99,16 +91,15 @@ class JupiterTPSLPlugin:
                 "mode": mode,
                 "user": user,
             }
-
             PLUGIN_LATENCY.labels(mode=mode).observe(monotonic() - start)
             return tp_pct, sl_pct, metadata
-
         except Exception as e:
             PLUGIN_ERRORS.inc()
-            logger.error(f"[TPSL Plugin][ERROR] {e} | symbol={symbol} | alpha={alpha_signal}")
+            logger.error(f"[TPSL Plugin] Error for {symbol}: {e}")
+            PLUGIN_LATENCY.labels(mode=mode).observe(monotonic() - start)
             raise
 
-# Backward-compatible alias
+# Alias for functional import
 async def jupiter_tp_sl_plugin(
     features: Dict[str, Any],
     alpha_signal: Dict[str, Any],
@@ -117,8 +108,8 @@ async def jupiter_tp_sl_plugin(
 ) -> Tuple[float, float, Dict[str, Any]]:
     plugin = JupiterTPSLPlugin()
     return await plugin.compute(
-        symbol=features["symbol"],
-        entry_price=features["entry_price"],
+        symbol=features.get("symbol"),
+        entry_price=features.get("entry_price"),
         alpha_signal=alpha_signal,
         mode=mode,
         user=user
