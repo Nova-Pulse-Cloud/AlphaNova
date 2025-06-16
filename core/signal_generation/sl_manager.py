@@ -1,4 +1,3 @@
-# core/signal_generation/sl_manager.py
 """
 Nova Pulse ALPHA — Elite SL Manager 4.0
 ────────────────────────────────────────────────────────────────
@@ -18,10 +17,10 @@ from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
 from core.signal_generation.ml_tp_sl import extract_features, predict_tp_sl, tpsl_rl_feedback
-from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
+from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.utils.config import config
-from utils.tpsl_jupiter_plugin import jupiter_tp_sl_plugin
-from utils.plugin_manager import fire_plugin_event
+from core.utils.tpsl_jupiter_plugin import jupiter_tp_sl_plugin
+from core.utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.sl_manager")
 logger.setLevel(logging.INFO)
@@ -60,7 +59,7 @@ def register_slm_plugin(name: str, fn: Any) -> None:
 register_slm_plugin("jupiter", jupiter_tp_sl_plugin)
 
 # adaptive instance
-_adaptive = AdaptiveTPSL()
+_adaptive = AdaptiveTPSL(config)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Main API
@@ -136,11 +135,14 @@ class SLManager:
                         predict_tp_sl(features, user=ctx.get("user_id")), timeout
                     )
                 elif method == "adaptive":
-                    tp, sl, meta = await asyncio.wait_for(
+                    tpsl_result = await asyncio.wait_for(
                         _adaptive.compute(
                             ctx.get("symbol"), ctx.get("entry_price"), ctx
                         ), timeout
                     )
+                    tp = tpsl_result["tp"]
+                    sl = tpsl_result["sl"]
+                    meta = tpsl_result
                 elif method in _slm_plugins:
                     tp, sl, meta = await asyncio.wait_for(
                         _slm_plugins[method](ctx), timeout
