@@ -1,4 +1,3 @@
-# core/utils/token_auditor.py
 """
 Nova Pulse ALPHA – Token Auditor (Risk/Trust Scoring Engine)
 ───────────────────────────────────────────────────────────
@@ -27,9 +26,10 @@ AUDIT_LATENCY = Histogram("token_audit_latency_seconds", "Token audit latency")
 # Data Model
 class TokenTrust(BaseModel):
     symbol: str
-    risk: float = Field(ge=0, le=1)
+    risk: float = Field(ge=0, le=1, description="0 is safe, 1 is max risk")
     blacklist: bool = False
     score_breakdown: Dict[str, Any] = {}
+    rug_score: float = 0.0
     timestamp: float = Field(default_factory=time.time)
 
 class TokenAuditor:
@@ -42,26 +42,31 @@ class TokenAuditor:
     def __init__(self):
         self._cache: Dict[str, TokenTrust] = {}
 
-    async def audit_token(self, symbol: str) -> TokenTrust:
+    async def audit(self, symbol: str) -> TokenTrust:
         AUDITS_RUN.inc()
-        key = symbol.upper()
-        if key in self._cache and time.time() - self._cache[key].timestamp < 3600:
+        if not symbol:
+            raise ValueError("[TokenAuditor] No symbol provided for audit.")
+        key = symbol.upper().strip()
+        now = time.time()
+        # Cache: 1hr
+        if key in self._cache and now - self._cache[key].timestamp < 3600:
             return self._cache[key]
         start = time.monotonic()
         try:
-            # --- Example: Replace these heuristics with on-chain API queries for prod ---
+            # TODO: Replace with real on-chain/ML logic
+            blacklist = key in ("SCAM", "RUG", "FRAUD")
             result = TokenTrust(
                 symbol=key,
-                risk=0.1 if key in ("SOL", "USDC", "WETH") else 0.65,  # basic default
-                blacklist=(key in ("SCAM", "RUG")),
+                risk=0.05 if key in ("SOL", "USDC", "WETH") else 0.65,
+                blacklist=blacklist,
+                rug_score=0.0 if not blacklist else 0.95,
                 score_breakdown={
-                    "liquidity": 0.95,
-                    "age": 0.90,
-                    "blacklist": key in ("SCAM", "RUG"),
-                    "manual_check": False,
+                    "liquidity": 0.95 if key in ("SOL", "USDC", "WETH") else 0.5,
+                    "age": 0.95 if key in ("SOL", "USDC", "WETH") else 0.4,
+                    "blacklist": float(blacklist),
+                    "manual_check": 0.0,
                 },
             )
-            # --- TODO: Replace with on-chain risk analysis for live tokens ---
         except Exception as e:
             AUDIT_ERRORS.inc()
             logger.error(f"[TokenAuditor] Error auditing {symbol}: {e}")
