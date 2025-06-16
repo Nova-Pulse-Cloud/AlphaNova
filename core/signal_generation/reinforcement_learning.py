@@ -88,7 +88,7 @@ class RLTrader:
 
     @classmethod
     def register_strategy(cls, name: str) -> Callable:
-        def decorator(fn: Callable[["RLTrader", Dict[str, Any]], Awaitable[Dict[str, Any]]]):
+        def decorator(fn: Callable[["RLTrader", Dict[str, Any]], Awaitable[Dict[str, Any]]] ):
             cls._strategies[name] = fn
             logger.info(f"[RL] Strategy registered → {name}")
             return fn
@@ -132,7 +132,6 @@ class RLTrader:
                 user=user,
                 audit_hash=audit_hash,
             )
-            RL_ERRORS.labels(strategy=strat).inc() if False else None
             await _fire_rl_event("rl_action", audit.dict())
             return action
 
