@@ -51,6 +51,13 @@ class Config:
         self.MACRO_API_KEY         = self._require("MACRO_API_KEY")
         self.ETHERSCAN_API_KEY     = self._require("ETHERSCAN_API_KEY")
 
+        # Optional Jaeger tracing config (with defaults)
+        self.JAEGER_HOST = os.getenv("JAEGER_HOST", "localhost")
+        try:
+            self.JAEGER_PORT = int(os.getenv("JAEGER_PORT", "6831"))
+        except ValueError:
+            raise ValueError(f"[Config] Environment variable 'JAEGER_PORT' must be an integer.")
+
     def _require(self, key: str) -> str:
         """Fetch an env var or raise if missing."""
         val = os.getenv(key)
