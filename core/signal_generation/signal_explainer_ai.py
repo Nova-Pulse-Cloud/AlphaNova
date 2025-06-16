@@ -1,4 +1,3 @@
-# core/signal_generation/signal_explainer_ai.py
 """
 Nova Pulse ALPHA – SignalExplainerAI 4.1 (Elite, fully-wired)
 ────────────────────────────────────────────────────────────────────
@@ -139,15 +138,25 @@ class SignalExplainerAI:
                 # Run orderbook in parallel, then compute TP/SL with that result
                 ob_task = asyncio.create_task(self.orderbook.analyze(signal.get("symbol")))
                 ob_data = await ob_task
+                # The key line: adaptive TP/SL for this exact signal context
                 tp_sl_data = await asyncio.wait_for(
                     self.tp_sl.compute(signal.get("symbol"), expl.get("price", 0.0), {**signal, **ob_data}),
                     timeout=20
                 )
 
+                # Calculate RR
+                tp = float(tp_sl_data.get("tp", expl.get("price", 0.0) * 1.02))
+                sl = float(tp_sl_data.get("sl", expl.get("price", 0.0) * 0.98))
+                entry = float(signal.get("price", expl.get("price", 0.0)))
+                rr_ratio = abs((tp - entry) / max(1e-8, abs(entry - sl))) if sl != entry else 1.0
+
                 full = {
                     **expl,
                     **ob_data,
-                    **tp_sl_data,
+                    "tp": tp,
+                    "sl": sl,
+                    "rr_ratio": rr_ratio,
+                    "size": float(signal.get("size", 0.0)),
                     "timestamp": int(time.time()),
                 }
                 full["audit_hash"] = _compute_hash(signal, full)
@@ -158,22 +167,19 @@ class SignalExplainerAI:
             FAILED_EXPLAIN_DLQ.append({"signal": signal, "error": str(e), "trace_id": trace_id})
             logger.error(f"[SignalExplainerAI] explain error: {e}")
             # fallback minimal explanation
+            entry = float(signal.get("price", 0.0)) or 1.0
             fallback = {
                 "narrative": "Explanation failed",
                 "confidence": 0.0,
                 "alert": False,
-                "price": signal.get("entry_price", 0.0),
-            }
-            full = {
-                **fallback,
-                "tp": fallback["price"] * 1.02,
-                "sl": fallback["price"] * 0.98,
+                "tp": entry * 1.02,
+                "sl": entry * 0.98,
                 "rr_ratio": 1.0,
                 "size": 0.0,
                 "timestamp": int(time.time()),
                 "audit_hash": _compute_hash(signal, {"error": str(e)})
             }
-            result = ExplanationResult.parse_obj(full)
+            result = ExplanationResult.parse_obj(fallback)
 
         # 3️⃣ Cache & return
         if self.redis:
@@ -191,6 +197,7 @@ class SignalExplainerAI:
         # Simple narrative synthesis
         trend     = signal.get("trend", 0.0)
         sentiment = signal.get("sentiment", 0.0)
+        price     = signal.get("price", 0.0)
         narrative = f"Trend: {trend:.2f}, Sentiment: {sentiment:.2f}"
         alert     = abs(trend) > 0.8 or sentiment > 0.7
         confidence = min(1.0, max(0.0, abs(trend)*0.5 + sentiment*0.5))
@@ -198,7 +205,7 @@ class SignalExplainerAI:
             "narrative": narrative,
             "confidence": confidence,
             "alert": alert,
-            "price": signal.get("price", 0.0)
+            "price": price
         }
 
     async def replay_dlq(self) -> None:
