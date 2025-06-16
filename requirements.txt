@@ -6,7 +6,7 @@ apscheduler==3.10.1
 aiogram==3.0.0b7
 aiohttp==3.8.4
 aiofiles==23.1.0
-magic-filter==1.0.0
+magic-filter==1.0.9            # <-- FIXED!
 httpx==0.24.1
 redis==4.5.5
 aiocache==0.11.1
@@ -41,6 +41,5 @@ deprecated==1.2.13
 tenacity==8.2.2
 python-multipart==0.0.6
 asgiref==3.6.0
-pydantic>=1.10.7
-pydantic-settings==2.2.1
-
+pydantic==2.6.4               # <-- Pin to compatible 2.x version
+pydantic-settings==2.2.1      # <-- Must be used with pydantic 2.x
