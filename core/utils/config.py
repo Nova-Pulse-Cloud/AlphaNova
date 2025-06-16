@@ -5,6 +5,9 @@ import json
 import re
 from typing import Any, Dict
 
+# 1. Add DEXSCREENER_URL as a module-level constant for easy import
+DEXSCREENER_URL = os.environ.get("DEXSCREENER_URL", "https://api.dexscreener.com/latest/dex/tokens/")
+
 class Config:
     """
     Singleton configuration loader with strict validation.
@@ -14,7 +17,6 @@ class Config:
     _instance: "Config" = None
     _initialized: bool = False
 
-    # Regex for base58‐encoded Solana addresses (32–44 chars, no 0/O/I/l)
     _BASE58_REGEX = re.compile(r'^[A-HJ-NP-Za-km-z1-9]{32,44}$')
 
     def __new__(cls) -> "Config":
@@ -59,22 +61,19 @@ class Config:
             raise ValueError(f"[Config] Environment variable 'JAEGER_PORT' must be an integer.")
 
     def _require(self, key: str) -> str:
-        """Fetch an env var or raise if missing."""
         val = os.getenv(key)
         if not val:
             raise EnvironmentError(f"[Config] Missing required environment variable: '{key}'")
         return val
 
     def _require_int(self, key: str) -> int:
-        """Fetch an env var and cast to int, raising on error."""
         val = self._require(key)
         try:
             return int(val)
         except ValueError:
             raise ValueError(f"[Config] Environment variable '{key}' must be an integer, got '{val}'")
 
-    def _load_json_secret(self, path: str) -> Dict[str, Any]:
-        """Read a JSON file (e.g. Solana keypair), with precise error messages."""
+    def _load_json_secret(self, path: str) -> Any:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"[Config] Secret file not found: '{path}'")
         try:
@@ -86,14 +85,12 @@ class Config:
             raise RuntimeError(f"[Config] Failed to load secret from '{path}': {e}")
 
     def _validate_url(self, url: str, key: str) -> None:
-        """Basic URL format check."""
         if not url.startswith(("https://", "http://")):
             raise ValueError(f"[Config] Invalid URL in '{key}': '{url}'")
 
     def _validate_base58(self, addr: str, key: str) -> None:
-        """Ensure Solana addresses are valid base58 strings."""
         if not self._BASE58_REGEX.match(addr):
             raise ValueError(f"[Config] Invalid base58 address in '{key}': '{addr}'")
 
-# Global singleton instance
+# 2. Global singleton instance
 config = Config()
