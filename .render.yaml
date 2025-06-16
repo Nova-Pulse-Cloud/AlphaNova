@@ -3,7 +3,7 @@ services:
     name: nova-alpha-launch
     env: python
     python_version: 3.10.12
-    build_command: pip install --upgrade pip setuptools wheel && pip install --no-cache-dir -r requirements.txt
+    build_command: pip install --no-cache-dir -r requirements.txt
     start_command: python -m uvicorn main_service:app --host 0.0.0.0 --port ${PORT:-8000}
     env_vars:
       - key: TELEGRAM_BOT_TOKEN
