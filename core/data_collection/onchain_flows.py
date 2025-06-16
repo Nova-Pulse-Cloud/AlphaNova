@@ -15,9 +15,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from prometheus_client import Counter, Histogram
-from solders.pubkey import Pubkey  # type: ignore
-from solana.rpc.async_api import AsyncClient
-from solana.transaction import Transaction  # noqa: F401 – future use
+from solders.pubkey import Pubkey  # correct, no change needed
+from solana.rpc.async_api import AsyncClient  # correct, no change needed
+from solders.transaction import Transaction  # <--- PATCH: use solders, not solana
 
 from utils.config import Config
 from utils.plugin_manager import fire_plugin_event
