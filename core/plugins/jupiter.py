@@ -1,4 +1,3 @@
-# core/plugins/jupiter.py
 import logging
 from core.wallet_management.wallet_manager import WalletManager
 from core.execution.tx_builder import build_compressed_swap
@@ -7,7 +6,7 @@ from core.utils.trade_logger import log_trade
 
 logger = logging.getLogger("plugin.jupiter")
 
-async def router(signal, rpc_url):
+async def router(signal, rpc_url=None):
     """
     Execute a swap directly via Jupiter route.
     """
@@ -27,10 +26,15 @@ async def router(signal, rpc_url):
             amount=amount,
             slippage_bps=slippage_bps,
             symbol=symbol,
+            rpc_url=rpc_url or config.HELIUS_RPC
         )
         logger.info(f"[Jupiter] TX success for {symbol}: {tx_meta['hash']}")
-        await log_trade(symbol, signal.get("side"), amount, tx_meta.get("route", {}).get("inAmount"),
-                        tx_meta.get("route", {}).get("outAmount"), 0, "jupiter plugin", signal.get("user_id"))
+        await log_trade(
+            symbol, signal.get("side"), amount,
+            tx_meta.get("route", {}).get("inAmount"),
+            tx_meta.get("route", {}).get("outAmount"),
+            0, "jupiter plugin", signal.get("user_id")
+        )
         return {
             "success": True,
             "tx_meta": tx_meta,
