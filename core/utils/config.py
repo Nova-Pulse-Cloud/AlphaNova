@@ -1,5 +1,3 @@
-# core/utils/config.py
-
 import os
 import json
 import re
@@ -59,6 +57,9 @@ class Config:
             self.JAEGER_PORT = int(os.getenv("JAEGER_PORT", "6831"))
         except ValueError:
             raise ValueError(f"[Config] Environment variable 'JAEGER_PORT' must be an integer.")
+
+        # [PATCH] Trade memory DB path (optional, with default)
+        self.TRADE_MEMORY_DB_PATH = os.getenv("TRADE_MEMORY_DB_PATH", "trade_memory.db")
 
     def _require(self, key: str) -> str:
         val = os.getenv(key)
