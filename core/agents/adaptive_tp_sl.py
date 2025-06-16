@@ -7,8 +7,8 @@ from typing import Dict, Any, Optional
 
 from prometheus_client import Gauge, Counter
 
-from utils.config import Config
-from utils.trade_memory import TradeMemory
+from core.utils.config import Config
+from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_learning import RLTrader
 
 logger = logging.getLogger("nova.adaptive_tp_sl")
