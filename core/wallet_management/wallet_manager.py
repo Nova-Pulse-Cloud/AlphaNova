@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import json
 from typing import Any, Dict, Tuple, Optional, List
 
 import httpx
@@ -34,8 +35,17 @@ WALLET_TX_CONFIRM_FAILS= Counter("wallet_tx_confirm_failures","Failed confirmati
 # Keypair loader
 # ────────────────────────────────────────────────────────────────────────────────
 def _load_keypair() -> Keypair:
-    secret_list = config.SOL_PRIVATE_KEY  # loaded from mounted JSON (list of ints)
-    secret_bytes = bytes(secret_list)     # convert list[int] to bytes
+    """
+    Loads a Solana Keypair from a 64-byte secret (list of ints) loaded from config or file.
+    """
+    # Patch: Accepts either direct list or file path (auto-detect)
+    secret = config.SOL_PRIVATE_KEY
+    if isinstance(secret, str):  # File path
+        with open(secret, "r") as f:
+            secret_list = json.load(f)
+    else:  # Already loaded as list
+        secret_list = secret
+    secret_bytes = bytes(secret_list)
     return Keypair.from_secret_key(secret_bytes)
 
 class WalletEntry:
@@ -43,7 +53,7 @@ class WalletEntry:
         self.chain = chain
         self.keypair = keypair
         self.label = label or f"{chain}-wallet"
-        self.pubkey = keypair.public_key
+        self.pubkey = keypair.pubkey()  # PATCH: .pubkey() for solders
 
     def summary(self) -> Dict[str,str]:
         return {"chain": self.chain, "pubkey": str(self.pubkey), "label": self.label}
@@ -62,7 +72,7 @@ class WalletManager:
     def _init_wallet(self) -> None:
         kp = _load_keypair()
         self.wallets["solana"] = WalletEntry("solana", kp, label="primary")
-        logger.info("[WalletManager] Solana wallet initialized: %s", kp.public_key)
+        logger.info("[WalletManager] Solana wallet initialized: %s", kp.pubkey())  # PATCHED
 
     def get_wallet(self, chain: str="solana") -> WalletEntry:
         if chain not in self.wallets:
