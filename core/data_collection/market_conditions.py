@@ -1,14 +1,3 @@
-"""
-Nova Pulse – Market Conditions Service
-======================================
-Live price + realised volatility feed for Solana tokens.
-* **Zero placeholders** – calls the public Jupiter v4 Price API.
-* Rolling in-memory + optional Redis (``REDIS_URL``) history buffer.
-* 24-h realised volatility (annualised, %) computed from log-returns.
-* Prometheus-instrumented + provenance hash for supply-chain audit.
-* Logger namespace: ``nova.market_conditions``.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -26,13 +15,7 @@ import numpy as np
 from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, Histogram
 
-from core.utils.config import (
-    Config,
-    DEXSCREENER_URL,
-    PRICE_CHANGE_THRESHOLD,
-    SESSION_HEADERS,
-    VOLUME_THRESHOLD,
-)
+from core.utils.config import config, DEXSCREENER_URL
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from core.plugin_manager import fire_plugin_event
 
@@ -78,6 +61,11 @@ JUP_ENDPOINT_TMPL: str = os.getenv(
 )
 REDIS_URL: Optional[str] = os.getenv("REDIS_URL")
 
+# Set sensible defaults if not present in config
+PRICE_CHANGE_THRESHOLD = getattr(config, "PRICE_CHANGE_THRESHOLD", 0.02)
+VOLUME_THRESHOLD = getattr(config, "VOLUME_THRESHOLD", 5000)
+SESSION_HEADERS = getattr(config, "SESSION_HEADERS", {})
+
 # ────────────────────────────────────────────────────────────────────────────
 # Data Models
 # ────────────────────────────────────────────────────────────────────────────
@@ -107,7 +95,7 @@ class MarketConditionsService:
     """Pulls live prices, volatility, macro-events & order-book stats."""
     def __init__(
         self,
-        cfg: Config,
+        cfg,
         *,
         cache_ttl: int = 60,
         price_history_len: int = 1_440,
@@ -301,7 +289,7 @@ class MarketConditionsService:
 # ────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     async def _demo():
-        cfg = Config()  # assumes env vars set
+        cfg = config  # use global singleton
         svc = MarketConditionsService(cfg)
         await svc.ensure_background_poll(["So11111111111111111111111111111111111111112"])
         mc = await svc.full_conditions("So11111111111111111111111111111111111111112")
