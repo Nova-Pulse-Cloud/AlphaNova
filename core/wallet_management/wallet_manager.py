@@ -9,7 +9,7 @@ from typing import Any, Dict, Tuple, Optional, List
 
 import httpx
 from prometheus_client import Counter, Histogram
-from solana.keypair import Keypair
+from solders.keypair import Keypair
 from solana.rpc.async_api import AsyncClient
 from solana.transaction import Transaction
 from solders.signature import Signature  # type: ignore
