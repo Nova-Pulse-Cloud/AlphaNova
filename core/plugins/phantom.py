@@ -1,4 +1,3 @@
-# core/plugins/phantom.py
 import logging
 from core.wallet_management.wallet_manager import WalletManager
 from core.execution.tx_builder import build_compressed_swap
@@ -7,7 +6,7 @@ from core.utils.trade_logger import log_trade
 
 logger = logging.getLogger("plugin.phantom")
 
-async def router(signal, rpc_url):
+async def router(signal, rpc_url=None):
     """
     Execute a swap using Phantom wallet with Jupiter as backend.
     """
@@ -29,7 +28,6 @@ async def router(signal, rpc_url):
             symbol=symbol,
         )
         # If you have actual send transaction logic, do it here using rpc_url
-
         logger.info(f"[Phantom] TX success for {symbol}: {tx_meta['hash']}")
         await log_trade(symbol, signal.get("side"), amount, tx_meta.get("route", {}).get("inAmount"),
                         tx_meta.get("route", {}).get("outAmount"), 0, "phantom plugin", signal.get("user_id"))
