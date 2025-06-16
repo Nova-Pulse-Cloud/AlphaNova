@@ -181,3 +181,14 @@ class ExecutionRouter:
 
 # alias for hooks
 register_execution_router_hook = fire_plugin_event
+
+# Before calling plugin, check if TP/SL are already set (from upstream signal generator)
+if "tp" not in signal or "sl" not in signal:
+    tp, sl, sl_meta = await self.tp_sl_plugin.compute(
+        symbol=signal["symbol"],
+        entry_price=signal.get("entry_price", 0),
+        alpha_signal=signal,
+        mode=signal.get("mode","live"),
+        user=user_id,
+    )
+    signal.update({"tp": tp, "sl": sl})
