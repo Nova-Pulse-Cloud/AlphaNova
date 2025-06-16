@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import csv
 import hashlib
 import io
@@ -45,8 +43,8 @@ class TradeMemory:
     Thread-safe in-memory cache plus persistent SQLite ledger for
     real trades with win-rate and PnL analytics, fully instrumented.
     """
-
     def __init__(self, db_path: Optional[str] = None) -> None:
+        # Ensure db_path is always a Path object
         self._db_path = Path(db_path or getattr(config, "TRADE_MEMORY_DB_PATH", "trade_memory.db"))
         self._lock = threading.RLock()
         self._history: List[Dict[str, Any]] = []
@@ -64,11 +62,11 @@ class TradeMemory:
             rec = {
                 "id": row[0],
                 "symbol": row[1],
-                "entry": row[2],
-                "exit": row[3],
-                "size": row[4],
-                "pnl": row[5],
-                "timestamp": row[6],
+                "entry": float(row[2]),
+                "exit": float(row[3]),
+                "size": float(row[4]),
+                "pnl": float(row[5]),
+                "timestamp": int(row[6]),
             }
             self._ingest_record(rec, persist=False)
         logger.info(
@@ -87,17 +85,17 @@ class TradeMemory:
     def add_trade(self, symbol: str, entry: float, size: float, exit: Optional[float] = None) -> None:
         """
         Record a new trade and update metrics.
-        :param symbol: Trading symbol
-        :param entry: Entry price
-        :param size: Trade size in SOL
-        :param exit: Exit price (None if still open)
+        :param symbol: Trading symbol (str)
+        :param entry: Entry price (float)
+        :param size: Trade size in SOL (float)
+        :param exit: Exit price (float, None if still open)
         """
         rec: Dict[str, Any] = {
             "symbol": symbol,
-            "entry": entry,
-            "exit": exit or 0.0,
-            "size": size,
-            "pnl": ((exit - entry) * size) if exit is not None else 0.0,
+            "entry": float(entry),
+            "exit": float(exit) if exit is not None else 0.0,
+            "size": float(size),
+            "pnl": (float(exit) - float(entry)) * float(size) if exit is not None else 0.0,
             "timestamp": int(time.time()),
         }
         rec["id"] = rec.get("id") or self._hash_trade(rec)
@@ -129,6 +127,10 @@ class TradeMemory:
     def latest_trade(self, symbol: str) -> Dict[str, Any]:
         trades = self.get_symbol_history(symbol)
         return trades[-1] if trades else {}
+
+    # Alias for consistency with other modules
+    def get_latest_trade(self, symbol: str) -> Dict[str, Any]:
+        return self.latest_trade(symbol)
 
     def export_csv(self) -> str:
         headers = ["id", "symbol", "entry", "exit", "size", "pnl", "timestamp"]
