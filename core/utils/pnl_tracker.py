@@ -6,11 +6,12 @@ import logging
 import io
 import matplotlib.pyplot as plt
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any  # <-- Added Any
 
 from prometheus_client import Counter, Histogram
 
 from core.utils.config import config
+
 
 logger = logging.getLogger("nova.pnl_tracker")
 logger.setLevel(logging.INFO)
