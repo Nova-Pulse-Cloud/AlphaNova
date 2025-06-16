@@ -26,7 +26,7 @@ import numpy as np
 from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, Histogram
 
-from utils.config import (
+from core.utils.config import (
     Config,
     DEXSCREENER_URL,
     PRICE_CHANGE_THRESHOLD,
