@@ -1,5 +1,3 @@
-# core/signal_generation/combined_signal_engine.py
-
 import asyncio
 import hashlib
 import json
@@ -64,6 +62,8 @@ class AlphaSignal(BaseModel):
     score: float
     risk: float
     entry: float
+    tp: float
+    sl: float
     flavor: str
     trigger_sources: Dict[str, float]
     meta_features: Dict[str, Any]
@@ -138,26 +138,30 @@ class CombinedSignalEngine:
             flavor= self._choose_flavor(score, user_context)
 
             # 4) Caption with OpenAI (timeout guard)
-            caption = await self._gen_caption(symbol, scores)  
+            caption = await self._gen_caption(symbol, scores)
 
-            # 5) Adaptive TP/SL
-            tp_sl = await self.adaptive_tp_sl.compute(symbol, entry, {**{
+            # 5) Adaptive TP/SL: **always present!**
+            tp_sl = await self.adaptive_tp_sl.compute(symbol, entry, {
                 "score":score,
                 **ob_data,
                 **whale_data,
                 **flow_data
-            }})
+            })
+            tp = float(tp_sl["tp"])
+            sl = float(tp_sl["sl"])
 
-            # 6) Build signal
-            prov = f"{symbol}{scores}{flavor}{score}{risk}{entry}"
+            # 6) Build elite signal object with TP/SL
+            prov = f"{symbol}{scores}{flavor}{score}{risk}{entry}{tp}{sl}"
             sig = AlphaSignal(
                 symbol=symbol,
                 score=score,
                 risk=risk,
                 entry=entry,
+                tp=tp,
+                sl=sl,
                 flavor=flavor,
                 trigger_sources=scores,
-                meta_features={"depth_adj":depth_adj, **whale_data},
+                meta_features={"depth_adj":depth_adj, **whale_data, **tp_sl},
                 caption=caption,
                 provenance_hash=hashlib.sha256(prov.encode()).hexdigest(),
                 timestamp=int(start.timestamp()),
@@ -194,12 +198,12 @@ class CombinedSignalEngine:
             action = max(q_values, key=q_values.get)
             SIG_ACTION.labels(action=str(action)).set(q_values[action])
 
-            # Compose final package
+            # Compose final package—**always TP/SL**
             sig = await self.evaluate_alpha(symbol, [{"source":"rl_agent","score":q_values[action],"entry":overlays.get("volatility",0)}])
             result = sig.dict()
 
             # Auto-trade if enabled
-            if user and await (await get_redis()).get(f"auto:{user}"):  
+            if user and await (await get_redis()).get(f"auto:{user}"):
                 from core.execution.execution_router import ExecutionRouter
                 router = ExecutionRouter(...)
                 asyncio.create_task(router.execute_trade(result, user))
@@ -219,7 +223,7 @@ class CombinedSignalEngine:
         return "Moderate"
 
     async def _gen_caption(self, symbol: str, scores: Dict[str, float]) -> str:
-        prompt = f"Caption for {symbol} with scores {scores}"  
+        prompt = f"Caption for {symbol} with scores {scores}"
         try:
             resp = await asyncio.wait_for(
                 openai.ChatCompletion.acreate(
