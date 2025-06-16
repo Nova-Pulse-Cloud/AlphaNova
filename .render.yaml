@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: nova-pulse-alpha
+    env: python
+    python_version: 3.10.12
+    build_command: pip install --no-cache-dir -r requirements.txt
+    start_command: python -m uvicorn main_service:app --host 0.0.0.0 --port ${PORT:-8000}
+    env_vars:
+      - key: TELEGRAM_BOT_TOKEN
+        from_secret: TELEGRAM_BOT_TOKEN
+      - key: TELEGRAM_CHAT_ID
+        from_secret: TELEGRAM_CHAT_ID
+      - key: SOL_PRIVATE_KEY
+        from_secret: SOL_PRIVATE_KEY
+      - key: SOL_ADDRESS
+        from_secret: SOL_ADDRESS
+      - key: REDIS_URL
+        from_secret: REDIS_URL
+      - key: HELIUS_RPC
+        from_secret: HELIUS_RPC
+      - key: HELIUS_API_KEY
+        from_secret: HELIUS_API_KEY
+      - key: CMC_API_KEY
+        from_secret: CMC_API_KEY
+      - key: OPENAI_API_KEY
+        from_secret: OPENAI_API_KEY
+      - key: WEBHOOK_URL
+        from_secret: WEBHOOK_URL
+      - key: TWITTER_BEARER_TOKEN
+        from_secret: TWITTER_BEARER_TOKEN
+      - key: METRICS_PORT
+        value: "8001"
+      - key: JAEGER_HOST
+        value: "localhost"
+      - key: JAEGER_PORT
+        value: "6831"
