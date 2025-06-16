@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 
 from prometheus_client import Gauge, Counter
 
-from core.utils.config import Config
+from core.utils.config import config  # FIXED: import singleton, not class!
 from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_learning import RLTrader
 
@@ -27,7 +27,7 @@ class AdaptiveTPSL:
     Pulls live context, memory, and RL adjustments for maximal edge.
     """
 
-    # Class‐level constants (configurable via code changes)
+    # Class-level constants (configurable via code changes)
     BASE_TP_ADJ       = 1.8
     BASE_SL_ADJ       = 0.9
     TP_LOWER_MULT     = 1.01
@@ -46,12 +46,10 @@ class AdaptiveTPSL:
 
     def __init__(
         self,
-        config: Config,
         memory: Optional[TradeMemory] = None,
         rl_agent: Optional[RLTrader] = None,
         overlays: Optional[Dict[str, Any]] = None
     ):
-        self.config    = config
         self.memory    = memory
         self.rl_agent  = rl_agent
         self.overlays  = overlays or {}
