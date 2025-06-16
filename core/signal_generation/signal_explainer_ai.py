@@ -15,7 +15,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import openai
 import redis.asyncio as redis_client
@@ -42,7 +42,7 @@ EXPLAIN_ALERTS   = Counter("explain_alerts_total",      "Explanations that trigg
 # ────────────────────────────────────────────────────────────────────────────────
 # DLQ
 # ────────────────────────────────────────────────────────────────────────────────
-FAILED_EXPLAIN_DLQ: list[Dict[str, Any]] = []
+FAILED_EXPLAIN_DLQ: List[Dict[str, Any]] = []
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Pydantic model for explanation output
@@ -136,18 +136,13 @@ class SignalExplainerAI:
                 else:
                     expl = await self._default_explain(signal, simulation)
 
-                # Parallel: OrderBookOverlay + AdaptiveTPSL
+                # Run orderbook in parallel, then compute TP/SL with that result
                 ob_task = asyncio.create_task(self.orderbook.analyze(signal.get("symbol")))
-                tp_sl_task = asyncio.create_task(
-                    self.tp_sl.compute(
-                        signal.get("symbol"),
-                        expl.get("price", 0.0),
-                        {**signal, **(await ob_task)}
-                    )
-                )
-
                 ob_data = await ob_task
-                tp_sl_data = await asyncio.wait_for(tp_sl_task, timeout=20)
+                tp_sl_data = await asyncio.wait_for(
+                    self.tp_sl.compute(signal.get("symbol"), expl.get("price", 0.0), {**signal, **ob_data}),
+                    timeout=20
+                )
 
                 full = {
                     **expl,
@@ -215,7 +210,7 @@ class SignalExplainerAI:
             except Exception:
                 continue
 
-    def get_dlq(self) -> list[Dict[str, Any]]:
+    def get_dlq(self) -> List[Dict[str, Any]]:
         return list(FAILED_EXPLAIN_DLQ)
 
 # Singleton instance
