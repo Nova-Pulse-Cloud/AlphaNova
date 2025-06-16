@@ -12,7 +12,7 @@ import httpx
 from prometheus_client import Counter, Histogram
 from solders.keypair import Keypair
 from solana.rpc.async_api import AsyncClient
-from solana.transaction import Transaction
+from solders.transaction import Transaction
 from solders.signature import Signature  # type: ignore
 
 from core.utils.config import config
