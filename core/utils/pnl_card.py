@@ -1,5 +1,3 @@
-# core/utils/pnl_card.py
-
 import io
 import logging
 import asyncio
@@ -30,7 +28,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 LOGO_PATH = BASE_DIR / "assets" / "mascot" / "Nova1.png"
 FONT_PATH = BASE_DIR / "assets" / "fonts" / "DejaVuSans-Bold.ttf"  # include a font file in repo
 
-# Card dimensions\ nWIDTH, HEIGHT = 900, 440
+# Card dimensions
+WIDTH, HEIGHT = 900, 440
 
 # Load fonts
 
@@ -53,7 +52,7 @@ except Exception as e:
     _BG = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 255))
 
 # Trade memory for snapshot cards
-_trade_memory = TradeMemory(config)
+_trade_memory = TradeMemory(getattr(config, "TRADE_MEMORY_DB_PATH", None))
 
 async def generate_pnl_card(
     symbol: Optional[str] = None,
