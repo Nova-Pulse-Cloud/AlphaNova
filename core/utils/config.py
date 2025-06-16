@@ -3,8 +3,9 @@ import json
 import re
 from typing import Any, Dict
 
-# 1. Add DEXSCREENER_URL as a module-level constant for easy import
+# Module-level constants
 DEXSCREENER_URL = os.environ.get("DEXSCREENER_URL", "https://api.dexscreener.com/latest/dex/tokens/")
+PRICE_CHANGE_THRESHOLD = float(os.environ.get("PRICE_CHANGE_THRESHOLD", "0.02"))  # Legacy fallback only
 
 class Config:
     """
@@ -58,7 +59,7 @@ class Config:
         except ValueError:
             raise ValueError(f"[Config] Environment variable 'JAEGER_PORT' must be an integer.")
 
-        # [PATCH] Trade memory DB path (optional, with default)
+        # Trade memory DB path (optional, with default)
         self.TRADE_MEMORY_DB_PATH = os.getenv("TRADE_MEMORY_DB_PATH", "trade_memory.db")
 
     def _require(self, key: str) -> str:
@@ -93,5 +94,5 @@ class Config:
         if not self._BASE58_REGEX.match(addr):
             raise ValueError(f"[Config] Invalid base58 address in '{key}': '{addr}'")
 
-# 2. Global singleton instance
+# Global singleton instance
 config = Config()
