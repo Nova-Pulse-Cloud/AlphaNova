@@ -1,4 +1,3 @@
-# core/signal_generation/sl_watchdog.py
 """
 Nova Pulse ALPHA – SL/TP Watchdog 2.0 (Nuclear Version)
 ────────────────────────────────────────
@@ -45,6 +44,7 @@ class OpenTrade(BaseModel):
     tp: float = Field(..., ge=0)
     sl: float = Field(..., ge=0)
     user: str
+    size: float = Field(..., ge=0)
     status: str = "open"  # pending/closed tracking
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -62,12 +62,10 @@ class SLWatchdog:
         self.trade_memory = trade_memory
         self.execution_router = execution_router
         self.pricing = PricingUtils()
-        # Support both env var or config singleton
         self.poll_interval = poll_interval or int(getattr(config, "SL_WATCHDOG_INTERVAL", 5))
         self._running = False
 
     async def start(self) -> None:
-        """Kick off the SL/TP watchdog loop."""
         await self.pricing.connect()
         self._running = True
         logger.info("🛡️ SL/TP Watchdog started, polling every %s seconds", self.poll_interval)
@@ -76,7 +74,6 @@ class SLWatchdog:
             await asyncio.sleep(self.poll_interval)
 
     async def stop(self) -> None:
-        """Stop the watchdog loop gracefully."""
         self._running = False
         await self.pricing.disconnect()
         logger.info("🔕 SL/TP Watchdog stopped")
@@ -108,32 +105,36 @@ class SLWatchdog:
             logger.error(f"[SLWatchdog] Price fetch error for {trade.symbol}: {e}")
             return
 
-        # Log price every time for audit
-        logger.info(f"[SLWatchdog][AUDIT] {trade.symbol} side={trade.side} entry={trade.entry} TP={trade.tp} SL={trade.sl} cur={current} user={trade.user}")
+        logger.info(
+            f"[SLWatchdog][AUDIT] {trade.symbol} side={trade.side} entry={trade.entry} TP={trade.tp} SL={trade.sl} cur={current} user={trade.user} size={trade.size}"
+        )
 
         hit_tp = (trade.side == "buy" and current >= trade.tp) or (trade.side == "sell" and current <= trade.tp)
         hit_sl = (trade.side == "buy" and current <= trade.sl) or (trade.side == "sell" and current >= trade.sl)
 
-        if trade.status == "closed":
-            logger.debug(f"[SLWatchdog] {trade.symbol} already closed (id={trade.id})")
-            return
-        if trade.status == "pending":
-            logger.debug(f"[SLWatchdog] {trade.symbol} already pending close (id={trade.id})")
+        if trade.status in ("closed", "pending"):
+            logger.debug(f"[SLWatchdog] {trade.symbol} already {trade.status} (id={trade.id})")
             return
 
         if hit_tp or hit_sl:
             reason = "tp" if hit_tp else "sl"
             logger.info(f"[SLWatchdog] {reason.upper()} hit for {trade.symbol} at {current}")
             SL_WATCHDOG_HITS.inc()
+
             # Mark trade as pending close in memory
             await self.trade_memory.mark_trade_pending(trade.id)
-            signal = {
+            close_signal = {
                 "symbol": trade.symbol,
                 "side": "sell" if trade.side == "buy" else "buy",
-                "size": None,  # let router size it
+                "size": trade.size,
                 "auto_close": True,
                 "reason": reason,
                 "price": current,
+                "entry": trade.entry,
+                "tp": trade.tp,
+                "sl": trade.sl,
+                "user": trade.user,
+                "trade_id": trade.id,
             }
             await fire_plugin_event("sl_tp_triggered", {
                 "trade_id": trade.id,
@@ -146,17 +147,23 @@ class SLWatchdog:
                 "current": current,
                 "user": trade.user,
             })
-            # Execute close
-            await self.execution_router.execute_trade(signal, user_id=trade.user)
-            # Mark as closed in memory after execution
-            await self.trade_memory.mark_trade_closed(trade.id)
+            # Execute close: pass close_signal with all context!
+            close_result = await self.execution_router.execute_trade(close_signal, user_id=trade.user)
+            # Mark as closed in memory, log with TP/SL and exit
+            await self.trade_memory.mark_trade_closed(
+                trade.id,
+                close_price=current,
+                close_reason=reason,
+                tp=trade.tp,
+                sl=trade.sl,
+                pnl=(current - trade.entry) * (trade.size if trade.side == "buy" else -trade.size)
+            )
         SL_WATCHDOG_LATENCY.observe(asyncio.get_event_loop().time() - start)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Factory & Singleton
 # ────────────────────────────────────────────────────────────────────────────────
 
-# All dependencies wired via Config singleton/global
 watchdog = SLWatchdog(
     wallet_manager=WalletManager(),
     trade_memory=TradeMemory(config),
