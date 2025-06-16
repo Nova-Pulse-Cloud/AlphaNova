@@ -41,3 +41,4 @@ python-multipart==0.0.6
 asgiref==3.7.2
 pydantic==1.10.12
 pydantic-settings==0.2.1
+cython>=0.29.36
