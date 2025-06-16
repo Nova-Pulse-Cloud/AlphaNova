@@ -45,7 +45,7 @@ class OpenTrade(BaseModel):
     tp: float = Field(..., ge=0)
     sl: float = Field(..., ge=0)
     user: str
-    status: str = "open"  # added for pending/closed tracking
+    status: str = "open"  # pending/closed tracking
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Watchdog Implementation
@@ -62,7 +62,8 @@ class SLWatchdog:
         self.trade_memory = trade_memory
         self.execution_router = execution_router
         self.pricing = PricingUtils()
-        self.poll_interval = poll_interval or config.SL_WATCHDOG_INTERVAL
+        # Support both env var or config singleton
+        self.poll_interval = poll_interval or int(getattr(config, "SL_WATCHDOG_INTERVAL", 5))
         self._running = False
 
     async def start(self) -> None:
@@ -109,7 +110,7 @@ class SLWatchdog:
 
         # Log price every time for audit
         logger.info(f"[SLWatchdog][AUDIT] {trade.symbol} side={trade.side} entry={trade.entry} TP={trade.tp} SL={trade.sl} cur={current} user={trade.user}")
-        
+
         hit_tp = (trade.side == "buy" and current >= trade.tp) or (trade.side == "sell" and current <= trade.tp)
         hit_sl = (trade.side == "buy" and current <= trade.sl) or (trade.side == "sell" and current >= trade.sl)
 
@@ -154,8 +155,11 @@ class SLWatchdog:
 # ────────────────────────────────────────────────────────────────────────────────
 # Factory & Singleton
 # ────────────────────────────────────────────────────────────────────────────────
+
+# All dependencies wired via Config singleton/global
 watchdog = SLWatchdog(
     wallet_manager=WalletManager(),
-    trade_memory=TradeMemory(),
-    execution_router=ExecutionRouter(wallet_manager=WalletManager(), rpc_nodes=[config.HELIUS_RPC])
+    trade_memory=TradeMemory(config),
+    execution_router=ExecutionRouter(wallet_manager=WalletManager(), rpc_nodes=[config.HELIUS_RPC]),
+    poll_interval=int(getattr(config, "SL_WATCHDOG_INTERVAL", 5))
 )
