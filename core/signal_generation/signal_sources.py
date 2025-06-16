@@ -69,13 +69,14 @@ class RawSignal(BaseModel):
 # SignalSources Class
 # ────────────────────────────────────────────────────────────────────────────────
 class SignalSources:
-    def __init__(self,
-                 adaptive_tp_sl: AdaptiveTPSL,
-                 orderbook_overlay: OrderBookOverlay,
-                 cache_ttl: int = 5
-                 ):
-        self.adaptive_tp_sl = adaptive_tp_sl
-        self.orderbook_overlay = orderbook_overlay
+    def __init__(
+        self,
+        adaptive_tp_sl: Optional[AdaptiveTPSL] = None,
+        orderbook_overlay: Optional[OrderBookOverlay] = None,
+        cache_ttl: int = 5
+    ):
+        self.adaptive_tp_sl = adaptive_tp_sl or AdaptiveTPSL(config)
+        self.orderbook_overlay = orderbook_overlay or OrderBookOverlay(config)
         self.cache: Dict[str, Dict[str, Any]] = {}
         self.cache_ttl = cache_ttl
 
