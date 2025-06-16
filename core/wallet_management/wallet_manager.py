@@ -34,8 +34,9 @@ WALLET_TX_CONFIRM_FAILS= Counter("wallet_tx_confirm_failures","Failed confirmati
 # Keypair loader
 # ────────────────────────────────────────────────────────────────────────────────
 def _load_keypair() -> Keypair:
-    secret = config.SOL_PRIVATE_KEY  # loaded from mounted JSON
-    return Keypair.from_secret_key(bytes(secret))
+    secret_list = config.SOL_PRIVATE_KEY  # loaded from mounted JSON (list of ints)
+    secret_bytes = bytes(secret_list)     # convert list[int] to bytes
+    return Keypair.from_secret_key(secret_bytes)
 
 class WalletEntry:
     def __init__(self, chain: str, keypair: Keypair, label: Optional[str]=None):
