@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import openai
@@ -17,10 +17,11 @@ from core.utils.config import config
 from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.signal_generation.reinforcement_learning import RLTrader
-from core.data_collection.orderbook_overlay import OrderBookOverlay
+from core.data_collection.orderbook_overlay import OrderBookOverlay, get_orderbook_imbalance
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.token_auditor import TokenAuditor
-from core.utils.token_guardian import TokenGuardian
+from core.utils.token_guardian import check_guardian
+from core.utils.risk_signals import rug_pull_signal
 from core.agents.adaptive_tp_sl import AdaptiveTPSL
 
 logger = logging.getLogger("nova.alpha_signal_agent")
@@ -83,19 +84,17 @@ class AlphaSignalAgent:
         self.redis: Optional[redis_client.Redis] = None
         self.memory = TradeMemory(config)
         self.rl_tuner = ReinforcementTuner()
-        self.orderbook = OrderBookOverlay(config)
-        self.rl_agent = RLTrader(config)
+        self.orderbook = OrderBookOverlay
+        self.rl_agent = RLTrader()
         self.symbols = symbols or []
         self._caption_lock = asyncio.Lock()
 
         # Risk/audit agents
-        self.token_auditor = TokenAuditor(config)
-        self.token_guardian = TokenGuardian(config)
-        # Adaptive TP/SL
+        self.token_auditor = TokenAuditor(config.REDIS_URL)
+        # use check_guardian instead of TokenGuardian
         self.tpsl_agent = AdaptiveTPSL(config, memory=self.memory, rl_agent=self.rl_agent)
 
     async def connect(self):
-        """Initialize Redis (DLQ storage, caching)."""
         if not self.redis:
             try:
                 self.redis = await redis_client.from_url(self.redis_url, decode_responses=True)
@@ -128,7 +127,16 @@ class AlphaSignalAgent:
             return f"{symbol} signal generated! 🚀"
 
     def _compute_provenance(
-        self, symbol: str, scores: Dict[str, float], meta: Dict[str, Any], flavor: str, score: float, risk: float, entry: float, tp: float, sl: float
+        self,
+        symbol: str,
+        scores: Dict[str, float],
+        meta: Dict[str, Any],
+        flavor: str,
+        score: float,
+        risk: float,
+        entry: float,
+        tp: float,
+        sl: float,
     ) -> str:
         blob = f"{symbol}{scores}{meta}{flavor}{score}{risk}{entry}{tp}{sl}"
         return hashlib.sha256(blob.encode()).hexdigest()
@@ -146,15 +154,10 @@ class AlphaSignalAgent:
             return "Degen"
         return "Moderate"
 
-    async def _full_risk_audit(self, symbol: str) -> (bool, Dict[str, Any]):
-        """
-        Runs all audit layers: token audit, guardian, rug, whale, and returns (pass, details).
-        """
-        details = {}
-
-        # TokenAuditor
+    async def _full_risk_audit(self, symbol: str) -> Tuple[bool, Dict[str, Any]]:
+        details: Dict[str, Any] = {}
         try:
-            audit_result = await self.token_auditor.audit(symbol)
+            audit_result = await self.token_auditor.audit_token(symbol)
             details["TokenAuditor"] = audit_result
             if not audit_result.get("passed", False):
                 return False, details
@@ -162,17 +165,15 @@ class AlphaSignalAgent:
             details["TokenAuditor"] = {"error": str(e)}
             return False, details
 
-        # TokenGuardian
         try:
-            guardian_result = await self.token_guardian.check(symbol)
+            guardian_result = await check_guardian(symbol)
             details["TokenGuardian"] = guardian_result
-            if not guardian_result.get("passed", False):
+            if not guardian_result.get("passed", True):
                 return False, details
         except Exception as e:
             details["TokenGuardian"] = {"error": str(e)}
             return False, details
 
-        # Rug signal
         try:
             rug_result = await rug_pull_signal(symbol)
             details["RugSignal"] = rug_result
@@ -190,33 +191,19 @@ class AlphaSignalAgent:
         agent_signals: List[Dict[str, Any]],
         user_context: Optional[Dict[str, Any]] = None,
     ) -> AlphaSignal:
-        """
-        Fuse multi-agent scores into one alpha signal with:
-        - RL trust weighting
-        - Trade-memory weighting
-        - Market-depth adjustment
-        - LLM captioning
-        - Full risk/audit block
-        - Dynamic TP/SL via AdaptiveTPSL
-        - Provenance hashing
-        - Prometheus metrics
-        """
         SIGNAL_TRIGGERS.inc()
         start = datetime.utcnow()
 
         try:
-            # ─────────────── Risk Audit (BLOCK if failed) ───────────────
             audit_passed, audit_details = await self._full_risk_audit(symbol)
             if not audit_passed:
-                logger.warning(f"[AlphaSignalAgent] BLOCKED by audit: {symbol} | {audit_details}")
-                raise RuntimeError(f"Signal blocked by audit for {symbol}: {audit_details}")
+                raise RuntimeError(f"Signal blocked: {audit_details}")
 
-            # 1) Trust + memory weights
-            weighted_scores = {}
-            trust_map = {}
             memory_rate = await asyncio.get_event_loop().run_in_executor(
-                None, self.memory.get_win_rate, symbol
+                None, self.memory.win_rate, symbol
             )
+            weighted_scores: Dict[str, float] = {}
+            trust_map: Dict[str, float] = {}
             for sig in agent_signals:
                 src = sig["source"]
                 base = float(sig.get("score", 0.0))
@@ -225,54 +212,34 @@ class AlphaSignalAgent:
                 weighted_scores[src] = base * weight
                 trust_map[src] = weight
 
-            # 2) Market-depth overlays
-            ob = await self.orderbook.get_orderbook_data(symbol)
-            liquidity = ob.get("liquidity", 0.0)
-            whale_pressure = ob.get("whale_pressure", 0.0)
-            depth_adj = 0.9 if liquidity < 0.1 else 1.0
-            if whale_pressure > 0.8:
-                depth_adj *= 1.1
+            imbalance, ob_summary = await get_orderbook_imbalance(symbol)
+            depth_adj = 0.9 if ob_summary.get("imbalance_score", 0.0) < 0 else 1.0
 
-            # 3) Composite score & risk
             avg = sum(weighted_scores.values()) / max(len(weighted_scores), 1)
             score = avg * depth_adj
-            risk = 1.0 - min(trust_map.values()) if trust_map else 1.0
-            entry = float(agent_signals[0].get("entry", 0.0)) if agent_signals else 0.0
+            risk = 1.0 - min(trust_map.values())
+            entry = float(agent_signals[0].get("entry", 0.0))
 
-            # 4) Dynamic TP/SL calculation via your advanced AdaptiveTPSL
-            signal_context = {
-                "volatility": ob.get("volatility", 0.02),
-                "trend_strength": ob.get("trend_strength", 0.5),
-                "whale_pressure": ob.get("whale_pressure", 0.0),
-                "spread": ob.get("spread", 0.001),
-                "gas_cost": ob.get("gas_cost", 0.0),
-                "orderbook_bias": ob.get("orderbook_bias", 0.0),
-                "rug_score": audit_details.get("TokenAuditor", {}).get("rug_score", 0.0),
-                "cycle_phase": ob.get("cycle_phase", 0.5),
-                "user_risk": user_context.get("risk_val", 0.0) if user_context else 0.0,
-            }
-            tpsl = await self.tpsl_agent.compute(
+            tpsl_res = await self.tpsl_agent.compute(
                 symbol=symbol,
                 price=entry,
-                signal_context=signal_context,
-                user=None  # Extend if user-specific RL/memory needed
+                signal_context={**ob_summary, **audit_details},
+                user_context=user_context,
             )
-            take_profit = float(tpsl["tp"])
-            stop_loss = float(tpsl["sl"])
+            take_profit = float(tpsl_res["tp"])
+            stop_loss = float(tpsl_res["sl"])
 
-            # 5) Flavor & caption
             flavor = self._choose_flavor(avg, user_context)
-            caption = await self._generate_caption(symbol, {"avg": avg, "depth_adj": depth_adj, "tp": take_profit, "sl": stop_loss})
+            caption = await self._generate_caption(symbol, {"avg": avg, "depth_adj": depth_adj})
 
-            # 6) Provenance
             prov_hash = self._compute_provenance(
-                symbol, weighted_scores, {"depth_adj": depth_adj}, flavor, score, risk, entry, take_profit, stop_loss
+                symbol, weighted_scores, ob_summary, flavor, score, risk, entry, take_profit, stop_loss
             )
 
             signal = AlphaSignal(
                 symbol=symbol,
                 trigger_sources=weighted_scores,
-                meta_features={"trusts": trust_map, **ob, "audit": audit_details},
+                meta_features={"trusts": trust_map, **ob_summary, **audit_details},
                 flavor=flavor,
                 score=round(score, 4),
                 risk=round(risk, 4),
@@ -286,16 +253,15 @@ class AlphaSignalAgent:
                 audit_details=audit_details,
             )
 
-            SIGNAL_SCORE.labels(symbol=symbol).set(score)
+            SIGNAL_SCORE.labels(symbol=symbol).set(signal.score)
             SIGNAL_LATENCY.observe((datetime.utcnow() - start).total_seconds())
 
-            # 7) Emit event for downstream hooks (execution, logging, telegram)
             await fire_plugin_event("alpha_signal", signal.dict())
             return signal
 
         except Exception as e:
             SIGNAL_ERRORS.inc()
-            logger.error(f"[AlphaSignalAgent] evaluate error for {symbol}: {e}")
+            logger.error(f"[AlphaSignalAgent] evaluate error: {e}")
             raise
 
 # singleton
