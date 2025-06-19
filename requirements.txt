@@ -50,6 +50,7 @@ prometheus-client
 openai
 pillow
 tenacity
+deprecated
 
 # Config & settings
 pydantic
