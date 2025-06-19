@@ -27,6 +27,7 @@ solders
 
 # Caching & messaging
 redis
+aiosqlite
 
 # HTTP & serialization
 magic-filter
