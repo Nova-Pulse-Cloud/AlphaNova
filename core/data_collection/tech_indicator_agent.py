@@ -23,7 +23,7 @@ import pandas as pd
 import pandas_ta as ta
 from prometheus_client import Counter, Histogram
 
-from utils.config import Config
+from core.utils.config import Config
 
 logger = logging.getLogger("nova.tech_indicator_agent")
 logger.setLevel(logging.INFO)
