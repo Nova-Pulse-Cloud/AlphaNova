@@ -24,8 +24,8 @@ from core.utils.config import config
 from core.utils.trade_memory import TradeMemory
 from core.alpha_memory_mesh import update_memory, get_token_memory_score
 from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
-from utils.plugin_manager import fire_plugin_event
-from utils.token_utils import TokenUtils
+from core.utils.plugin_manager import fire_plugin_event
+from core.utils.token_utils import TokenUtils
 
 logger = logging.getLogger("nova.combined_signal_engine")
 logger.setLevel(logging.INFO)
