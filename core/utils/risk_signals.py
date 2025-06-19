@@ -9,7 +9,7 @@ import aioredis
 import numpy as np
 from pydantic import BaseModel
 from prometheus_client import Counter, Histogram
-from utils.config import Config
+from core.utils.config import Config
 
 logger = logging.getLogger("risk_signals")
 
