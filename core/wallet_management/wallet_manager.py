@@ -5,18 +5,17 @@ import asyncio
 import base64
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
-from solders.keypair import Keypair
 from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
 from solders.transaction import Transaction
 from prometheus_client import Counter, Histogram
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from core.utils.config import Config
+from core.utils.config import config
 from core.utils.trade_memory import TradeMemory
-from core.utils.trade_logger import add_fill
 
 logger = logging.getLogger("nova.wallet_manager")
 logger.setLevel(logging.INFO)
@@ -58,12 +57,12 @@ class WalletManager:
     Manages Solana wallet interactions, swap execution, and PnL tracking.
     Provides robust retry logic and metrics instrumentation.
     """
-    def __init__(self, config: Config) -> None:
-        self.config = config
+    def __init__(self, cfg=config) -> None:
+        self.config = cfg
         self.wallets: Dict[str, WalletEntry] = {}
         self._lock = asyncio.Lock()
         self.trade_memory = TradeMemory(self.config)
-        self._http: httpx.AsyncClient = httpx.AsyncClient(timeout=self.config.http_timeout)
+        self._http = httpx.AsyncClient(timeout=self.config.HTTP_TIMEOUT)
         self._init_wallet()
 
     def _init_wallet(self) -> None:
@@ -96,7 +95,7 @@ class WalletManager:
         confirms on-chain, and tracks PnL.
         """
         wallet = self.get_wallet()
-        swap_url = self.config.jupiter_swap_endpoint
+        swap_url = self.config.JUPITER_SWAP_ENDPOINT
 
         # Retry logic for network robustness
         async for attempt in AsyncRetrying(
@@ -138,32 +137,27 @@ class WalletManager:
                 WALLET_TX_CONFIRMS.inc()
             else:
                 WALLET_TX_CONFIRM_FAILS.inc()
-                logger.warning(
-                    "[WalletManager] Confirmation failed for %s", signature
-                )
+                logger.warning("[WalletManager] Confirmation failed for %s", signature)
 
             logger.info(
                 "[WalletManager] Swap TX %s → https://solscan.io/tx/%s",
                 signature,
-                signature,
+                signature
             )
 
-            # Track PnL asynchronously
+            # Track PnL asynchronously via TradeMemory
             in_amt = quote.get("inAmount", 0) / 1e9
             out_amt = quote.get("outAmount", 0) / 1e9
-            pnl = out_amt - in_amt
             await asyncio.get_running_loop().run_in_executor(
                 None,
-                add_fill,
-                wallet.chain,
-                "BUY",
-                in_amt,
-                in_amt,
-                out_amt,
-                pnl,
-                user_id or "global",
-                None,
+                lambda: self.trade_memory.add_trade(
+                    wallet.chain,
+                    in_amt,
+                    in_amt,
+                    out_amt
+                )
             )
+
             return signature, out_amt
 
         except Exception as err:
