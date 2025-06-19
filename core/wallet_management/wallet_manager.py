@@ -12,7 +12,7 @@ import httpx
 from prometheus_client import Counter, Histogram
 from solders.keypair import Keypair
 from solana.rpc.async_api import AsyncClient
-from solders.transaction import Transaction
+from solders.transaction import Transaction  # ensure .deserialize & .sign support
 from solders.signature import Signature  # type: ignore
 
 from core.utils.config import config
@@ -38,7 +38,6 @@ def _load_keypair() -> Keypair:
     """
     Loads a Solana Keypair from a 64-byte secret (list of ints) loaded from config or file.
     """
-    # Patch: Accepts either direct list or file path (auto-detect)
     secret = config.SOL_PRIVATE_KEY
     if isinstance(secret, str):  # File path
         with open(secret, "r") as f:
@@ -53,7 +52,7 @@ class WalletEntry:
         self.chain = chain
         self.keypair = keypair
         self.label = label or f"{chain}-wallet"
-        self.pubkey = keypair.pubkey()  # PATCH: .pubkey() for solders
+        self.pubkey = keypair.pubkey()
 
     def summary(self) -> Dict[str,str]:
         return {"chain": self.chain, "pubkey": str(self.pubkey), "label": self.label}
@@ -66,13 +65,13 @@ class WalletManager:
     def __init__(self) -> None:
         self.wallets: Dict[str, WalletEntry] = {}
         self._lock = asyncio.Lock()
-        self.trade_memory = TradeMemory(config)  # ML memory
+        self.trade_memory = TradeMemory(config)
         self._init_wallet()
 
     def _init_wallet(self) -> None:
         kp = _load_keypair()
         self.wallets["solana"] = WalletEntry("solana", kp, label="primary")
-        logger.info("[WalletManager] Solana wallet initialized: %s", kp.pubkey())  # PATCHED
+        logger.info("[WalletManager] Solana wallet initialized: %s", kp.pubkey())
 
     def get_wallet(self, chain: str="solana") -> WalletEntry:
         if chain not in self.wallets:
@@ -88,12 +87,8 @@ class WalletManager:
         *,
         user_id: Optional[str] = None,
     ) -> Tuple[str, float]:
-        """
-        Execute a Jupiter swap, record on-chain TX, and persist PnL.
-        Returns (signature, output_amount_SOL).
-        """
-        wallet = self.get_wallet()
         # 1️⃣ Fetch signed transaction blob from Jupiter
+        wallet = self.get_wallet()
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 "https://quote-api.jup.ag/v6/swap",
@@ -129,10 +124,9 @@ class WalletManager:
         in_amount  = quote.get("inAmount", 0)  / 1e9
         out_amount = quote.get("outAmount",0) / 1e9
         pnl        = out_amount - in_amount
-        side       = "BUY"  # or derive from signal context
-        entry_price= in_amount  # mint amount treated as price
+        side       = "BUY"
+        entry_price= in_amount
         exit_price = out_amount
-        # offload DB write
         await asyncio.get_running_loop().run_in_executor(
             None,
             add_fill,
