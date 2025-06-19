@@ -1,157 +1,186 @@
+```python
 # core/wallet_management/wallet_manager.py
 
 from __future__ import annotations
-
 import asyncio
 import base64
-import logging
 import json
-from typing import Any, Dict, Tuple, Optional, List
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from prometheus_client import Counter, Histogram
 from solders.keypair import Keypair
 from solana.rpc.async_api import AsyncClient
-from solders.transaction import Transaction  # ensure .deserialize & .sign support
-from solders.signature import Signature  # type: ignore
+from solders.transaction import Transaction
+from prometheus_client import Counter, Histogram
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from core.utils.config import config
-from core.utils.pnl_tracker import add_fill
+from core.utils.config import Config
 from core.utils.trade_memory import TradeMemory
+from core.utils.trade_logger import add_fill
 
 logger = logging.getLogger("nova.wallet_manager")
 logger.setLevel(logging.INFO)
 
-# ────────────────────────────────────────────────────────────────────────────────
 # Metrics
-# ────────────────────────────────────────────────────────────────────────────────
-WALLET_TX_COUNT        = Counter("wallet_tx_count",        "Total transactions signed by wallet")
-WALLET_TX_FAILS        = Counter("wallet_tx_failures",     "Wallet TX failures")
-WALLET_TX_LATENCY      = Histogram("wallet_tx_latency_seconds","Latency of wallet-TX commits")
-WALLET_TX_CONFIRMS     = Counter("wallet_tx_confirm_success","Confirmed transactions")
-WALLET_TX_CONFIRM_FAILS= Counter("wallet_tx_confirm_failures","Failed confirmations")
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Keypair loader
-# ────────────────────────────────────────────────────────────────────────────────
-def _load_keypair() -> Keypair:
-    """
-    Loads a Solana Keypair from a 64-byte secret (list of ints) loaded from config or file.
-    """
-    secret = config.SOL_PRIVATE_KEY
-    if isinstance(secret, str):  # File path
-        with open(secret, "r") as f:
-            secret_list = json.load(f)
-    else:  # Already loaded as list
-        secret_list = secret
-    secret_bytes = bytes(secret_list)
-    return Keypair.from_secret_key(secret_bytes)
+WALLET_TX_COUNT = Counter(
+    "wallet_tx_count", "Total transactions signed and sent by wallet"
+)
+WALLET_TX_FAILS = Counter(
+    "wallet_tx_failures", "Number of failed wallet transactions"
+)
+WALLET_TX_LATENCY = Histogram(
+    "wallet_tx_latency_seconds", "Latency of wallet transaction confirmations"
+)
+WALLET_TX_CONFIRMS = Counter(
+    "wallet_tx_confirm_success", "Successful transaction confirmations"
+)
+WALLET_TX_CONFIRM_FAILS = Counter(
+    "wallet_tx_confirm_failures", "Failed transaction confirmations"
+)
 
 class WalletEntry:
-    def __init__(self, chain: str, keypair: Keypair, label: Optional[str]=None):
+    def __init__(
+        self,
+        chain: str,
+        keypair: Keypair,
+        label: Optional[str] = None
+    ) -> None:
         self.chain = chain
         self.keypair = keypair
-        self.label = label or f"{chain}-wallet"
         self.pubkey = keypair.pubkey()
+        self.label = label or f"{chain}-wallet"
 
-    def summary(self) -> Dict[str,str]:
+    def summary(self) -> Dict[str, str]:
         return {"chain": self.chain, "pubkey": str(self.pubkey), "label": self.label}
 
 class WalletManager:
     """
-    Async wallet & Jupiter swap manager for Solana.
-    Single-user mode with PnL tracking and metrics.
+    Manages Solana wallet interactions, swap execution, and PnL tracking.
+    Provides robust retry logic and metrics instrumentation.
     """
-    def __init__(self) -> None:
+    def __init__(self, config: Config) -> None:
+        self.config = config
         self.wallets: Dict[str, WalletEntry] = {}
         self._lock = asyncio.Lock()
-        self.trade_memory = TradeMemory(config)
+        self.trade_memory = TradeMemory(self.config)
+        self._http: httpx.AsyncClient = httpx.AsyncClient(timeout=self.config.http_timeout)
         self._init_wallet()
 
     def _init_wallet(self) -> None:
-        kp = _load_keypair()
-        self.wallets["solana"] = WalletEntry("solana", kp, label="primary")
-        logger.info("[WalletManager] Solana wallet initialized: %s", kp.pubkey())
+        secret = self.config.SOL_PRIVATE_KEY
+        if isinstance(secret, str):
+            with open(secret, "r") as f:
+                secret_list = json.load(f)
+        else:
+            secret_list = secret
+        keypair = Keypair.from_secret_key(bytes(secret_list))
+        self.wallets["solana"] = WalletEntry("solana", keypair, label="primary")
+        logger.info("[WalletManager] Initialized Solana wallet: %s", keypair.pubkey())
 
-    def get_wallet(self, chain: str="solana") -> WalletEntry:
+    def get_wallet(self, chain: str = "solana") -> WalletEntry:
         if chain not in self.wallets:
             raise ValueError(f"No wallet configured for chain '{chain}'")
         return self.wallets[chain]
 
-    def get_pubkey(self, chain: str="solana") -> str:
+    def get_pubkey(self, chain: str = "solana") -> str:
         return str(self.get_wallet(chain).pubkey)
 
     async def submit_swap(
         self,
-        quote: Dict[str,Any],
+        quote: Dict[str, Any],
         *,
-        user_id: Optional[str] = None,
+        user_id: Optional[str] = None
     ) -> Tuple[str, float]:
-        # 1️⃣ Fetch signed transaction blob from Jupiter
+        """
+        Executes a Jupiter swap: fetches transaction, signs, broadcasts,
+        confirms on-chain, and tracks PnL.
+        """
         wallet = self.get_wallet()
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://quote-api.jup.ag/v6/swap",
-                json={
-                    "userPublicKey": str(wallet.pubkey),
-                    "wrapUnwrapSOL": True,
-                    "quoteResponse": quote,
-                    "computeUnitPriceMicroLamports": 10_000,
-                },
+        swap_url = self.config.jupiter_swap_endpoint
+
+        # Retry logic for network robustness
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry=retry_if_exception_type((httpx.HTTPError, asyncio.TimeoutError))
+        ):
+            with attempt:
+                resp = await self._http.post(
+                    swap_url,
+                    json={
+                        "userPublicKey": str(wallet.pubkey),
+                        "wrapUnwrapSOL": True,
+                        "quoteResponse": quote,
+                        "computeUnitPriceMicroLamports": 10_000,
+                    }
+                )
+                resp.raise_for_status()
+                tx_b64 = resp.json().get("swapTransaction")
+                if not tx_b64:
+                    raise RuntimeError("Jupiter API did not return a swapTransaction blob")
+
+        try:
+            # Deserialize and sign transaction
+            raw_tx = base64.b64decode(tx_b64)
+            tx = Transaction.deserialize(raw_tx)
+            tx.sign([wallet.keypair])
+
+            # Broadcast with metrics
+            with WALLET_TX_LATENCY.time():
+                async with self._lock:
+                    async with AsyncClient(self.config.HELIUS_RPC) as client:
+                        send_resp = await client.send_raw_transaction(tx.serialize())
+                        confirmation = await client.confirm_transaction(send_resp.value)
+
+            signature = str(send_resp.value)
+            WALLET_TX_COUNT.inc()
+            if confirmation.value:
+                WALLET_TX_CONFIRMS.inc()
+            else:
+                WALLET_TX_CONFIRM_FAILS.inc()
+                logger.warning(
+                    "[WalletManager] Confirmation failed for %s", signature
+                )
+
+            logger.info(
+                "[WalletManager] Swap TX %s → https://solscan.io/tx/%s",
+                signature,
+                signature,
             )
-            resp.raise_for_status()
-            tx_b64 = resp.json().get("swapTransaction")
-            if not tx_b64:
-                WALLET_TX_FAILS.inc()
-                raise RuntimeError("Jupiter returned no transaction blob")
-        # 2️⃣ Decode & sign
-        tx = Transaction.deserialize(base64.b64decode(tx_b64))
-        tx.sign([wallet.keypair])
-        # 3️⃣ Broadcast
-        async with self._lock, WALLET_TX_LATENCY.time():
-            async with AsyncClient(config.HELIUS_RPC) as sol_client:
-                send_resp = await sol_client.send_raw_transaction(tx.serialize())
-                confirm = await sol_client.confirm_transaction(send_resp.value)
-        sig = str(send_resp.value)
-        WALLET_TX_COUNT.inc()
-        if confirm.value:
-            WALLET_TX_CONFIRMS.inc()
-        else:
-            WALLET_TX_CONFIRM_FAILS.inc()
-        logger.info("[WalletManager] Swap TX %s → https://solscan.io/tx/%s", sig, sig)
 
-        # 4️⃣ PnL tracking
-        in_amount  = quote.get("inAmount", 0)  / 1e9
-        out_amount = quote.get("outAmount",0) / 1e9
-        pnl        = out_amount - in_amount
-        side       = "BUY"
-        entry_price= in_amount
-        exit_price = out_amount
-        await asyncio.get_running_loop().run_in_executor(
-            None,
-            add_fill,
-            wallet.chain,
-            side,
-            in_amount,
-            entry_price,
-            exit_price,
-            pnl,
-            user_id or "global",
-            None,
-        )
+            # Track PnL asynchronously
+            in_amt = quote.get("inAmount", 0) / 1e9
+            out_amt = quote.get("outAmount", 0) / 1e9
+            pnl = out_amt - in_amt
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                add_fill,
+                wallet.chain,
+                "BUY",
+                in_amt,
+                in_amt,
+                out_amt,
+                pnl,
+                user_id or "global",
+                None,
+            )
+            return signature, out_amt
 
-        return sig, out_amount
+        except Exception as err:
+            WALLET_TX_FAILS.inc()
+            logger.error("[WalletManager] submit_swap error: %s", err)
+            raise
 
     async def get_total_open_sol(self) -> float:
-        loop = asyncio.get_running_loop()
-        history: List[Dict[str,Any]] = await loop.run_in_executor(
+        history = await asyncio.get_running_loop().run_in_executor(
             None, self.trade_memory.get_history
         )
-        return sum(t.get("size",0) for t in history if t.get("exit",0)==0)
+        return sum(tx.get("size", 0) for tx in history if tx.get("exit", 0) == 0)
 
     async def has_open_position(self, symbol: str) -> bool:
-        loop = asyncio.get_running_loop()
-        trades: List[Dict[str,Any]] = await loop.run_in_executor(
+        trades = await asyncio.get_running_loop().run_in_executor(
             None, self.trade_memory.get_symbol_history, symbol
         )
-        return any(t.get("exit",0)==0 for t in trades)
+        return any(tx.get("exit", 0) == 0 for tx in trades)
+```
