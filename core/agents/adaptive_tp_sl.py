@@ -204,6 +204,5 @@ class AdaptiveTPSL:
         """
         Async benchmarking entry point for multiple TP/SL strategies.
         """
-        # Example: only adaptive TPSL for now
         result = await self.compute(symbol, price, context)
         return {"nova_adaptive": result}
