@@ -1,4 +1,4 @@
-# Nova Pulse ALPHA – OrderBookOverlay 2.0
+# Nova Pulse ALPHA – OrderBookOverlay 2.0
 # -------------------------------------------------------------
 # • Live L2 order‑book depth for ANY SPL token via Jupiter API
 # • Solana‑native (no mock RPC) – works on Raydium/OpenBook pools
@@ -7,7 +7,6 @@
 # -------------------------------------------------------------
 
 from __future__ import annotations
-
 import asyncio
 import hashlib
 import logging
@@ -23,11 +22,11 @@ logger.setLevel(logging.INFO)
 # ────────────────────────────────────────────────────────────────────────────────
 # Prometheus Metrics
 # ────────────────────────────────────────────────────────────────────────────────
-OB_FETCH         = Counter("orderbook_fetch_total", "Total Jupiter order‑book pulls")
-OB_ERRORS        = Counter("orderbook_errors_total", "Order‑book fetch/parse errors")
-OB_LATENCY       = Histogram("orderbook_latency_seconds", "Latency of order‑book pulls")
-OB_CACHE_HITS    = Counter("orderbook_cache_hits_total", "Cache hits (≤ ttl)")
-OB_CACHE_MISSES  = Counter("orderbook_cache_miss_total", "Cache misses (> ttl)")
+OB_FETCH        = Counter("orderbook_fetch_total", "Total Jupiter order‑book pulls")
+OB_ERRORS       = Counter("orderbook_errors_total", "Order‑book fetch/parse errors")
+OB_LATENCY      = Histogram("orderbook_latency_seconds", "Latency of order‑book pulls")
+OB_CACHE_HITS   = Counter("orderbook_cache_hits_total", "Cache hits (≤ ttl)")
+OB_CACHE_MISSES = Counter("orderbook_cache_miss_total", "Cache misses (> ttl)")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # In‑mem cache (key → (timestamp, depth)) – ttl default 10 s
@@ -39,7 +38,7 @@ _CACHE_LOCK = asyncio.Lock()
 # Jupiter v6 order‑book endpoint (pairAddress param)
 JUP_OB_URL = "https://quote-api.jup.ag/v6/orderbook/{market}"
 
-# depth_n controls how many levels we keep (Jupiter returns top 20 by default)
+# depth_n controls how many levels we keep (Jupiter returns top 20 by default)
 DEFAULT_DEPTH_N = 20
 
 # -----------------------------------------------------------------------------
@@ -52,19 +51,17 @@ def _hash(data: Dict[str, Any]) -> str:
 # -----------------------------------------------------------------------------
 # OrderBookOverlay class
 # -----------------------------------------------------------------------------
-
 class OrderBookOverlay:
     """Pulls live L2 depth from Jupiter for a Raydium/OpenBook market address.
 
     Args:
-        market (str): *On‑chain* market address (a.k.a. Serum/OpenBook market).
+        market (str): On‑chain market address.
     """
-
     def __init__(
         self,
         market: str,
         *,
-        depth_threshold: float = 1000.0,  # SOL‑notional imbalance threshold
+        depth_threshold: float = 1000.0,
         depth_n: int = DEFAULT_DEPTH_N,
         ttl: float = _CACHE_TTL,
     ) -> None:
@@ -73,9 +70,6 @@ class OrderBookOverlay:
         self.depth_n = depth_n
         self.ttl = ttl
 
-    # ────────────────────────────────────────────────────────────────────────
-    # public async API
-    # ────────────────────────────────────────────────────────────────────────
     async def get_orderbook_data(self) -> Dict[str, Any]:
         """Return cached (or freshly‑fetched) order‑book depth dict."""
         async with _CACHE_LOCK:
@@ -85,7 +79,6 @@ class OrderBookOverlay:
                 return data
             OB_CACHE_MISSES.inc()
 
-        # cache miss → pull from Jupiter
         async with OB_LATENCY.time():
             try:
                 async with httpx.AsyncClient(timeout=8) as client:
@@ -99,23 +92,16 @@ class OrderBookOverlay:
                 return {}
 
         depth = self._parse_depth(raw)
-
         async with _CACHE_LOCK:
             _CACHE[self.market] = (time.time(), depth)
-
         return depth
 
     async def get_orderbook_summary(self) -> Dict[str, Any]:
-        """Shortcut: returns trend + imbalance for signal engines."""
+        """Returns trend + imbalance for signal engines."""
         depth = await self.get_orderbook_data()
         return self._analyse(depth)
 
-    # ------------------------------------------------------------------
-    # internal parsing / analytics helpers
-    # ------------------------------------------------------------------
-
     def _parse_depth(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert Jupiter JSON → {bids:[(p,q)], asks:[(p,q)]}."""
         book = {"bids": [], "asks": []}
         for side in ("bids", "asks"):
             for lvl in raw.get(side, [])[: self.depth_n]:
@@ -143,9 +129,16 @@ class OrderBookOverlay:
         }
 
 # -----------------------------------------------------------------------------
-# Example CLI (run with:  python -m core.data_collection.orderbook_overlay <market>)
+# Convenience helper for signal engines
 # -----------------------------------------------------------------------------
+async def get_orderbook_imbalance(market: str) -> Tuple[float, Dict[str, Any]]:
+    ob = OrderBookOverlay(market)
+    summary = await ob.get_orderbook_summary()
+    return summary.get("imbalance_score", 0.0), summary
 
+# -----------------------------------------------------------------------------
+# Example CLI
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys, asyncio, pprint
 
