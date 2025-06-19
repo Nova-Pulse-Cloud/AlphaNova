@@ -2,7 +2,7 @@ import io
 import logging
 import matplotlib.pyplot as plt
 import pandas as pd
-from core.trade_memory import get_trade_history_by_user_or_symbol
+from core.utils.trade_memory import get_trade_history_by_user_or_symbol
 
 logger = logging.getLogger("pnl_chart")
 
