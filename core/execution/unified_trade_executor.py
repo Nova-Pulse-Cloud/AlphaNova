@@ -25,7 +25,7 @@ from core.utils.trade_memory import TradeMemory
 from core.alpha_memory_mesh import MemoryMesh
 from core.utils.plugin_manager import PluginManager
 from core.utils.pnl_card import generate_pnl_card
-from utils.plugin_manager import fire_plugin_event
+from core.utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.unified_trade_executor")
 logger.setLevel(logging.INFO)
