@@ -182,4 +182,3 @@ class WalletManager:
             None, self.trade_memory.get_symbol_history, symbol
         )
         return any(tx.get("exit", 0) == 0 for tx in trades)
-```
