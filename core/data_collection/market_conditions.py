@@ -17,7 +17,7 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from core.utils.config import config, DEXSCREENER_URL
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
-from core.plugin_manager import fire_plugin_event
+from core.utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.market_conditions")
 logger.setLevel(logging.INFO)
