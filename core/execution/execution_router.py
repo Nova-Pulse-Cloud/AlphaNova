@@ -1,5 +1,3 @@
-# core/execution/execution_router.py
-
 """
 Nova Pulse ALPHA – ExecutionRouter (Elite)
 ───────────────────────────────────────────────────────────────────────────────
@@ -52,6 +50,7 @@ execution_router_event_hooks: List[Callable[[str, Dict[str, Any]], Awaitable[Non
 # ────────────────────────────────────────────────────────────────────────────────
 MAX_TOTAL_SOL = float(getattr(config, "MAX_TOTAL_SOL", 0.5))
 MAX_TRADE_SOL = float(getattr(config, "MAX_TRADE_SOL", 0.1))
+MIN_CONFIDENCE = float(getattr(config, "MIN_CONFIDENCE", 0.5))
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helper to hash for audit
@@ -80,7 +79,8 @@ class ExecutionRouter:
         self.tp_sl_plugin   = JupiterTPSLPlugin()
         self.token_utils    = TokenUtils()
         self._http          = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            timeout=self.cfg.HTTP_TIMEOUT
         )
         self._sem           = asyncio.Semaphore(int(getattr(config, "EXECUTION_RATE_LIMIT", 10)))
 
@@ -96,99 +96,91 @@ class ExecutionRouter:
 
     async def _choose_rpc(self, signal: Dict[str, Any]) -> str:
         RPC_CALLS.inc()
+        start = asyncio.get_event_loop().time()
         idx = self.rl_trader.pick_best_node(self.rpc_nodes, signal)
+        RPC_LATENCY.observe(asyncio.get_event_loop().time() - start)
         return self.rpc_nodes[idx]
 
     async def _risk_checks(self, signal: Dict[str, Any]) -> Optional[str]:
-        # Exposure limit
         total = await self.wallet_manager.get_total_open_sol()
         if total >= MAX_TOTAL_SOL:
             return "Max total exposure reached"
-        # Single trade limit
         if signal.get("size", 0) > MAX_TRADE_SOL:
             return "Trade size exceeds limit"
-        # Duplicate position
-        if await self.wallet_manager.has_open_position(signal["symbol"]):
+        if await self.wallet_manager.has_open_position(signal.get("symbol", "")):
             return "Existing open position"
-        # Token audit
-        audit = await audit_token(signal["symbol"])
+        audit = await audit_token(signal.get("symbol", ""))
         if not audit.get("safe", False):
             return f"Token audit failed: {audit.get('reason')}"
         return None
 
-    async def execute_trade(self, signal: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
+    async def execute_trade(
+        self,
+        signal: Dict[str, Any],
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Main entry: process a trade signal end-to-end.
         Returns result dict with status, tx details, or error.
         """
         async with self._sem, tracer.start_as_current_span("execute_trade"):
+            EXEC_RESULT: Dict[str, Any]
             try:
                 signal.setdefault("trace_id", f"tx-{uuid.uuid4().hex[:8]}")
-                # Confidence & size
-                if signal.get("score", 0) < float(getattr(config, "MIN_CONFIDENCE", 0.5)):
-                    return {"status":"skipped","reason":"low confidence","trace_id": signal["trace_id"]}
+                if signal.get("score", 0) < MIN_CONFIDENCE:
+                    return {"status": "skipped", "reason": "low confidence", "trace_id": signal["trace_id"]}
+
                 signal["size"] = self.rl_trader.act(signal)
-                # Risk
                 if err := await self._risk_checks(signal):
-                    return {"status":"rejected","reason":err,"trace_id": signal["trace_id"]}
-                # Slippage overlay
-                imbalance, _ = await get_orderbook_imbalance(signal["symbol"])
+                    return {"status": "rejected", "reason": err, "trace_id": signal["trace_id"]}
+
+                imbalance, _ = await get_orderbook_imbalance(signal.get("symbol", ""))
                 signal["slippage"] = imbalance
-                # Pre-trade plugin hooks
+
                 await self.plugin_mgr.pre_trade(signal)
-                # TP/SL
-                tp, sl, sl_meta = await self.tp_sl_plugin.compute(
-                    symbol=signal["symbol"],
+                tp, sl, _ = await self.tp_sl_plugin.compute(
+                    symbol=signal.get("symbol", ""),
                     entry_price=signal.get("entry_price", 0),
                     alpha_signal=signal,
-                    mode=signal.get("mode","live"),
+                    mode=signal.get("mode", "live"),
                     user=user_id,
                 )
-                signal.update({"tp":tp, "sl":sl})
-                # Choose RPC
+                signal.update({"tp": tp, "sl": sl})
+
                 rpc = await self._choose_rpc(signal)
-                # Route execution via plugin (e.g. phantom)
-                router = self.plugin_mgr.get_router("phantom")
-                result = await router(signal=signal, rpc_url=rpc)
-                # Post-trade feedback
-                await self.tp_sl_plugin.compute  # ensure any side-effects
-                # RL reward
+                router_fn = self.plugin_mgr.get_router("phantom")
+                result = await router_fn(signal=signal, rpc_url=rpc)
+
                 await self.rl_trader.reward(signal, result)
-                # Trade logging
+
                 result.update({
                     "audit_hash": _execution_hash(signal, result),
                     "trace_id": signal["trace_id"],
+                    "status": "success"
                 })
-                await log_trade(
-                    symbol=signal["symbol"],
-                    side=signal["side"],
-                    size=signal["size"],
+
+                asyncio.create_task(log_trade(
+                    symbol=signal.get("symbol", ""),
+                    side=signal.get("side", ""),
+                    size=signal.get("size", 0),
                     entry=result.get("entry_price"),
                     exit=result.get("exit_price"),
                     pnl=result.get("pnl"),
                     user=user_id,
-                )
-                # Notify and fire events
-                await fire_plugin_event("trade_success", {"signal":signal,"result":result})
-                return result
+                ))
+
+                await fire_plugin_event("trade_success", {"signal": signal, "result": result})
+                EXEC_RESULT = result
+
             except Exception as e:
                 RPC_ERRORS.inc()
                 EXEC_DLQ.inc()
-                failed = {"signal":signal,"error":str(e),"user_id":user_id}
+                failed = {"signal": signal, "error": str(e), "user_id": user_id}
                 FAILED_EXEC_DLQ.append(failed)
                 await fire_plugin_event("trade_failed", failed)
-                return {"status":"failed","error":str(e),"trace_id": signal.get("trace_id")}
+                EXEC_RESULT = {"status": "failed", "error": str(e), "trace_id": signal.get("trace_id")}
 
-# alias for hooks
+            return EXEC_RESULT
+
+# Alias for external hooks
 register_execution_router_hook = fire_plugin_event
-
-# Before calling plugin, check if TP/SL are already set (from upstream signal generator)
-if "tp" not in signal or "sl" not in signal:
-    tp, sl, sl_meta = await self.tp_sl_plugin.compute(
-        symbol=signal["symbol"],
-        entry_price=signal.get("entry_price", 0),
-        alpha_signal=signal,
-        mode=signal.get("mode","live"),
-        user=user_id,
-    )
-    signal.update({"tp": tp, "sl": sl})
