@@ -19,8 +19,8 @@ from solders.pubkey import Pubkey  # correct, no change needed
 from solana.rpc.async_api import AsyncClient  # correct, no change needed
 from solders.transaction import Transaction  # <--- PATCH: use solders, not solana
 
-from utils.config import Config
-from utils.plugin_manager import fire_plugin_event
+from core.utils.config import Config
+from core.utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.onchain_flows")
 logger.setLevel(logging.INFO)
