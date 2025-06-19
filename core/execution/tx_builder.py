@@ -1,4 +1,3 @@
-# core/execution/tx_builder.py
 """
 Nova Pulse – TX Builder Elite (Jupiter/Phantom + Double Audit Failsafe)
 """
