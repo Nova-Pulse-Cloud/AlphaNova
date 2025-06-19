@@ -22,8 +22,8 @@ import openai
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
-from utils.config import Config
-from utils.plugin_manager import fire_plugin_event
+from core.utils.config import Config
+from core.utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.social_divergence_detector")
 logger.setLevel(logging.INFO)
