@@ -21,7 +21,6 @@ from core.data_collection.orderbook_overlay import OrderBookOverlay, get_orderbo
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.token_auditor import TokenAuditor
 from core.utils.token_guardian import check_guardian
-from core.utils.risk_signals import rug_pull_signal
 from core.agents.adaptive_tp_sl import AdaptiveTPSL
 
 logger = logging.getLogger("nova.alpha_signal_agent")
