@@ -1,4 +1,3 @@
-# core/execution/unified_trade_executor.py
 """
 -------------------------------------------------------------------------------
 World‑class unified execution pipeline:
@@ -100,7 +99,7 @@ class UnifiedTradeExecutor:
                 # ③ Routing & Execution
                 # ----------------------------------------------------------------
                 try:
-                    tx = await self.plugins.get_router(signal.get("dex", "phantom"))(
+                    tx = await self.plugins.get_router(signal.get("dex", "phantom"))(  # type: ignore
                         signal, self.cfg.HELIUS_RPC
                     )
                 except Exception as router_exc:
@@ -156,7 +155,6 @@ class UnifiedTradeExecutor:
 # ────────────────────────────────────────────────────────────
 # Factory Function (Example)
 # ────────────────────────────────────────────────────────────
-# To use in main_service or as a dependency:
 def create_unified_trade_executor(cfg: Config) -> UnifiedTradeExecutor:
     return UnifiedTradeExecutor(
         config=cfg,
