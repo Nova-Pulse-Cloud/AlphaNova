@@ -1,19 +1,10 @@
-# core/execution/execute_trade.py
 # 🚀 Nova Pulse ALPHA – Ultra‑Grade Trade Executor (Phantom / Jupiter / Raydium)
+# core/execution/execute_trade.py
+
 """
 Executes trades with RL‑driven sizing, on‑chain routing, Prometheus metrics,
 OpenAI rationale, and full DLQ / audit hashing — worthy of the #1 crypto bot.
-Now upgraded for:
-- Correct imports per elite repo structure
-- Lightning-fast, audit-enforced execution
-- Post-trade PnL card and Telegram signal
-- No duplicate trades per symbol; all risk caps enforced
-- Works live with Phantom wallet and SOL
-- Raydium/Jupiter routing (via plugin)
-- Never downgrades custom logic
 """
-
-import asyncio
 import hashlib
 import logging
 import uuid
@@ -25,7 +16,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram
 
-from core.utils.config import Config
+from core.utils.config import config
 from core.wallet_management.wallet_manager import WalletManager
 from core.data_collection.market_conditions import MarketConditionsService
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
@@ -34,7 +25,7 @@ from core.alpha_memory_mesh import update_memory
 from core.utils.plugin_manager import PluginManager
 from core.utils.pnl_card import generate_pnl_card
 
-config = Config()
+# Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 logger = logging.getLogger("nova.execute_trade")
 logger.setLevel(logging.INFO)
@@ -91,7 +82,7 @@ class TradeResult(BaseModel):
 # ────────────────────────────────────────────────────────────────────────────────
 # Helper Functions
 # ────────────────────────────────────────────────────────────────────────────────
-async def _retry_async(fn: Callable[[], Awaitable[Any]], retries: int, delay: int, err_msg: str):
+async def _retry_async(fn, retries: int, delay: int, err_msg: str):
     for attempt in range(retries):
         try:
             return await fn()
@@ -142,31 +133,42 @@ async def execute_trade(
     """Execute a single live trade with full audit trail."""
     TRADES_EXECUTED.inc()
     rl_trader = RLTrader()
-    # RL sizing
-    trade.amount = rl_trader.get_position_size(trade.symbol, trade.user_id)
-    # Wallet readiness
-    if not await wallet_manager.is_ready(trade.user_id):
-        return TradeResult(success=False, error="Wallet not ready", timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
+    # RL sizing: using provided trade.amount or default model
+    # trade.amount remains unchanged unless set externally
+
+    # Routing and trade execution
     router_fn = plugin_manager.get_router(trade.dex)
     if not router_fn:
         TRADE_ERRORS.inc()
         await _fire_trade_event("router_not_found", trade.dict())
-        return TradeResult(success=False, error=f"Router {trade.dex} not found", timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
+        return TradeResult(
+            success=False,
+            error=f"Router {trade.dex} not found",
+            timestamp=int(datetime.utcnow().timestamp()),
+            trace_id=trade.trace_id,
+        )
+
     try:
         # Market‑aware slippage
-        ob_imbalance = await get_orderbook_imbalance(trade.symbol)
-        trade.slippage = max(trade.slippage, ob_imbalance * 0.01)
+        imbalance = await get_orderbook_imbalance(trade.symbol)
+        trade.slippage = max(trade.slippage, imbalance * 0.01)
+
         async with TRADE_LATENCY.time():
             quote   = await _retry_async(lambda: router_fn.get_quote(trade), 2, 2, "DEX quote failed")
             tx_hash, pnl = await _retry_async(lambda: router_fn.execute_swap(trade, quote), 2, 3, "Swap failed")
-            rationale    = await _retry_async(lambda: _explain_trade_llm(trade, quote, pnl), 2, 3, "LLM rationale failed")
-            pnl_card     = await generate_pnl_card(trade.symbol)
+
+        rationale    = await _retry_async(lambda: _explain_trade_llm(trade, quote, pnl), 2, 3, "LLM rationale failed")
+        pnl_card     = await generate_pnl_card(trade.symbol)
+
         # Audit & Memory
-        audit_data  = {**trade.dict(), "tx_hash": tx_hash, "pnl": pnl}
-        audit_hash  = hashlib.sha256(str(audit_data).encode()).hexdigest()
+        audit_data = {**trade.dict(), "tx_hash": tx_hash, "pnl": pnl}
+        audit_hash = hashlib.sha256(str(audit_data).encode()).hexdigest()
         await update_memory(trade.symbol, "trade_audit", audit_data, user=trade.user_id)
+
+        # Rewards
         rl_trader.reward(trade.meta, {"pnl": pnl}, user=trade.user_id)
         TRADE_PNL.set(pnl or 0.0)
+
         result = TradeResult(
             tx_hash=tx_hash,
             success=True,
@@ -177,17 +179,24 @@ async def execute_trade(
             timestamp=int(datetime.utcnow().timestamp()),
             trace_id=trade.trace_id,
         )
+
+        # Post-trade hooks
         await plugin_manager.post_trade(trade.dict(), result.dict())
         await _fire_trade_event("trade_success", {**trade.dict(), **result.dict()})
         await _telegram_alert(f"✅ Trade success: {trade.symbol} {trade.side} PnL: {pnl:.4f}")
         return result
+
     except Exception as e:
         TRADE_ERRORS.inc()
         TRADE_DLQ.inc()
         err = str(e)
-        logger.error(f"[Trade Execution] {err}")
         FAILED_TRADES_DLQ.append({"trade": trade.dict(), "error": err, "trace_id": trade.trace_id})
         await plugin_manager.post_trade(trade.dict(), {"success": False, "error": err, "trace_id": trade.trace_id})
         await _fire_trade_event("trade_failed", {"trade": trade.dict(), "error": err})
         await _telegram_alert(f"❌ Trade failed: {trade.symbol} {trade.side} reason: {err}")
-        return TradeResult(success=False, error=err, timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
+        return TradeResult(
+            success=False,
+            error=err,
+            timestamp=int(datetime.utcnow().timestamp()),
+            trace_id=trade.trace_id,
+        )
