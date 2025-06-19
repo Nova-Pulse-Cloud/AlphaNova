@@ -1,44 +1,61 @@
-setuptools
-wheel
+# Core framework
 fastapi
 uvicorn[standard]
-apscheduler
-aiogram
-aiohttp
+
+# Async tooling
 aiofiles
-magic-filter
-httpx
-redis
+aiohttp
 aiocache
-openai
-scikit-learn
+aiogram
+apscheduler
+httpx
+python-multipart
+
+# Data science & ML
 joblib
-tqdm
 numpy
 pandas
-matplotlib
-pillow
-requests
-ujson
-msgpack
-wrapt
-zipp
-solana
-solders
+pandas-ta
+scikit-learn
+tqdm
+
+# Crypto & blockchain
 anchorpy
 base58
-pandas-ta
-prometheus-client
-opentelemetry-sdk
-opentelemetry-instrumentation
-opentelemetry-instrumentation-fastapi
-opentelemetry-instrumentation-asgi
-opentelemetry-util-http
-opentelemetry-semantic-conventions
+solana
+solders
+
+# Caching & messaging
+redis
+
+# HTTP & serialization
+magic-filter
+msgpack
+requests
+ujson
+wrapt
+zipp
+
+# Observability
 opentelemetry-exporter-jaeger
-deprecated
+opentelemetry-instrumentation
+opentelemetry-instrumentation-asgi
+opentelemetry-instrumentation-fastapi
+opentelemetry-sdk
+opentelemetry-semantic-conventions
+opentelemetry-util-http
+prometheus-client
+
+# AI & utilities
+openai
+pillow
+scikit-learn
 tenacity
-python-multipart
-asgiref
-pydantic             
-pydantic-settings     
+
+# Config & settings
+pydantic
+pydantic-settings
+
+# Packaging / build tools
+setuptools>
+wheel>
