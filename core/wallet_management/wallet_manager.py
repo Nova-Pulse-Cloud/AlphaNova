@@ -1,4 +1,3 @@
-```python
 # core/wallet_management/wallet_manager.py
 
 from __future__ import annotations
