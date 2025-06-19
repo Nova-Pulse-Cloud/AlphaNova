@@ -11,6 +11,7 @@ Nova Pulse ALPHA – SL/TP Watchdog 2.0 (Nuclear Version)
 """
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field, ValidationError
@@ -26,16 +27,16 @@ from core.utils.plugin_manager import fire_plugin_event
 logger = logging.getLogger("nova.sl_watchdog")
 logger.setLevel(logging.INFO)
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Prometheus Metrics
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 SL_WATCHDOG_ERRORS  = Counter("sl_watchdog_errors_total", "SL Watchdog errors")
 SL_WATCHDOG_HITS    = Counter("sl_watchdog_hits_total", "TP/SL hit events")
 SL_WATCHDOG_LATENCY = Histogram("sl_watchdog_latency_seconds", "SL/TP watch latency")
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Data Models
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 class OpenTrade(BaseModel):
     id: str
     symbol: str
@@ -47,9 +48,9 @@ class OpenTrade(BaseModel):
     size: float = Field(..., ge=0)
     status: str = "open"  # pending/closed tracking
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Watchdog Implementation
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 class SLWatchdog:
     def __init__(
         self,
@@ -80,7 +81,9 @@ class SLWatchdog:
 
     async def _monitor_all(self) -> None:
         try:
-            open_trades_raw = await self.trade_memory.get_open_trades()
+            # Retrieve open trades from memory
+            history = await asyncio.get_event_loop().run_in_executor(None, self.trade_memory.get_history)
+            open_trades_raw = [t for t in history if t.get("exit", 0) == 0]
             tasks = [self._monitor_trade(t) for t in open_trades_raw]
             await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
@@ -95,11 +98,10 @@ class SLWatchdog:
             logger.error(f"[SLWatchdog] Invalid trade record: {ve}")
             return
 
-        start = asyncio.get_event_loop().time()
-        current = None
+        start_time = asyncio.get_event_loop().time()
         try:
-            price = await self.pricing.fetch_price(trade.symbol)
-            current = price.price
+            price_data = await self.pricing.fetch_price(trade.symbol)
+            current = price_data.price
         except Exception as e:
             SL_WATCHDOG_ERRORS.inc()
             logger.error(f"[SLWatchdog] Price fetch error for {trade.symbol}: {e}")
@@ -122,7 +124,22 @@ class SLWatchdog:
             SL_WATCHDOG_HITS.inc()
 
             # Mark trade as pending close in memory
-            await self.trade_memory.mark_trade_pending(trade.id)
+            await asyncio.get_event_loop().run_in_executor(None, self.trade_memory.mark_trade_pending, trade.id)
+
+            # Fire event for TP/SL trigger
+            await fire_plugin_event("sl_tp_triggered", {
+                "trade_id": trade.id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "trigger": reason,
+                "entry": trade.entry,
+                "tp": trade.tp,
+                "sl": trade.sl,
+                "current": current,
+                "user": trade.user,
+            })
+
+            # Execute close
             close_signal = {
                 "symbol": trade.symbol,
                 "side": "sell" if trade.side == "buy" else "buy",
@@ -136,33 +153,25 @@ class SLWatchdog:
                 "user": trade.user,
                 "trade_id": trade.id,
             }
-            await fire_plugin_event("sl_tp_triggered", {
-                "trade_id": trade.id,
-                "symbol": trade.symbol,
-                "side": trade.side,
-                "trigger": reason,
-                "entry": trade.entry,
-                "tp": trade.tp,
-                "sl": trade.sl,
-                "current": current,
-                "user": trade.user,
-            })
-            # Execute close: pass close_signal with all context!
             close_result = await self.execution_router.execute_trade(close_signal, user_id=trade.user)
-            # Mark as closed in memory, log with TP/SL and exit
-            await self.trade_memory.mark_trade_closed(
-                trade.id,
-                close_price=current,
-                close_reason=reason,
-                tp=trade.tp,
-                sl=trade.sl,
-                pnl=(current - trade.entry) * (trade.size if trade.side == "buy" else -trade.size)
-            )
-        SL_WATCHDOG_LATENCY.observe(asyncio.get_event_loop().time() - start)
 
-# ────────────────────────────────────────────────────────────────────────────────
+            # Mark as closed in memory
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                self.trade_memory.mark_trade_closed,
+                trade.id,
+                current,
+                reason,
+                trade.tp,
+                trade.sl,
+                (current - trade.entry) * (trade.size if trade.side == "buy" else -trade.size)
+            )
+
+        SL_WATCHDOG_LATENCY.observe(asyncio.get_event_loop().time() - start_time)
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Factory & Singleton
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 watchdog = SLWatchdog(
     wallet_manager=WalletManager(),
