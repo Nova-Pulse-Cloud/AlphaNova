@@ -16,21 +16,23 @@ services:
         from_secret: SOL_ADDRESS
       - key: REDIS_URL
         from_secret: REDIS_URL
+      - key: OPENAI_API_KEY
+        from_secret: OPENAI_API_KEY
+      - key: MACRO_API_URL
+        from_secret: MACRO_API_URL
+      - key: MACRO_API_KEY
+        from_secret: MACRO_API_KEY
       - key: HELIUS_RPC
         from_secret: HELIUS_RPC
       - key: HELIUS_API_KEY
         from_secret: HELIUS_API_KEY
+      - key: GECKO_API_URL
+        from_secret: GECKO_API_URL
+      - key: ETHERSCAN_API_KEY
+        from_secret: ETHERSCAN_API_KEY
       - key: CMC_API_KEY
         from_secret: CMC_API_KEY
-      - key: OPENAI_API_KEY
-        from_secret: OPENAI_API_KEY
       - key: WEBHOOK_URL
         from_secret: WEBHOOK_URL
       - key: TWITTER_BEARER_TOKEN
         from_secret: TWITTER_BEARER_TOKEN
-      - key: METRICS_PORT
-        value: "8001"
-      - key: JAEGER_HOST
-        value: "localhost"
-      - key: JAEGER_PORT
-        value: "6831"
