@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import time
+import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import redis.asyncio as redis_async  # Modern Redis (no aioredis)
@@ -21,8 +22,8 @@ import openai
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
-from utils.config import Config
-from utils.plugin_manager import fire_plugin_event
+from core.utils.config import config
+from core.utils.plugin_manager import fire_plugin_event
 
 logger = logging.getLogger("nova.social_sentiment")
 logger.setLevel(logging.INFO)
@@ -88,17 +89,17 @@ class SocialSentiment:
     """Live sentiment processor – subscribes, scores, publishes."""
 
     # High-confidence threshold | allow override via env
-    SCORE_THRESHOLD = float(Config()._get_env("SENTIMENT_ALERT_THRESHOLD", "0.7"))
+    SCORE_THRESHOLD = float(os.getenv("SENTIMENT_ALERT_THRESHOLD", "0.7"))
 
     def __init__(
         self,
-        cfg: Optional[Config] = None,
+        cfg: Optional[type(config)] = None,
         *,
         in_channel: str = "sentiment_signals",
         out_channel: str = "sentiment_alerts",
         cache_ttl: int = 900,
     ) -> None:
-        self.cfg = cfg or Config()
+        self.cfg = cfg or config
         self.redis_url = self.cfg.REDIS_URL
         self.in_channel = in_channel
         self.out_channel = out_channel
