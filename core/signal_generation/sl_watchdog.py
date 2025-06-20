@@ -1,5 +1,3 @@
-# core/signal_generation/sl_watchdog.py
-
 """
 Nova Pulse ALPHA – SL/TP Watchdog 2.0 (Nuclear Version)
 ────────────────────────────────────────
@@ -11,10 +9,9 @@ Nova Pulse ALPHA – SL/TP Watchdog 2.0 (Nuclear Version)
 • Graceful shutdown and DLQ for failure replay
 • Now: event firing, closed/pending memory marking, full audit trail logging
 """
-
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from pydantic import BaseModel, Field, ValidationError
 from prometheus_client import Counter, Histogram
@@ -44,11 +41,11 @@ class OpenTrade(BaseModel):
     symbol: str
     side: str
     entry: float = Field(..., ge=0)
-    tp: float    = Field(..., ge=0)
-    sl: float    = Field(..., ge=0)
+    tp: float = Field(..., ge=0)
+    sl: float = Field(..., ge=0)
     user: str
-    size: float  = Field(..., ge=0)
-    status: str  = "open"  # pending/closed tracking
+    size: float = Field(..., ge=0)
+    status: str = "open"  # pending/closed tracking
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Watchdog Implementation
@@ -59,7 +56,7 @@ class SLWatchdog:
         wallet_manager: WalletManager,
         trade_memory: TradeMemory,
         execution_router: ExecutionRouter,
-        poll_interval: Optional[int] = None
+        poll_interval: int = None
     ):
         self.wallet_manager    = wallet_manager
         self.trade_memory      = trade_memory
@@ -71,7 +68,7 @@ class SLWatchdog:
     async def start(self) -> None:
         await self.pricing.connect()
         self._running = True
-        logger.info("🛡️ SL/TP Watchdog started, polling every %s seconds", self.poll_interval)
+        logger.info("🛡️ SL/TP Watchdog started — polling every %s seconds", self.poll_interval)
         while self._running:
             await self._monitor_all()
             await asyncio.sleep(self.poll_interval)
@@ -83,7 +80,9 @@ class SLWatchdog:
 
     async def _monitor_all(self) -> None:
         try:
-            history = await asyncio.get_event_loop().run_in_executor(None, self.trade_memory.get_history)
+            history = await asyncio.get_event_loop().run_in_executor(
+                None, self.trade_memory.get_history
+            )
             open_trades = [t for t in history if t.get("exit", 0) == 0]
             await asyncio.gather(*(self._monitor_trade(t) for t in open_trades), return_exceptions=True)
         except Exception as e:
@@ -112,20 +111,26 @@ class SLWatchdog:
             f"TP={trade.tp} SL={trade.sl} cur={current} user={trade.user} size={trade.size}"
         )
 
-        hit_tp = (trade.side == "buy" and current >= trade.tp) or \
-                 (trade.side == "sell" and current <= trade.tp)
-        hit_sl = (trade.side == "buy" and current <= trade.sl) or \
-                 (trade.side == "sell" and current >= trade.sl)
+        hit_tp = (trade.side == "buy"  and current >= trade.tp) \
+              or (trade.side == "sell" and current <= trade.tp)
+        hit_sl = (trade.side == "buy"  and current <= trade.sl) \
+              or (trade.side == "sell" and current >= trade.sl)
 
+        # skip already-handled
         if trade.status in ("closed", "pending"):
             return
 
         if hit_tp or hit_sl:
             reason = "tp" if hit_tp else "sl"
             SL_WATCHDOG_HITS.inc()
+            logger.info(f"[SLWatchdog] {reason.upper()} hit for {trade.symbol} at {current}")
+
+            # mark pending
             await asyncio.get_event_loop().run_in_executor(
                 None, self.trade_memory.mark_trade_pending, trade.id
             )
+
+            # fire plugin event
             await fire_plugin_event("sl_tp_triggered", {
                 "trade_id": trade.id,
                 "symbol":   trade.symbol,
@@ -138,21 +143,23 @@ class SLWatchdog:
                 "user":     trade.user,
             })
 
-            close_signal = {
-                "symbol":    trade.symbol,
-                "side":      "sell" if trade.side == "buy" else "buy",
-                "size":      trade.size,
-                "auto_close":True,
-                "reason":    reason,
-                "price":     current,
-                "entry":     trade.entry,
-                "tp":        trade.tp,
-                "sl":        trade.sl,
-                "user":      trade.user,
-                "trade_id":  trade.id,
+            # execute auto-close
+            close_sig = {
+                "symbol":   trade.symbol,
+                "side":     "sell" if trade.side == "buy" else "buy",
+                "size":     trade.size,
+                "auto_close": True,
+                "reason":   reason,
+                "price":    current,
+                "entry":    trade.entry,
+                "tp":       trade.tp,
+                "sl":       trade.sl,
+                "user":     trade.user,
+                "trade_id": trade.id,
             }
-            await self.execution_router.execute_trade(close_signal, user_id=trade.user)
+            await self.execution_router.execute_trade(close_sig, user_id=trade.user)
 
+            # finally mark closed
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 self.trade_memory.mark_trade_closed,
@@ -167,21 +174,18 @@ class SLWatchdog:
         SL_WATCHDOG_LATENCY.observe(asyncio.get_event_loop().time() - start_ts)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Singleton & Entrypoint
+# Entry point expected by main_service.py
 # ───────────────────────────────────────────────────────────────────────────────
-_wallet_mgr = WalletManager()
-_router     = ExecutionRouter(wallet_manager=_wallet_mgr, rpc_nodes=[config.HELIUS_RPC])
-_watchdog   = SLWatchdog(
-    wallet_manager=   _wallet_mgr,
-    trade_memory=     TradeMemory(config),
-    execution_router= _router,
-    poll_interval=    int(getattr(config, "SL_WATCHDOG_INTERVAL", 5))
-)
-
-async def start_sl_watchdog() -> None:
+async def start_sl_watchdog(
+    wallet_manager: WalletManager,
+    trade_memory: TradeMemory,
+    execution_router: ExecutionRouter,
+    poll_interval: int = None
+) -> None:
     """
-    Entrypoint to kick off the SL/TP watchdog loop on startup.
+    Launches the SL/TP watchdog loop.
+    Used in main_service.py as:
+        asyncio.create_task(start_sl_watchdog(wallet_manager, trade_memory, execution_router))
     """
-    asyncio.create_task(_watchdog.start())
-
-__all__ = ["start_sl_watchdog"]
+    watchdog = SLWatchdog(wallet_manager, trade_memory, execution_router, poll_interval)
+    await watchdog.start()
