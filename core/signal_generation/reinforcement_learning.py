@@ -1,7 +1,7 @@
 # core/signal_generation/reinforcement_learning.py
 """
 Nova Pulse ALPHA — Reinforcement-Learning Engine 2.0
-────────────────────────────────────────────────────────────────────
+───────────────────────────────────────────────────────────────
 • Single async façade `RLTrader.act` with per-strategy timeouts
 • Pydantic validation of strategy outputs for safety
 • Prometheus metrics labeled by strategy: actions, errors, latency
@@ -88,7 +88,7 @@ class RLTrader:
 
     @classmethod
     def register_strategy(cls, name: str) -> Callable:
-        def decorator(fn: Callable[["RLTrader", Dict[str, Any]], Awaitable[Dict[str, Any]]] ):
+        def decorator(fn: Callable[["RLTrader", Dict[str, Any]], Awaitable[Dict[str, Any]]]):
             cls._strategies[name] = fn
             logger.info(f"[RL] Strategy registered → {name}")
             return fn
@@ -171,3 +171,6 @@ async def _basic_strategy(trader: RLTrader, ctx: Dict[str, Any]) -> Dict[str, An
     if score <= -0.4:
         return {"action": "sell", "size": size}
     return {"action": "hold", "size": 0.0}
+
+# Alias for backward-compatibility / CombinedSignalEngine
+DQNAgent = RLTrader
