@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from solana.rpc.async_api import AsyncClient
-from solders.keypair import Keypair
-from solders.transaction import Transaction
+from solana.keypair import Keypair
+from solana.transaction import Transaction as SolanaTransaction
 from prometheus_client import Counter, Histogram
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -21,11 +21,21 @@ logger = logging.getLogger("nova.wallet_manager")
 logger.setLevel(logging.INFO)
 
 # Metrics
-WALLET_TX_COUNT         = Counter("wallet_tx_count", "Total transactions signed and sent by wallet")
-WALLET_TX_FAILS         = Counter("wallet_tx_failures", "Number of failed wallet transactions")
-WALLET_TX_LATENCY       = Histogram("wallet_tx_latency_seconds", "Latency of wallet transaction confirmations")
-WALLET_TX_CONFIRMS      = Counter("wallet_tx_confirm_success", "Successful transaction confirmations")
-WALLET_TX_CONFIRM_FAILS = Counter("wallet_tx_confirm_failures", "Failed transaction confirmations")
+WALLET_TX_COUNT = Counter(
+    "wallet_tx_count", "Total transactions signed and sent by wallet"
+)
+WALLET_TX_FAILS = Counter(
+    "wallet_tx_failures", "Number of failed wallet transactions"
+)
+WALLET_TX_LATENCY = Histogram(
+    "wallet_tx_latency_seconds", "Latency of wallet transaction confirmations"
+)
+WALLET_TX_CONFIRMS = Counter(
+    "wallet_tx_confirm_success", "Successful transaction confirmations"
+)
+WALLET_TX_CONFIRM_FAILS = Counter(
+    "wallet_tx_confirm_failures", "Failed transaction confirmations"
+)
 
 class WalletEntry:
     def __init__(
@@ -36,7 +46,7 @@ class WalletEntry:
     ) -> None:
         self.chain = chain
         self.keypair = keypair
-        self.pubkey = keypair.pubkey()
+        self.pubkey = keypair.public_key
         self.label = label or f"{chain}-wallet"
 
     def summary(self) -> Dict[str, str]:
@@ -56,7 +66,6 @@ class WalletManager:
         self._init_wallet()
 
     def _init_wallet(self) -> None:
-        # Load secret key array (either path or direct list)
         secret = self.config.SOL_PRIVATE_KEY
         if isinstance(secret, str):
             with open(secret, "r") as f:
@@ -64,10 +73,12 @@ class WalletManager:
         else:
             secret_list = secret
 
-        # solders.Keypair expects raw bytes via from_bytes()
-        keypair = Keypair.from_bytes(bytes(secret_list))
+        # load via solana-py Keypair
+        raw = bytes(secret_list)
+        keypair = Keypair.from_secret_key(raw)
+
         self.wallets["solana"] = WalletEntry("solana", keypair, label="primary")
-        logger.info("[WalletManager] Initialized Solana wallet: %s", keypair.pubkey())
+        logger.info("[WalletManager] Initialized Solana wallet: %s", keypair.public_key)
 
     def get_wallet(self, chain: str = "solana") -> WalletEntry:
         if chain not in self.wallets:
@@ -83,14 +94,9 @@ class WalletManager:
         *,
         user_id: Optional[str] = None
     ) -> Tuple[str, float]:
-        """
-        Executes a Jupiter swap: fetches transaction, signs, broadcasts,
-        confirms on-chain, and tracks PnL.
-        """
         wallet = self.get_wallet()
         swap_url = self.config.JUPITER_SWAP_ENDPOINT
 
-        # Retry logic for network robustness
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -112,12 +118,10 @@ class WalletManager:
                     raise RuntimeError("Jupiter API did not return a swapTransaction blob")
 
         try:
-            # Deserialize and sign transaction
             raw_tx = base64.b64decode(tx_b64)
-            tx = Transaction.deserialize(raw_tx)
+            tx = SolanaTransaction.deserialize(raw_tx)
             tx.sign([wallet.keypair])
 
-            # Broadcast with metrics
             with WALLET_TX_LATENCY.time():
                 async with self._lock:
                     async with AsyncClient(self.config.HELIUS_RPC) as client:
@@ -138,7 +142,6 @@ class WalletManager:
                 signature
             )
 
-            # Track PnL asynchronously via TradeMemory
             in_amt = quote.get("inAmount", 0) / 1e9
             out_amt = quote.get("outAmount", 0) / 1e9
             await asyncio.get_running_loop().run_in_executor(
