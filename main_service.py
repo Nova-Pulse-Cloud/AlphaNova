@@ -34,7 +34,7 @@ from core.signal_generation.sl_watchdog import start_sl_watchdog
 from core.utils.plugin_manager import PluginManager as CorePluginManager
 from core.ws_endpoint import ws_manager, websocket_endpoint
 from core.signal_generation.rl_trainer_loop import RLTrainerLoop
-from core.auto_trader import AutoTrader
+from core.execution.execute_trade import AutoTrader
 from core.social.helius import register_helius_webhook
 from core.utils.token_auditor import TokenAuditor
 from core.utils.token_guardian import TokenGuardian
