@@ -32,11 +32,11 @@ logger.setLevel(logging.INFO)
 # Prometheus metrics
 # ───────────────────────────────────────────────────────────────────────────────
 SENTIMENT_PAYLOADS = Counter("sentiment_payloads_total", "Payloads processed")
-SENTIMENT_ALERTS  = Counter("sentiment_alerts_total", "High-confidence alerts emitted")
-SENTIMENT_ERRORS  = Counter("sentiment_errors_total", "Processing errors")
-SENTIMENT_LATENCY = Histogram("sentiment_latency_seconds", "End-to-end latency")
-SENTIMENT_CAP_LAT = Histogram("sentiment_caption_latency_seconds", "OpenAI caption latency")
-SENTIMENT_DLQ     = Counter("sentiment_dlq_total", "Emission failures (DLQ)")
+SENTIMENT_ALERTS   = Counter("sentiment_alerts_total", "High-confidence alerts emitted")
+SENTIMENT_ERRORS   = Counter("sentiment_errors_total", "Processing errors")
+SENTIMENT_LATENCY  = Histogram("sentiment_latency_seconds", "End-to-end latency")
+SENTIMENT_CAP_LAT  = Histogram("sentiment_caption_latency_seconds", "OpenAI caption latency")
+SENTIMENT_DLQ      = Counter("sentiment_dlq_total", "Emission failures (DLQ)")
 
 # ───────────────────────────────────────────────────────────────────────────────
 # In-memory DLQ (kept small – persisted elsewhere by DLQ manager)
@@ -88,7 +88,6 @@ class SentimentAlert(BaseModel):
 class SocialSentiment:
     """Live sentiment processor – subscribes, scores, publishes."""
 
-    # High-confidence threshold | allow override via env
     SCORE_THRESHOLD = float(os.getenv("SENTIMENT_ALERT_THRESHOLD", "0.7"))
 
     def __init__(
@@ -203,3 +202,19 @@ class SocialSentiment:
 
     def get_dlq(self):
         return list(_DLQ)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Convenience helpers for imports
+# ───────────────────────────────────────────────────────────────────────────────
+
+async def score_token_sentiment(symbol: str) -> float:
+    """Get a simple sentiment score for a token using the default plugin."""
+    ss = SocialSentiment()
+    # no live data, default data dict
+    return await ss._default_score({"social_score": 0, "news_score": 0, "onchain_score": 0}, False)
+
+async def get_live_narrative(symbol: str) -> str:
+    """Generate a live AI narrative caption for a token's sentiment."""
+    score = await score_token_sentiment(symbol)
+    ss = SocialSentiment()
+    return await ss._caption(symbol, score)
