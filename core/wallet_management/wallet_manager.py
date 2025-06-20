@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from solana.rpc.async_api import AsyncClient
-from solana.keypair import Keypair
-from solana.transaction import Transaction as SolanaTransaction
+from solders.keypair import Keypair
+from solders.transaction import Transaction as SolanaTransaction
 from prometheus_client import Counter, Histogram
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -46,7 +46,7 @@ class WalletEntry:
     ) -> None:
         self.chain = chain
         self.keypair = keypair
-        self.pubkey = keypair.public_key
+        self.pubkey = keypair.pubkey()
         self.label = label or f"{chain}-wallet"
 
     def summary(self) -> Dict[str, str]:
@@ -73,12 +73,10 @@ class WalletManager:
         else:
             secret_list = secret
 
-        # load via solana-py Keypair
         raw = bytes(secret_list)
-        keypair = Keypair.from_secret_key(raw)
-
+        keypair = Keypair.from_bytes(raw)
         self.wallets["solana"] = WalletEntry("solana", keypair, label="primary")
-        logger.info("[WalletManager] Initialized Solana wallet: %s", keypair.public_key)
+        logger.info("[WalletManager] Initialized Solana wallet: %s", keypair.pubkey())
 
     def get_wallet(self, chain: str = "solana") -> WalletEntry:
         if chain not in self.wallets:
