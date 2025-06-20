@@ -13,8 +13,7 @@ python-multipart
 
 # Data science & ML
 joblib
-numpy
-pandas
+numpy<1.25
 pandas-ta
 scikit-learn
 tqdm
