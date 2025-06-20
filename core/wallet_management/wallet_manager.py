@@ -73,8 +73,25 @@ class WalletManager:
         else:
             secret_list = secret
 
-        raw = bytes(secret_list)
-        keypair = Keypair.from_bytes(raw)
+        # Determine seed or full keypair
+        if isinstance(secret_list, list):
+            data = bytes(secret_list)
+            # full keypair json includes 64 bytes: first 32 seed, last 32 public
+            if len(data) == 64:
+                seed = data[:32]
+                keypair = Keypair.from_seed(seed)
+            elif len(data) == 32:
+                keypair = Keypair.from_seed(data)
+            else:
+                raise ValueError(f"Unexpected secret key length: {len(data)} bytes")
+        else:
+            # possibly base58 encoded string
+            try:
+                raw = base64.b64decode(secret)
+                keypair = Keypair.from_seed(raw[:32])
+            except Exception as e:
+                raise ValueError(f"Invalid SOL_PRIVATE_KEY format: {e}")
+
         self.wallets["solana"] = WalletEntry("solana", keypair, label="primary")
         logger.info("[WalletManager] Initialized Solana wallet: %s", keypair.pubkey())
 
