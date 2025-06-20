@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
-from solders.transaction import Transaction as SolanaTransaction
+from solders.transaction import Transaction
 from prometheus_client import Counter, Histogram
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -73,22 +73,22 @@ class WalletManager:
         else:
             secret_list = secret
 
-        # Determine seed or full keypair
+        # Load keypair from 32- or 64-byte array seed
         if isinstance(secret_list, list):
-            data = bytes(secret_list)
-            # full keypair json includes 64 bytes: first 32 seed, last 32 public
-            if len(data) == 64:
-                seed = data[:32]
-                keypair = Keypair.from_seed(seed)
-            elif len(data) == 32:
-                keypair = Keypair.from_seed(data)
+            key_bytes = bytes(secret_list)
+            if len(key_bytes) == 64:
+                seed = key_bytes[:32]
+            elif len(key_bytes) == 32:
+                seed = key_bytes
             else:
-                raise ValueError(f"Unexpected secret key length: {len(data)} bytes")
+                raise ValueError(f"Unexpected secret key length: {len(key_bytes)} bytes")
+            keypair = Keypair.from_seed(seed)
         else:
-            # possibly base58 encoded string
+            # if string, try base64 decode
             try:
                 raw = base64.b64decode(secret)
-                keypair = Keypair.from_seed(raw[:32])
+                seed = raw[:32]
+                keypair = Keypair.from_seed(seed)
             except Exception as e:
                 raise ValueError(f"Invalid SOL_PRIVATE_KEY format: {e}")
 
@@ -134,7 +134,7 @@ class WalletManager:
 
         try:
             raw_tx = base64.b64decode(tx_b64)
-            tx = SolanaTransaction.deserialize(raw_tx)
+            tx = Transaction.deserialize(raw_tx)
             tx.sign([wallet.keypair])
 
             with WALLET_TX_LATENCY.time():
