@@ -7,11 +7,11 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from prometheus_client import Counter, Gauge
 
-from core.utils.config import config
+from core.utils.config import config, Config
 
 logger = logging.getLogger("nova.trade_memory")
 logger.setLevel(logging.INFO)
@@ -43,8 +43,11 @@ class TradeMemory:
     Thread-safe in-memory cache plus persistent SQLite ledger for
     real trades with win-rate and PnL analytics, fully instrumented.
     """
-    def __init__(self, db_path: Optional[str] = None) -> None:
-        # Ensure db_path is always a Path object
+    def __init__(self, db_path: Optional[Union[str, Path, Config]] = None) -> None:
+        # Resolve db_path if passed a Config instance
+        if isinstance(db_path, Config):
+            db_path = getattr(db_path, "TRADE_MEMORY_DB_PATH", "trade_memory.db")
+        # Determine actual file path
         self._db_path = Path(db_path or getattr(config, "TRADE_MEMORY_DB_PATH", "trade_memory.db"))
         self._lock = threading.RLock()
         self._history: List[Dict[str, Any]] = []
@@ -128,7 +131,7 @@ class TradeMemory:
         trades = self.get_symbol_history(symbol)
         return trades[-1] if trades else {}
 
-    # Alias for consistency with other modules
+    # Alias for consistency
     def get_latest_trade(self, symbol: str) -> Dict[str, Any]:
         return self.latest_trade(symbol)
 
