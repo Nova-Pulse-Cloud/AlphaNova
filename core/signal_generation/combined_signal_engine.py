@@ -9,23 +9,22 @@ from typing import Any, Dict, List, Optional
 import openai
 import redis.asyncio as redis_async
 import numpy as np
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram, Gauge
 from solana.rpc.async_api import AsyncClient
 
-from core.signal_generation.reinforcement_tuner import ReinforcementTuner, DQNAgent
+from core.signal_generation.reinforcement_tuner import ReinforcementTuner  # no DQNAgent here
+from core.signal_generation.reinforcement_learning import DQNAgent  # correct source
 from core.data_collection.market_conditions import MarketConditionsService
 from core.data_collection.social_sentiment import score_token_sentiment, get_live_narrative
 from core.data_collection.whale_detector import get_recent_whale_activity
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from core.data_collection.onchain_flows import get_token_flow_stats
-from core.utils.token_utils import TokenUtils
 from core.utils.config import config
 from core.utils.trade_memory import TradeMemory
 from core.alpha_memory_mesh import update_memory, get_token_memory_score
-from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
 from core.utils.plugin_manager import fire_plugin_event
-from core.utils.token_utils import TokenUtils
+from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
 
 logger = logging.getLogger("nova.combined_signal_engine")
 logger.setLevel(logging.INFO)
@@ -43,7 +42,6 @@ SIG_ACTION   = Gauge("signal_action_gauge",       "RL action values", ["action"]
 # Redis & OpenAI Init
 # ────────────────────────────────────────────────────────────────────────────────
 redis_client: Optional[redis_async.Redis] = None
-
 async def get_redis() -> redis_async.Redis:
     global redis_client
     if not redis_client:
@@ -71,9 +69,6 @@ class AlphaSignal(BaseModel):
     provenance_hash: str
     timestamp: int
 
-# ────────────────────────────────────────────────────────────────────────────────
-# CombinedSignalEngine
-# ────────────────────────────────────────────────────────────────────────────────
 class CombinedSignalEngine:
     def __init__(
         self,
@@ -142,7 +137,7 @@ class CombinedSignalEngine:
 
             # 5) Adaptive TP/SL: **always present!**
             tp_sl = await self.adaptive_tp_sl.compute(symbol, entry, {
-                "score":score,
+                "score": score,
                 **ob_data,
                 **whale_data,
                 **flow_data
@@ -161,7 +156,7 @@ class CombinedSignalEngine:
                 sl=sl,
                 flavor=flavor,
                 trigger_sources=scores,
-                meta_features={"depth_adj":depth_adj, **whale_data, **tp_sl},
+                meta_features={"depth_adj": depth_adj, **whale_data, **tp_sl},
                 caption=caption,
                 provenance_hash=hashlib.sha256(prov.encode()).hexdigest(),
                 timestamp=int(start.timestamp()),
@@ -189,7 +184,7 @@ class CombinedSignalEngine:
                 "volatility": await self.market_svc.get_volatility(symbol),
                 "trend":      await self.market_svc.get_trend_strength(symbol),
                 "sentiment":  await score_token_sentiment(symbol),
-                "whale":      (await get_recent_whale_activity(symbol)).get("score",0),
+                "whale":      (await get_recent_whale_activity(symbol)).get("score", 0),
             }
 
             # RL action
@@ -199,13 +194,13 @@ class CombinedSignalEngine:
             SIG_ACTION.labels(action=str(action)).set(q_values[action])
 
             # Compose final package—**always TP/SL**
-            sig = await self.evaluate_alpha(symbol, [{"source":"rl_agent","score":q_values[action],"entry":overlays.get("volatility",0)}])
+            sig = await self.evaluate_alpha(symbol, [{"source": "rl_agent", "score": q_values[action], "entry": overlays.get("volatility", 0)}])
             result = sig.dict()
 
             # Auto-trade if enabled
             if user and await (await get_redis()).get(f"auto:{user}"):
                 from core.execution.execution_router import ExecutionRouter
-                router = ExecutionRouter(...)
+                router = ExecutionRouter()  # instantiate properly
                 asyncio.create_task(router.execute_trade(result, user))
 
             SIG_LATENCY.observe((datetime.utcnow() - start).total_seconds())
@@ -239,7 +234,7 @@ class CombinedSignalEngine:
 
 def combine_ensemble(comps: List[Any]) -> Dict[str, Any]:
     if not comps:
-        return {"signal_strength":0.0, "alert":False, "note":"No data"}
-    scores = [c[1].get("signal_strength",0) for c in comps]
+        return {"signal_strength": 0.0, "alert": False, "note": "No data"}
+    scores = [c[1].get("signal_strength", 0) for c in comps]
     avg = float(np.mean(scores))
-    return {"signal_strength":avg, "alert":avg>0.85, "note":"Ensemble"}
+    return {"signal_strength": avg, "alert": avg > 0.85, "note": "Ensemble"}
