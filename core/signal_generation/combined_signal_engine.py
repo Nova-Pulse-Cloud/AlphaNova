@@ -34,13 +34,8 @@ SIG_LATENCY  = Histogram("signal_latency_seconds","Composite signal latency")
 SIG_ALERTS   = Counter("signal_alerts_total",     "Alerts emitted")
 SIG_ACTION   = Gauge("signal_action_gauge",       "RL action values", ["action"])
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Redis & OpenAI Init for sentiment
-# ────────────────────────────────────────────────────────────────────────────────
+# instantiate shared sentiment processor
 _sentiment = SocialSentiment(config)
-# make sure Redis connection is ready somewhere in startup:
-#   await _sentiment.connect()
-
 
 class AlphaSignal(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -108,16 +103,19 @@ class CombinedSignalEngine:
             flow_task  = asyncio.create_task(get_token_flow_stats(symbol))
             ob, whale, flow = await asyncio.gather(ob_task, whale_task, flow_task)
 
-            # 3) Social sentiment score & narrative
-            sentiment_score = await _sentiment._default_score({"social_score": whale.get("social",0),
-                                                               "news_score": flow.get("news",0),
-                                                               "onchain_score": ob.get("imbalance_score",0)}, False)
+            # 3) Social sentiment fallback & narrative
+            sentiment_score = await _sentiment._default_score(
+                {"social_score": whale.get("social_score", 0),
+                 "news_score": flow.get("news_score", 0),
+                 "onchain_score": ob.get("imbalance_score", 0)},
+                False
+            )
             caption_narrative = await _sentiment._caption(symbol, sentiment_score)
 
             # 4) Composite score & risk
-            depth_adj = 1.0 - min(abs(ob.get("imbalance_score",0)), 1.0)
+            depth_adj = 1.0 - min(abs(ob.get("imbalance_score", 0.0)), 1.0)
             whale_adj = whale.get("score", 0.0)
-            composite = sum(scores.values()) / max(len(scores),1)
+            composite = sum(scores.values()) / max(len(scores), 1)
             score     = composite * (1 + whale_adj) * depth_adj
             risk      = 1 - min(trusts.values()) if trusts else 1.0
             entry     = float(agent_signals[0].get("entry", 0.0)) if agent_signals else 0.0
@@ -126,10 +124,10 @@ class CombinedSignalEngine:
 
             # 5) Adaptive TP/SL
             tp_sl = await self.adaptive_tp_sl.compute(symbol, entry, {
-                "volatility": ob.get("volatility",0.0),
-                "trend":      ob.get("trend",0.0),
-                "whale":      whale_adj,
-                "imbalance":  ob.get("imbalance_score",0.0),
+                "volatility":   ob.get("volatility", 0.0),
+                "trend_strength": ob.get("trend_strength", 0.0),
+                "whale_pressure": whale_adj,
+                "imbalance_score": ob.get("imbalance_score", 0.0),
             })
             tp = float(tp_sl["tp"])
             sl = float(tp_sl["sl"])
@@ -138,14 +136,14 @@ class CombinedSignalEngine:
             blob = f"{symbol}{scores}{flavor}{score}{risk}{entry}{tp}{sl}"
             sig = AlphaSignal(
                 symbol=symbol,
-                score=round(score,4),
-                risk=round(risk,4),
-                entry=round(entry,6),
+                score=round(score, 4),
+                risk=round(risk, 4),
+                entry=round(entry, 6),
                 tp=tp,
                 sl=sl,
                 flavor=flavor,
                 trigger_sources=scores,
-                meta_features={"depth_adj":depth_adj, **tp_sl, "sentiment_score": sentiment_score},
+                meta_features={"depth_adj": depth_adj, "sentiment_score": sentiment_score, **tp_sl},
                 caption=caption_narrative,
                 provenance_hash=hashlib.sha256(blob.encode()).hexdigest(),
                 timestamp=int(start.timestamp()),
@@ -166,17 +164,16 @@ class CombinedSignalEngine:
         user: Optional[str] = None
     ) -> Dict[str, Any]:
         try:
-            # Simple RL action on sentiment/context
+            # Basic RL action on sentiment
             overlays = {"sentiment": await _sentiment._default_score({"social_score":0,"news_score":0,"onchain_score":0}, False)}
-            agent   = RLTrader()
-            q_vals  = await agent.act(overlays)
-            action  = q_vals.action
-            SIG_ACTION.labels(action=str(action.action)).set(action.size)
+            agent    = RLTrader()
+            action   = await agent.act(overlays)
+            SIG_ACTION.labels(action=action.action).set(action.size)
 
             sig = await self.evaluate_alpha(symbol, [{"source":"rl_agent","score":action.size,"entry":overlays["sentiment"]}])
             result = sig.dict()
 
-            # auto-trade if user opted in
+            # auto-trade if enabled
             if user and await _sentiment._redis.get(f"auto:{user}") == "1":
                 from core.execution.execution_router import ExecutionRouter
                 router = ExecutionRouter(wallet_manager=self.trade_memory, rpc_nodes=[config.HELIUS_RPC])
@@ -188,6 +185,11 @@ class CombinedSignalEngine:
             SIG_ERRORS.inc()
             return {"error": str(e)}
 
-    def _choose_flavor(self, score: float, ctx: Optional[Dict[str,Any]]) -> str:
-        if ctx and ctx.get("risk") == "degen": return "Degen"
-        return "Safe" if score>0.8 else "Moderate" if score>0.3 else "Degen"
+    def _choose_flavor(self, score: float, ctx: Optional[Dict[str, Any]]) -> str:
+        if ctx and ctx.get("risk") == "degen":
+            return "Degen"
+        if score > 0.85:
+            return "Safe"
+        if score < 0.3:
+            return "Degen"
+        return "Moderate"
