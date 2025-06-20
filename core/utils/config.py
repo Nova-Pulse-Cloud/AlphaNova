@@ -3,16 +3,16 @@
 import os
 import json
 import re
-from typing import Any, Dict
+from typing import Any
 
-# Module-level constants
+# Legacy constants
 DEXSCREENER_URL = os.environ.get(
     "DEXSCREENER_URL",
     "https://api.dexscreener.com/latest/dex/tokens/"
 )
 PRICE_CHANGE_THRESHOLD = float(
     os.environ.get("PRICE_CHANGE_THRESHOLD", "0.02")
-)  # Legacy fallback only
+)
 
 class Config:
     """
@@ -35,13 +35,13 @@ class Config:
             return
         self._initialized = True
 
-        # HTTP client timeout for external API calls
+        # Timeouts
         try:
             self.HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
         except ValueError:
             raise ValueError("[Config] 'HTTP_TIMEOUT' must be an integer")
 
-        # Jupiter API endpoint for swap quotes
+        # Jupiter swap API
         self.JUPITER_SWAP_ENDPOINT = os.getenv(
             "JUPITER_SWAP_ENDPOINT",
             "https://quote-api.jup.ag/v6/swap"
@@ -71,16 +71,14 @@ class Config:
         self.MACRO_API_KEY        = self._require("MACRO_API_KEY")
         self.ETHERSCAN_API_KEY    = self._require("ETHERSCAN_API_KEY")
 
-        # Optional Jaeger tracing config (with defaults)
+        # Optional Jaeger tracing config
         self.JAEGER_HOST = os.getenv("JAEGER_HOST", "localhost")
         try:
             self.JAEGER_PORT = int(os.getenv("JAEGER_PORT", "6831"))
         except ValueError:
-            raise ValueError(
-                "[Config] Environment variable 'JAEGER_PORT' must be an integer."
-            )
+            raise ValueError("[Config] 'JAEGER_PORT' must be an integer.")
 
-        # Trade memory DB path (optional, with default)
+        # Trade-memory DB (fallback)
         self.TRADE_MEMORY_DB_PATH = os.getenv(
             "TRADE_MEMORY_DB_PATH",
             "trade_memory.db"
@@ -89,9 +87,7 @@ class Config:
     def _require(self, key: str) -> str:
         val = os.getenv(key)
         if not val:
-            raise EnvironmentError(
-                f"[Config] Missing required environment variable: '{key}'"
-            )
+            raise EnvironmentError(f"[Config] Missing required environment variable: '{key}'")
         return val
 
     def _require_int(self, key: str) -> int:
@@ -99,38 +95,27 @@ class Config:
         try:
             return int(val)
         except ValueError:
-            raise ValueError(
-                f"[Config] Environment variable '{key}' must be an integer, got '{val}'"
-            )
+            raise ValueError(f"[Config] '{key}' must be an integer, got '{val}'")
 
     def _load_json_secret(self, path: str) -> Any:
         if not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"[Config] Secret file not found: '{path}'"
-            )
+            raise FileNotFoundError(f"[Config] Secret file not found: '{path}'")
         try:
             with open(path, "r") as f:
                 return json.load(f)
         except json.JSONDecodeError:
-            raise ValueError(
-                f"[Config] Secret file at '{path}' is not valid JSON"
-            )
+            raise ValueError(f"[Config] Secret file at '{path}' is not valid JSON")
         except Exception as e:
-            raise RuntimeError(
-                f"[Config] Failed to load secret from '{path}': {e}"
-            )
+            raise RuntimeError(f"[Config] Failed to load secret from '{path}': {e}")
 
     def _validate_url(self, url: str, key: str) -> None:
         if not url.startswith(("https://", "http://")):
-            raise ValueError(
-                f"[Config] Invalid URL in '{key}': '{url}'"
-            )
+            raise ValueError(f"[Config] Invalid URL in '{key}': '{url}'")
 
     def _validate_base58(self, addr: str, key: str) -> None:
         if not self._BASE58_REGEX.match(addr):
-            raise ValueError(
-                f"[Config] Invalid base58 address in '{key}': '{addr}'"
-            )
+            raise ValueError(f"[Config] Invalid Base58 address in '{key}': '{addr}'")
+
 
 # Global singleton instance
 config = Config()
