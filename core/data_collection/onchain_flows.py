@@ -32,7 +32,7 @@ logger.setLevel(logging.INFO)
 OCF_TX_FETCH   = Counter("ocf_tx_fetch_total", "Transactions fetched")
 OCF_ERRORS     = Counter("ocf_errors_total", "On-chain-flow errors")
 OCF_LATENCY    = Histogram("ocf_latency_seconds", "RPC latency")
-OCF_WHALE_EVT  = Counter("ocf_whale_events_total", "Whale-size transfers detected")
+OCF_WH A LE_EVT  = Counter("ocf_whale_events_total", "Whale-size transfers detected")
 
 def _hash(obj: Any) -> str:
     return hashlib.sha256(str(obj).encode()).hexdigest()
@@ -48,7 +48,7 @@ class OnChainFlows:
     async def connect(self):
         if self._client is None:
             self._client = AsyncClient(self.cfg.HELIUS_RPC)
-            logger.info("[OnChainFlows] RPC client initialised → %s", self.cfg.HELIUS_RPC)
+            logger.info(f"[OnChainFlows] RPC client initialized → {self.cfg.HELIUS_RPC}")
 
     async def close(self):
         if self._client:
@@ -81,7 +81,13 @@ class OnChainFlows:
         txs = await asyncio.gather(*(self.get_tx_details(s) for s in sigs))
         return [t for t in txs if t]
 
-    async def token_flows(self, symbol: str, wallet: str, *, limit: int = 100) -> Dict[str, Any]:
+    async def token_flows(
+        self,
+        symbol: str,
+        wallet: str,
+        *,
+        limit: int = 100
+    ) -> Dict[str, Any]:
         """Aggregate inflow/outflow & whale hits for `symbol` at `wallet`."""
         txs = await self.fetch_transactions(wallet, limit=limit)
         inflow = outflow = 0.0
@@ -98,7 +104,7 @@ class OnChainFlows:
             else:
                 outflow += abs(delta)
             if abs(delta) >= self.whale_thresh:
-                OCF_WHALE_EVT.inc()
+                OCF_WH A LE_EVT.inc()
                 whales.append({
                     "sig": tx.get("transaction", {}).get("signatures", ["?"])[0],
                     "amount": delta,
@@ -116,7 +122,13 @@ class OnChainFlows:
         await fire_plugin_event("onchain_flow", analysis)
         return analysis
 
-    async def whale_activity(self, wallet: str, *, threshold: Optional[float] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    async def whale_activity(
+        self,
+        wallet: str,
+        *,
+        threshold: Optional[float] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
         thr = threshold or self.whale_thresh
         txs = await self.fetch_transactions(wallet, limit=limit)
         return [
@@ -127,6 +139,10 @@ class OnChainFlows:
 
 # Convenience wrapper so other modules can still do:
 #   from core.data_collection.onchain_flows import get_token_flow_stats
-async def get_token_flow_stats(symbol: str, wallet: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
+async def get_token_flow_stats(
+    symbol: str,
+    wallet: Optional[str] = None,
+    limit: int = 100
+) -> Dict[str, Any]:
     svc = OnChainFlows(config)
     return await svc.token_flows(symbol, wallet or config.SOL_ADDRESS, limit=limit)
