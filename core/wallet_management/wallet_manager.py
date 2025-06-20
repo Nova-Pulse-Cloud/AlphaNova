@@ -21,21 +21,11 @@ logger = logging.getLogger("nova.wallet_manager")
 logger.setLevel(logging.INFO)
 
 # Metrics
-WALLET_TX_COUNT = Counter(
-    "wallet_tx_count", "Total transactions signed and sent by wallet"
-)
-WALLET_TX_FAILS = Counter(
-    "wallet_tx_failures", "Number of failed wallet transactions"
-)
-WALLET_TX_LATENCY = Histogram(
-    "wallet_tx_latency_seconds", "Latency of wallet transaction confirmations"
-)
-WALLET_TX_CONFIRMS = Counter(
-    "wallet_tx_confirm_success", "Successful transaction confirmations"
-)
-WALLET_TX_CONFIRM_FAILS = Counter(
-    "wallet_tx_confirm_failures", "Failed transaction confirmations"
-)
+WALLET_TX_COUNT         = Counter("wallet_tx_count", "Total transactions signed and sent by wallet")
+WALLET_TX_FAILS         = Counter("wallet_tx_failures", "Number of failed wallet transactions")
+WALLET_TX_LATENCY       = Histogram("wallet_tx_latency_seconds", "Latency of wallet transaction confirmations")
+WALLET_TX_CONFIRMS      = Counter("wallet_tx_confirm_success", "Successful transaction confirmations")
+WALLET_TX_CONFIRM_FAILS = Counter("wallet_tx_confirm_failures", "Failed transaction confirmations")
 
 class WalletEntry:
     def __init__(
@@ -66,13 +56,16 @@ class WalletManager:
         self._init_wallet()
 
     def _init_wallet(self) -> None:
+        # Load secret key array (either path or direct list)
         secret = self.config.SOL_PRIVATE_KEY
         if isinstance(secret, str):
             with open(secret, "r") as f:
                 secret_list = json.load(f)
         else:
             secret_list = secret
-        keypair = Keypair.from_secret_key(bytes(secret_list))
+
+        # solders.Keypair expects raw bytes via from_bytes()
+        keypair = Keypair.from_bytes(bytes(secret_list))
         self.wallets["solana"] = WalletEntry("solana", keypair, label="primary")
         logger.info("[WalletManager] Initialized Solana wallet: %s", keypair.pubkey())
 
