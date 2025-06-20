@@ -17,11 +17,12 @@ from core.utils.config import config
 from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.signal_generation.reinforcement_learning import RLTrader
-from core.data_collection.orderbook_overlay import OrderBookOverlay
+from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.token_auditor import TokenAuditor
 from core.utils.token_guardian import check_guardian
-from core.agents.adaptive_tp_sl.py import AdaptiveTPSL
+# Correct TP/SL import from ml directory
+from ml.ml_tp_sl import AdaptiveTPSL
 
 logger = logging.getLogger("nova.alpha_signal_agent")
 logger.setLevel(logging.INFO)
@@ -76,16 +77,14 @@ class AlphaSignalAgent:
         self.redis: Optional[redis_client.Redis] = None
         self.memory = TradeMemory(config)
         self.rl_tuner = ReinforcementTuner()
-        self.orderbook = OrderBookOverlay
-        self.rl_agent = RLTrader()
         self.symbols = symbols or []
         self._caption_lock = asyncio.Lock()
 
         # Risk/audit agents
         self.token_auditor = TokenAuditor()
         self.token_guardian = check_guardian
-        # Adaptive TP/SL
-        self.tpsl_agent = AdaptiveTPSL(memory=self.memory, rl_agent=self.rl_agent)
+        # Adaptive TP/SL from ml folder
+        self.tpsl_agent = AdaptiveTPSL(memory=self.memory, rl_agent=None)
 
     async def connect(self):
         if not self.redis:
@@ -187,16 +186,22 @@ class AlphaSignalAgent:
                 weighted_scores[src] = base * weight
                 trust_map[src] = weight
 
-            depth_adj = 1.0
-            ob_summary = await self.orderbook(symbol)
+            imbalance, ob_summary = await get_orderbook_imbalance(symbol)
+            depth_adj = 0.9 if imbalance < 0 else 1.0
+
             avg = sum(weighted_scores.values()) / max(len(weighted_scores), 1)
             score = avg * depth_adj
             risk = 1.0 - min(trust_map.values()) if trust_map else 1.0
             entry = float(agent_signals[0].get("entry", 0.0)) if agent_signals else 0.0
 
-            tpsl = {"tp": entry * 1.05, "sl": entry * 0.95}
-            take_profit = tpsl["tp"]
-            stop_loss = tpsl["sl"]
+            tpsl = await self.tpsl_agent.compute(
+                symbol=symbol,
+                price=entry,
+                signal_context={"imbalance": imbalance},
+                user=None
+            )
+            take_profit = float(tpsl["tp"])
+            stop_loss = float(tpsl["sl"])
 
             flavor = self._choose_flavor(avg, user_context)
             caption = await self._generate_caption(symbol, {"avg": avg})
@@ -208,7 +213,7 @@ class AlphaSignalAgent:
             signal = AlphaSignal(
                 symbol=symbol,
                 trigger_sources=weighted_scores,
-                meta_features={"trusts": trust_map, **audit_details},
+                meta_features={"trusts": trust_map, **ob_summary, **audit_details},
                 flavor=flavor,
                 score=round(score, 4),
                 risk=round(risk, 4),
