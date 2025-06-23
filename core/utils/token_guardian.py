@@ -25,9 +25,8 @@ GUARD_BLOCKS   = Counter("token_guardian_blocks_total", "Guardian blocks (risk/f
 GUARD_LATENCY  = Histogram("token_guardian_latency_seconds", "Guardian check latency")
 GUARD_DLQ: list = []
 
-# Optional: live RugCheck API endpoint (set in config)
 RUGCHECK_URL = getattr(config, "RUGCHECK_API", None) or "https://www.rugcheck.xyz/api/token/"
-REDIS_URL = getattr(config, "REDIS_URL", None)
+REDIS_URL    = getattr(config, "REDIS_URL", None)
 
 try:
     import redis.asyncio as redis_async
@@ -36,12 +35,10 @@ except ImportError:
     REDIS_ENABLED = False
     redis_async = None
 
-# In-memory fast cache
 _guard_cache: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 120  # seconds
 
 async def get_rugcheck_status(symbol: str) -> Dict[str, Any]:
-    # Optionally use RugCheck API for live flagging
     import httpx
     url = f"{RUGCHECK_URL}{symbol}"
     try:
@@ -51,37 +48,32 @@ async def get_rugcheck_status(symbol: str) -> Dict[str, Any]:
             data = resp.json()
         if isinstance(data, dict) and "score" in data:
             return {"rug_score": data["score"], "explanation": data.get("summary", ""), "details": data}
-        else:
-            return {"rug_score": 0.2, "explanation": "No flag (default)"}
+        return {"rug_score": 0.2, "explanation": "No flag (default)"}
     except Exception as e:
         logger.warning(f"[TokenGuardian] RugCheck API failed for {symbol}: {e}")
         return {"rug_score": 0.5, "explanation": f"API error: {e}"}
 
 async def check_guardian(symbol: str) -> Dict[str, Any]:
-    """
-    Elite, live risk check for token. Returns dict with risk/flag, and full explanation.
-    """
     GUARD_CHECKS.inc()
     key = symbol.upper()
     t0 = time.monotonic()
-    # Check in-memory cache
+    # In-memory cache
     v = _guard_cache.get(key)
     if v and time.time() - v.get("ts", 0) < CACHE_TTL:
         GUARD_LATENCY.observe(time.monotonic() - t0)
         return v
-    # Check Redis if enabled
+    # Redis cache
     if REDIS_ENABLED and REDIS_URL:
         try:
             redis = redis_async.from_url(REDIS_URL, decode_responses=True)
             cached = await redis.get(f"tg:{key}")
             if cached:
-                GUARD_LATENCY.observe(time.monotonic() - t0)
                 v = eval(cached)
                 _guard_cache[key] = v
+                GUARD_LATENCY.observe(time.monotonic() - t0)
                 return v
-        except Exception as e:
-            logger.warning(f"[TokenGuardian] Redis get failed: {e}")
-    # --- On-chain/External API check (example: RugCheck) ---
+        except Exception:
+            pass
     data = await get_rugcheck_status(symbol)
     rug_score = float(data.get("rug_score", 0.5))
     flag = rug_score > 0.33
@@ -93,25 +85,24 @@ async def check_guardian(symbol: str) -> Dict[str, Any]:
         "details": data.get("details", {}),
         "ts": time.time(),
     }
-    # Block logic
     if flag:
         GUARD_BLOCKS.inc()
         GUARD_DLQ.append({"symbol": key, "rug_score": rug_score, "reason": data.get("explanation")})
         logger.warning(f"[TokenGuardian] Blocked: {key} | {data}")
-    # Store in both caches
     _guard_cache[key] = result
     if REDIS_ENABLED and REDIS_URL:
         try:
             redis = redis_async.from_url(REDIS_URL, decode_responses=True)
             await redis.set(f"tg:{key}", str(result), ex=CACHE_TTL)
-        except Exception as e:
-            logger.warning(f"[TokenGuardian] Redis set failed: {e}")
+        except Exception:
+            pass
     GUARD_LATENCY.observe(time.monotonic() - t0)
     return result
 
-# --- Optional: Telegram alert hook ---
+# Alias for backward compatibility
+TokenGuardian = check_guardian
+
 async def alert_guardian_block(symbol: str, reason: str):
-    """Send alert to Telegram if token is blocked."""
     from core.utils.config import config
     import httpx
     if not hasattr(config, "TELEGRAM_BOT_TOKEN") or not hasattr(config, "TELEGRAM_CHAT_ID"):
@@ -120,14 +111,9 @@ async def alert_guardian_block(symbol: str, reason: str):
         async with httpx.AsyncClient(timeout=5) as client:
             await client.post(
                 f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": config.TELEGRAM_CHAT_ID,
-                    "text": f"🚨 [TokenGuardian] {symbol} blocked: {reason}"
-                },
+                json={"chat_id": config.TELEGRAM_CHAT_ID, "text": f"🚨 [TokenGuardian] {symbol} blocked: {reason}"},
             )
     except Exception as e:
         logger.error(f"[TokenGuardian] Telegram alert failed: {e}")
 
-# --- For future: plug community or ML risk APIs here ---
-
-__all__ = ["check_guardian", "alert_guardian_block"]
+__all__ = ["check_guardian", "TokenGuardian", "alert_guardian_block"]
