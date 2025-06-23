@@ -5,7 +5,9 @@ import json
 import re
 from typing import Any
 
-# Legacy constants
+# ────────────────────────────────────────────────────────────────────────────────
+# Legacy constants (still available if you need direct calls)
+# ────────────────────────────────────────────────────────────────────────────────
 DEXSCREENER_URL = os.environ.get(
     "DEXSCREENER_URL",
     "https://api.dexscreener.com/latest/dex/tokens/"
@@ -17,12 +19,13 @@ PRICE_CHANGE_THRESHOLD = float(
 class Config:
     """
     Singleton configuration loader with strict validation.
-    Loads all required environment variables, validates formats,
-    and reads the Solana private key from a mounted JSON secret.
+    Loads required environment variables, validates formats,
+    and reads the Solana private key from a JSON secret file.
     """
     _instance: "Config" = None
     _initialized: bool = False
 
+    # Base58 regex (exclude 0/O, I/l)
     _BASE58_REGEX = re.compile(r'^[A-HJ-NP-Za-km-z1-9]{32,44}$')
 
     def __new__(cls) -> "Config":
@@ -35,13 +38,13 @@ class Config:
             return
         self._initialized = True
 
-        # Timeouts
+        # HTTP client timeout (seconds)
         try:
             self.HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
         except ValueError:
             raise ValueError("[Config] 'HTTP_TIMEOUT' must be an integer")
 
-        # Jupiter swap API
+        # Jupiter swap API endpoint
         self.JUPITER_SWAP_ENDPOINT = os.getenv(
             "JUPITER_SWAP_ENDPOINT",
             "https://quote-api.jup.ag/v6/swap"
@@ -53,13 +56,13 @@ class Config:
         self.TELEGRAM_CHAT_ID   = self._require_int("TELEGRAM_CHAT_ID")
         self.WEBHOOK_URL        = self._require("WEBHOOK_URL")
 
-        # Solana wallet
+        # Solana wallet secret (path to JSON array)
         key_path = self._require("SOL_PRIVATE_KEY_PATH")
         self.SOL_PRIVATE_KEY    = self._load_json_secret(key_path)
         self.SOL_ADDRESS        = self._require("SOL_ADDRESS")
         self._validate_base58(self.SOL_ADDRESS, "SOL_ADDRESS")
 
-        # RPC / API keys
+        # RPC / API keys & URLs
         self.HELIUS_RPC           = self._require("HELIUS_RPC")
         self._validate_url(self.HELIUS_RPC, "HELIUS_RPC")
         self.HELIUS_API_KEY       = self._require("HELIUS_API_KEY")
@@ -71,14 +74,14 @@ class Config:
         self.MACRO_API_KEY        = self._require("MACRO_API_KEY")
         self.ETHERSCAN_API_KEY    = self._require("ETHERSCAN_API_KEY")
 
-        # Optional Jaeger tracing config
+        # Optional Jaeger tracing
         self.JAEGER_HOST = os.getenv("JAEGER_HOST", "localhost")
         try:
             self.JAEGER_PORT = int(os.getenv("JAEGER_PORT", "6831"))
         except ValueError:
             raise ValueError("[Config] 'JAEGER_PORT' must be an integer.")
 
-        # Trade-memory DB (fallback)
+        # Trade-memory DB path (fallback)
         self.TRADE_MEMORY_DB_PATH = os.getenv(
             "TRADE_MEMORY_DB_PATH",
             "trade_memory.db"
@@ -117,5 +120,5 @@ class Config:
             raise ValueError(f"[Config] Invalid Base58 address in '{key}': '{addr}'")
 
 
-# Global singleton instance
+# Global singleton instance for imports
 config = Config()
