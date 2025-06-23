@@ -1,3 +1,4 @@
+```python
 # File: src/main_service.py
 # Elite pre-launch main service wiring for Nova Pulse Alpha
 
@@ -17,7 +18,10 @@ from opentelemetry.exporter.jaeger.thrift import JaegerExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from aiogram import Bot
+
+# Aiogram imports
+from aiogram import Bot, Dispatcher
+from aiogram.types import Update
 
 # Core imports
 from core.utils.config import Config
@@ -49,11 +53,12 @@ from core.telegram_pusher import (
     push_pnl_card,
     push_trade_update,
 )
-from telegram.integration.telegram_router import telegram_router  # your command handlers
+from telegram.integration.telegram_router import router as telegram_router
 
 # === Settings ===
 class Settings(BaseSettings):
-    WEBHOOK_URL: str
+    WEBHOOK_URL: str        # e.g. https://your.domain.com/telegram/webhook
+    WEBHOOK_PATH: str       # e.g. "/telegram/webhook"
     TELEGRAM_CHAT_ID: int
     TELEGRAM_BOT_TOKEN: str
     SOL_PRIVATE_KEY: str
@@ -75,8 +80,10 @@ class Settings(BaseSettings):
 settings = Settings()
 config = Config()
 
-# Telegram Bot (for pushers & webhook)
+# Bot & Dispatcher
 bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+dp  = Dispatcher(bot=bot)
+dp.include_router(telegram_router)
 
 # FastAPI app setup
 app = FastAPI(title="Nova Pulse Alpha", version="1.0.0")
@@ -89,9 +96,6 @@ app.add_middleware(
 )
 FastAPIInstrumentor.instrument_app(app)
 app.add_api_websocket_route("/ws/signal_feed", websocket_endpoint)
-
-# Mount Telegram command router
-app.include_router(telegram_router, prefix="/telegram")
 
 # Prometheus metrics
 start_http_server(settings.METRICS_PORT)
@@ -118,7 +122,7 @@ auto_trader      = AutoTrader(
     telegram_chat_id=settings.TELEGRAM_CHAT_ID,
 )
 
-# Register agents
+# Register agents\NREGISTER
 AGENT_REGISTRY = {}
 def register_agent(name: str, agent_obj):
     AGENT_REGISTRY[name] = agent_obj
@@ -162,11 +166,13 @@ async def load_plugins_from_dir(directory: str = "core/plugins"):
     await plugin_manager.initialize(mapping)
     logging.info("🔌 Loaded plugins: %s", list(mapping.keys()))
 
+
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+
 
 def setup_tracing():
     exporter = JaegerExporter(
@@ -182,9 +188,9 @@ def setup_tracing():
         settings.JAEGER_PORT
     )
 
-# ─ Startup & shutdown ─
+# ─ Startup & Shutdown ─
 @app.on_event("startup")
-async def startup_event():
+async def on_startup():
     setup_logging()
     setup_tracing()
     logging.info("Prometheus metrics on port %s", settings.METRICS_PORT)
@@ -192,7 +198,7 @@ async def startup_event():
     # Set Telegram webhook
     await bot.set_webhook(settings.WEBHOOK_URL)
 
-    # 1) Connect agents & subsystems
+    # 1) Connect agents & subsystems\Nasync
     for agent in AGENT_REGISTRY.values():
         if hasattr(agent, "connect"):
             await agent.connect()
@@ -207,15 +213,13 @@ async def startup_event():
     # 3) Load external plugins
     await load_plugins_from_dir()
 
-    # 4) RL trainer & SL watchdog
+    # 4) Start RL trainer & SL watchdog
     asyncio.create_task(RLTrainerLoop(rl_tuner).start())
-    asyncio.create_task(start_sl_watchdog(
-        wallet_manager,
-        trade_memory,
-        execution_router
-    ))
+    asyncio.create_task(
+        start_sl_watchdog(wallet_manager, trade_memory, execution_router)
+    )
 
-    # 5) Auto-trade loop
+    # 5) Auto-trade loop\Ntrade
     async def trade_loop():
         while True:
             try:
@@ -248,7 +252,7 @@ async def startup_event():
     logging.info("Nova Pulse LIVE: %s", list(AGENT_REGISTRY.keys()))
 
 @app.on_event("shutdown")
-async def shutdown_event():
+async def on_shutdown():
     logging.info("Shutting down Nova Pulse...")
     for agent in AGENT_REGISTRY.values():
         if hasattr(agent, "disconnect"):
@@ -259,31 +263,44 @@ async def shutdown_event():
     await execution_router.disconnect()
     logging.info("Clean shutdown complete.")
 
+# Telegram webhook endpoint
+@app.post(settings.WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update(**data)
+    await dp.process_update(update)
+    return JSONResponse(content={"ok": True})
+
+# Universal exception handler
 @app.exception_handler(Exception)
 async def universal_exception_handler(request: Request, exc: Exception):
     logging.error("Unhandled error: %s", exc, exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal error occurred."})
 
+# Health check endpoint
 @app.get("/healthz")
 def health_check():
     return {"status": "ok", "agents": list(AGENT_REGISTRY.keys())}
 
+# DLQ status endpoint
 @app.get("/dlq/status")
 async def dlq_status():
     summary = await get_dlq_summary()
     return {"status": "ok", "summary": summary}
 
+# DLQ replay endpoint
 @app.post("/dlq/replay")
 async def replay_dlq():
     results = await replay_execution_dlq(execution_router)
     return {"replay_attempted": len(results), "details": results}
 
+# Signal generation endpoint
 @app.post("/generate_signal")
 async def generate_signal(request: Request):
     payload = await request.json()
     symbol = payload.get("symbol")
     if not symbol:
-        raise HTTPException(status_code=400, detail="Missing 'symbol' field.")
+        raise HTTPException(status_code=400, detail="Missing 'symbol'.")
 
     # Gather agent signals
     tasks = [
@@ -307,17 +324,17 @@ async def generate_signal(request: Request):
     signals_counter.inc()
     agents_gauge.set(len(AGENT_REGISTRY))
 
-    # Fuse, broadcast, push
+    # Fuse, broadcast, and push signal card
     fused = await adaptive_signal_fusion(symbol, agent_results)
     await ws_manager.broadcast(fused)
     await push_signal_card(fused)
 
-    # Execute trade + push card
+    # Execute trade and push execution card
     exec_res = await execution_router.execute_trade(fused, user_id="telegram")
     fused["execution"] = exec_res
     await push_trade_card(fused, exec_res)
 
-    # Log + update
+    # Log trade and push detailed update
     await log_trade(
         fused["symbol"],
         exec_res.get("side"),
@@ -330,21 +347,24 @@ async def generate_signal(request: Request):
     )
     await push_trade_update(fused)
 
-    # Closed PnL snapshot
+    # Push standalone PnL card if trade closed
     if exec_res.get("success") and exec_res.get("exit"):
         await push_pnl_card(fused["symbol"])
 
     return fused
 
+# Token audit endpoint
 @app.post("/audit/{address}")
 async def audit_token(address: str):
     return (await auditor.audit_token(address)).dict()
 
+# Signal explanation endpoint
 @app.post("/explain_signal")
 async def explain_signal(request: Request):
     payload = await request.json()
     sym = payload.get("symbol")
     if not sym:
-        raise HTTPException(status_code=400, detail="Missing 'symbol' field.")
+        raise HTTPException(status_code=400, detail="Missing 'symbol'.")
     result = await explainer.explain(sym, payload.get("context", {}))
     return result.dict() if hasattr(result, "dict") else result
+```
