@@ -92,9 +92,12 @@ agents_gauge    = Gauge("nova_agents_active", "Active agents in mesh")
 wallet_manager   = WalletManager(config)
 trade_memory     = TradeMemory(config)
 rl_tuner         = ReinforcementTuner()
-execution_router = ExecutionRouter(wallet_manager=wallet_manager, rpc_nodes=[settings.HELIUS_RPC])
+execution_router = ExecutionRouter(
+    wallet_manager=wallet_manager,
+    rpc_nodes=[settings.HELIUS_RPC]
+)
 auditor          = TokenAuditor(config.REDIS_URL)
-guardian         = TokenGuardian               # now correctly wired to check_guardian()
+guardian         = TokenGuardian
 explainer        = SignalExplainerAI(config.OPENAI_API_KEY)
 plugin_manager   = CorePluginManager()
 auto_trader      = AutoTrader(
@@ -123,7 +126,10 @@ register_agent("social_sentiment", SocialSentiment(config))
 register_agent("tech_indicators", TechIndicatorAgent(config))
 
 async def adaptive_signal_fusion(symbol: str, agent_results: list[dict]) -> dict:
-    weights = {res["source"]: rl_tuner.get_trust_score(res["source"], symbol) for res in agent_results}
+    weights = {
+        res["source"]: rl_tuner.get_trust_score(res["source"], symbol)
+        for res in agent_results
+    }
     total = sum(weights.values()) or 1.0
     score = sum(res["score"] * weights[res["source"]] for res in agent_results) / total
     entropy_penalty = 1.0 - min(max(score, 0), 1)
@@ -131,7 +137,10 @@ async def adaptive_signal_fusion(symbol: str, agent_results: list[dict]) -> dict
     return {
         "symbol": symbol,
         "score": adjusted_score,
-        "breakdown": [{**res, "weight": weights[res["source"]]} for res in agent_results],
+        "breakdown": [
+            {**res, "weight": weights[res["source"]]}
+            for res in agent_results
+        ],
         "meta": {"fusion": "adaptive_trust_entropy", "agents": list(weights.keys())},
     }
 
@@ -144,14 +153,24 @@ async def load_plugins_from_dir(directory: str = "core/plugins"):
     logging.info("🔌 Loaded plugins: %s", list(mapping.keys()))
 
 def setup_logging():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
 def setup_tracing():
-    exporter = JaegerExporter(agent_host_name=settings.JAEGER_HOST, agent_port=settings.JAEGER_PORT)
+    exporter = JaegerExporter(
+        agent_host_name=settings.JAEGER_HOST,
+        agent_port=settings.JAEGER_PORT
+    )
     provider = TracerProvider(resource=Resource.create({"service.name": "nova-pulse"}))
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
-    logging.info("✅ Jaeger tracing initialized on %s:%s", settings.JAEGER_HOST, settings.JAEGER_PORT)
+    logging.info(
+        "✅ Jaeger tracing initialized on %s:%s",
+        settings.JAEGER_HOST,
+        settings.JAEGER_PORT
+    )
 
 # ─ Startup & shutdown ─
 @app.on_event("startup")
@@ -160,7 +179,7 @@ async def startup_event():
     setup_tracing()
     logging.info("Prometheus metrics on port %s", settings.METRICS_PORT)
 
-    # 1) connect your agents
+    # 1) Connect agents & subsystems
     for agent in AGENT_REGISTRY.values():
         if hasattr(agent, "connect"):
             await agent.connect()
@@ -169,17 +188,21 @@ async def startup_event():
     await auto_trader.connect()
     await execution_router.connect()
 
-    # 2) hook SentimentAgent into the PluginManager
+    # 2) Hook SentimentAgent into plugin bus
     register_sentiment_event_hook(fire_plugin_event)
 
-    # 3) load any external plugins
+    # 3) Load external plugins
     await load_plugins_from_dir()
 
     # 4) RL trainer & SL watchdog
     asyncio.create_task(RLTrainerLoop(rl_tuner).start())
-    asyncio.create_task(start_sl_watchdog(wallet_manager, trade_memory, execution_router))
+    asyncio.create_task(start_sl_watchdog(
+        wallet_manager,
+        trade_memory,
+        execution_router
+    ))
 
-    # 5) auto-trade loop
+    # 5) Auto-trade loop
     async def trade_loop():
         while True:
             try:
@@ -189,7 +212,7 @@ async def startup_event():
             await asyncio.sleep(60)
     asyncio.create_task(trade_loop())
 
-    # 6) periodic signal generation
+    # 6) Periodic signal generation
     symbols = os.getenv("WATCH_SYMBOLS", "SOL,ETH,BTC").split(",")
     interval = int(os.getenv("SIGNAL_INTERVAL", "60"))
     async def signal_loop():
@@ -251,7 +274,8 @@ async def generate_signal(request: Request):
 
     # Gather agent signals
     tasks = [
-        agent.analyze(symbol, **payload) if hasattr(agent, "analyze")
+        agent.analyze(symbol, **payload)
+        if hasattr(agent, "analyze")
         else agent.fetch_sentiment({"symbol": symbol}, user=None)
         for agent in AGENT_REGISTRY.values()
     ]
@@ -260,9 +284,12 @@ async def generate_signal(request: Request):
     agent_results = []
     for name, res in zip(AGENT_REGISTRY.keys(), results):
         score = getattr(res, "sentiment_score", None) or getattr(res, "score", 0.0)
-        agent_results.append(
-            {"source": name, "score": score, "meta": {}, "entry": getattr(res, "entry", 0.0)}
-        )
+        agent_results.append({
+            "source": name,
+            "score": score,
+            "meta": {},
+            "entry": getattr(res, "entry", 0.0)
+        })
 
     signals_counter.inc()
     agents_gauge.set(len(AGENT_REGISTRY))
