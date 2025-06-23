@@ -1,4 +1,4 @@
-# File: telegram/commands/commands.py
+# File: src/telegram/commands/commands.py
 # 🚀 Nova Pulse ALPHA – Elite async commands for Nova Pulse
 
 import os
@@ -27,6 +27,7 @@ from core.utils.pnl_chart import generate_pnl_image
 from core.utils.signal_card import generate_signal_card
 from core.utils.plugin_manager import fire_plugin_event
 from core.signal_generation.reinforcement_learning import RLTrader
+from core.data_collection.social_sentiment import score_token_sentiment  # fixed import
 
 # Initialize dependencies
 wallet_manager = WalletManager(config)
@@ -212,7 +213,7 @@ async def explain_handler(message: Message):
         await message.answer("Usage: /explain <SYMBOL>")
         return
     symbol = parts[1].upper()
-    explainer = SignalExplainerAI()
+    explainer = SignalExplainerAI(config.OPENAI_API_KEY)
     res = await explainer.explain(symbol)
     narrative = getattr(res, 'narrative', res.get('narrative', 'No explanation.'))
     await message.answer(f"🧠 *Insight for {symbol}:*\n{narrative}", parse_mode="Markdown")
@@ -226,7 +227,7 @@ async def auto_handler(message: Message):
         return
     new = '1' if parts[1]=='on' else '0'
     await auto_redis.set(f"auto:{message.from_user.id}", new)
-    await fire_plugin_event("cmd_auto_toggle", {"mode": new})
+    await fire_plugin_event("telegram_auto_toggle", {"mode": new, "user": message.from_user.id})
     await message.answer(f"🤖 Auto-Trading {'ENABLED' if new=='1' else 'DISABLED'}")
 
 @router.message(Command("status"))
@@ -254,13 +255,13 @@ async def mirror_handler(message: Message):
         await message.answer("Usage: /mirror <SYMBOL>")
         return
     symbol = parts[1].upper()
-    await fire_plugin_event("cmd_mirror", {"symbol": symbol})
+    await fire_plugin_event("cmd_mirror", {"symbol": symbol, "user": message.from_user.id})
     await message.answer(f"👥 Mirror trade: {symbol}")
 
 @router.message(Command("exportdata"))
 @admin_only
 async def export_handler(message: Message):
-    await fire_plugin_event("cmd_export_data", {})
+    await fire_plugin_event("cmd_export_data", {"user": message.from_user.id})
     await message.answer("🗃️ Export coming soon.")
 
 # EOF
