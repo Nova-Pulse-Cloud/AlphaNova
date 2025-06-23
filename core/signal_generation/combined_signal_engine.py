@@ -17,7 +17,7 @@ from core.data_collection.whale_detector import get_recent_whale_activity
 from core.data_collection.onchain_flows import get_token_flow_stats
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
 from core.signal_generation.reinforcement_learning import RLTrader
-from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
+from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.utils.config import config
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.trade_memory import TradeMemory
@@ -94,15 +94,15 @@ class CombinedSignalEngine:
                 scores[src] = base * weight
                 trusts[src] = weight
 
-            # 2) On-chain + orderbook + whale
+            # 2) Overlays
             ob_task    = asyncio.create_task(get_orderbook_imbalance(symbol))
             whale_task = asyncio.create_task(get_recent_whale_activity(symbol))
             flow_task  = asyncio.create_task(get_token_flow_stats(symbol))
             ob, whale, flow = await asyncio.gather(ob_task, whale_task, flow_task)
 
-            # 3) Social sentiment
-            sent_score      = await _sentiment.score_token_sentiment(symbol)
-            caption_narr    = await _sentiment.get_live_narrative(symbol)
+            # 3) Sentiment
+            sent_score   = await _sentiment.score_token_sentiment(symbol)
+            caption_narr = await _sentiment.get_live_narrative(symbol)
 
             # 4) Composite score & risk
             depth_adj = 1.0 - min(abs(ob), 1.0)
@@ -117,7 +117,7 @@ class CombinedSignalEngine:
             tp_sl = await self.adaptive_tp_sl.compute(
                 symbol,
                 entry,
-                {"volatility": ob, "whale": whale_adj, "imbalance": flow.get("imbalance", 0.0)},
+                {"volatility": ob, "whale_pressure": whale_adj, "imbalance": flow.get("imbalance", 0.0)},
             )
             tp = float(tp_sl["tp"])
             sl = float(tp_sl["sl"])
@@ -133,7 +133,7 @@ class CombinedSignalEngine:
                 sl=sl,
                 flavor=flavor,
                 trigger_sources=scores,
-                meta_features={**tp_sl, "sentiment_score": sent_score, "narrative": caption_narr},
+                meta_features={**tp_sl, "sentiment_score": sent_score},
                 caption=caption_narr,
                 provenance_hash=hashlib.sha256(blob.encode()).hexdigest(),
                 timestamp=int(start.timestamp()),
@@ -155,22 +155,17 @@ class CombinedSignalEngine:
     ) -> Dict[str, Any]:
         SIG_TRIGGERS.inc()
         try:
-            # 1) Score sentiment
-            sent = await _sentiment.score_token_sentiment(symbol)
-
-            # 2) RL action
+            sent  = await _sentiment.score_token_sentiment(symbol)
             agent = RLTrader()
             action = await agent.act({"score": sent})
             SIG_ACTION.labels(action=action.action).set(action.size)
 
-            # 3) Build composite
-            sig = await self.evaluate_alpha(
+            sig_res = await self.evaluate_alpha(
                 symbol,
                 [{"source":"rl_agent","score":action.size,"entry":sent}]
             )
-            result = sig.dict()
+            result = sig_res.dict()
 
-            # 4) Auto‐trade if enabled
             if user and await _sentiment._redis.get(f"auto:{user}") == "1":
                 from core.execution.execution_router import ExecutionRouter
                 router = ExecutionRouter(wallet_manager=self.trade_memory, rpc_nodes=[config.HELIUS_RPC])
