@@ -17,6 +17,7 @@ from opentelemetry.exporter.jaeger.thrift import JaegerExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from aiogram import Bot
 
 # Core imports
 from core.utils.config import Config
@@ -42,7 +43,13 @@ from core.utils.trade_logger import log_trade
 from core.utils.dlq_manager import get_dlq_summary, replay_execution_dlq
 from core.utils.signal_card import generate_signal_card
 from core.utils.pnl_card import generate_pnl_card
-from aiogram import Bot
+from core.telegram_pusher import (
+    push_signal_card,
+    push_trade_card,
+    push_pnl_card,
+    push_trade_update,
+)
+from telegram.integration.telegram_router import telegram_router  # your command handlers
 
 # === Settings ===
 class Settings(BaseSettings):
@@ -68,7 +75,7 @@ class Settings(BaseSettings):
 settings = Settings()
 config = Config()
 
-# Telegram Bot (for pushers)
+# Telegram Bot (for pushers & webhook)
 bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
 # FastAPI app setup
@@ -82,6 +89,9 @@ app.add_middleware(
 )
 FastAPIInstrumentor.instrument_app(app)
 app.add_api_websocket_route("/ws/signal_feed", websocket_endpoint)
+
+# Mount Telegram command router
+app.include_router(telegram_router, prefix="/telegram")
 
 # Prometheus metrics
 start_http_server(settings.METRICS_PORT)
@@ -178,6 +188,9 @@ async def startup_event():
     setup_logging()
     setup_tracing()
     logging.info("Prometheus metrics on port %s", settings.METRICS_PORT)
+
+    # Set Telegram webhook
+    await bot.set_webhook(settings.WEBHOOK_URL)
 
     # 1) Connect agents & subsystems
     for agent in AGENT_REGISTRY.values():
@@ -315,7 +328,6 @@ async def generate_signal(request: Request):
         rationale="auto-trade fused signal",
         user="telegram",
     )
-    from core.telegram_pusher import push_trade_update
     await push_trade_update(fused)
 
     # Closed PnL snapshot
