@@ -1,9 +1,11 @@
+# core/data_collection/orderbook_overlay.py
+
 # Nova Pulse ALPHA – OrderBookOverlay 2.0
 # -------------------------------------------------------------
-# • Live L2 order‑book depth for ANY SPL token via Jupiter API
-# • Solana‑native (no mock RPC) – works on Raydium/OpenBook pools
-# • Async, cache‑aware, Prometheus instrumented, SHA‑256 provenance
-# • Plug‑ready for CombinedSignalEngine → slippage / TP‑SL logic
+# • Live L2 order-book depth for ANY SPL token via Jupiter API
+# • Solana-native (no mock RPC) – works on Raydium/OpenBook pools
+# • Async, cache-aware, Prometheus instrumented, SHA-256 provenance
+# • Plug-ready for CombinedSignalEngine → slippage / TP-SL logic
 # -------------------------------------------------------------
 
 from __future__ import annotations
@@ -22,40 +24,39 @@ logger.setLevel(logging.INFO)
 # ────────────────────────────────────────────────────────────────────────────────
 # Prometheus Metrics
 # ────────────────────────────────────────────────────────────────────────────────
-OB_FETCH        = Counter("orderbook_fetch_total", "Total Jupiter order‑book pulls")
-OB_ERRORS       = Counter("orderbook_errors_total", "Order‑book fetch/parse errors")
-OB_LATENCY      = Histogram("orderbook_latency_seconds", "Latency of order‑book pulls")
-OB_CACHE_HITS   = Counter("orderbook_cache_hits_total", "Cache hits (≤ ttl)")
-OB_CACHE_MISSES = Counter("orderbook_cache_miss_total", "Cache misses (> ttl)")
+OB_FETCH          = Counter("orderbook_fetch_total", "Total Jupiter order-book pulls")
+OB_ERRORS         = Counter("orderbook_errors_total", "Order-book fetch/parse errors")
+OB_LATENCY        = Histogram("orderbook_latency_seconds", "Latency of order-book pulls")
+OB_CACHE_HITS     = Counter("orderbook_cache_hits_total", "Cache hits (≤ ttl)")
+OB_CACHE_MISSES   = Counter("orderbook_cache_misses_total", "Cache misses (> ttl)")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# In‑mem cache (key → (timestamp, depth)) – ttl default 10 s
+# In-mem cache (key → (timestamp, depth)) – ttl default 10 s
 # ────────────────────────────────────────────────────────────────────────────────
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _CACHE_TTL = 10.0  # seconds
 _CACHE_LOCK = asyncio.Lock()
 
-# Jupiter v6 order‑book endpoint (pairAddress param)
+# Jupiter v6 order-book endpoint (pairAddress param)
 JUP_OB_URL = "https://quote-api.jup.ag/v6/orderbook/{market}"
 
 # depth_n controls how many levels we keep (Jupiter returns top 20 by default)
 DEFAULT_DEPTH_N = 20
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # helper: provenance hash (for audits)
-# -----------------------------------------------------------------------------
-
+# -------------------------------------------------------------------
 def _hash(data: Dict[str, Any]) -> str:
     return hashlib.sha256(str(data).encode()).hexdigest()
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # OrderBookOverlay class
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 class OrderBookOverlay:
     """Pulls live L2 depth from Jupiter for a Raydium/OpenBook market address.
 
     Args:
-        market (str): On‑chain market address.
+        market (str): On-chain market address.
     """
     def __init__(
         self,
@@ -71,7 +72,7 @@ class OrderBookOverlay:
         self.ttl = ttl
 
     async def get_orderbook_data(self) -> Dict[str, Any]:
-        """Return cached (or freshly‑fetched) order‑book depth dict."""
+        """Return cached (or freshly-fetched) order-book depth dict."""
         async with _CACHE_LOCK:
             ts, data = _CACHE.get(self.market, (0.0, {}))
             if time.time() - ts < self.ttl and data:
@@ -81,11 +82,13 @@ class OrderBookOverlay:
 
         async with OB_LATENCY.time():
             try:
+                logger.debug("[OrderBookOverlay] Fetching depth for %s", self.market)
                 async with httpx.AsyncClient(timeout=8) as client:
                     url = JUP_OB_URL.format(market=self.market)
-                    r = await client.get(url)
-                    r.raise_for_status()
-                    raw = r.json()
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                OB_FETCH.inc()
+                raw = resp.json()
             except Exception as e:
                 OB_ERRORS.inc()
                 logger.error("[OrderBookOverlay] fetch error %s: %s", self.market, e)
@@ -128,23 +131,10 @@ class OrderBookOverlay:
             "hash": _hash(depth),
         }
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # Convenience helper for signal engines
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 async def get_orderbook_imbalance(market: str) -> Tuple[float, Dict[str, Any]]:
     ob = OrderBookOverlay(market)
     summary = await ob.get_orderbook_summary()
     return summary.get("imbalance_score", 0.0), summary
-
-# -----------------------------------------------------------------------------
-# Example CLI
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import sys, asyncio, pprint
-
-    if len(sys.argv) < 2:
-        print("Usage: python -m core.data_collection.orderbook_overlay <marketAddress>")
-        sys.exit(1)
-
-    ob = OrderBookOverlay(sys.argv[1])
-    pprint.pp(asyncio.run(ob.get_orderbook_summary()))
