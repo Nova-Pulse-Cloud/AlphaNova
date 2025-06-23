@@ -363,4 +363,4 @@ async def explain_signal(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'symbol'.")
     result = await explainer.explain(sym, payload.get("context", {}))
     return result.dict() if hasattr(result, "dict") else result
-```
+
