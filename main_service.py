@@ -1,7 +1,3 @@
-```python
-# File: src/main_service.py
-# Elite pre-launch main service wiring for Nova Pulse Alpha
-
 import os
 import glob
 import logging
