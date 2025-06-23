@@ -20,7 +20,7 @@ from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.token_auditor import TokenAuditor
 from core.utils.token_guardian import TokenGuardian
-from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
+from core.agents.adaptive_tp_sl import AdaptiveTPSL
 
 logger = logging.getLogger("nova.alpha_signal_agent")
 logger.setLevel(logging.INFO)
