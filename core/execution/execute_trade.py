@@ -1,10 +1,6 @@
+# File: core/execution/execute_trade.py
 # 🚀 Nova Pulse ALPHA – Ultra‑Grade Trade Executor (Phantom / Jupiter / Raydium)
-# core/execution/execute_trade.py
 
-"""
-Executes trades with RL‑driven sizing, on‑chain routing, Prometheus metrics,
-OpenAI rationale, and full DLQ / audit hashing — worthy of the #1 crypto bot.
-"""
 import hashlib
 import logging
 import uuid
@@ -15,6 +11,8 @@ import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram
+
+import aioredis
 
 from core.utils.config import config
 from core.wallet_management.wallet_manager import WalletManager
@@ -30,18 +28,17 @@ openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 logger = logging.getLogger("nova.execute_trade")
 logger.setLevel(logging.INFO)
 
-# ────────────────────────────────────────────────────────────────────────────────
+# Redis for auto-mode toggle
+redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
+
 # Prometheus Metrics
-# ────────────────────────────────────────────────────────────────────────────────
 TRADES_EXECUTED = Counter("trades_executed_total", "Total trades executed")
 TRADE_ERRORS    = Counter("trade_errors_total", "Trade execution errors")
 TRADE_LATENCY   = Histogram("trade_latency_seconds", "Trade execution latency")
 TRADE_PNL       = Gauge("trade_pnl", "Realized PnL from trades")
 TRADE_DLQ       = Counter("trade_dlq_total", "Failed trades in DLQ")
 
-# ────────────────────────────────────────────────────────────────────────────────
 # Event Hooks & DLQ
-# ────────────────────────────────────────────────────────────────────────────────
 trade_event_hooks: list[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
 FAILED_TRADES_DLQ: list = []
 
@@ -55,10 +52,7 @@ async def _fire_trade_event(event_name: str, data: Dict[str, Any]):
         except Exception as e:
             logger.error(f"[Trade Event] Hook failure [{hook.__name__}]: {e}")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Pydantic Models
-# ────────────────────────────────────────────────────────────────────────────────
-class TradeRequest(BaseModel):
+# Pydantic Models\ class TradeRequest(BaseModel):
     symbol: str
     side: str  # "buy" or "sell"
     user_id: Optional[str] = "global"
@@ -79,10 +73,7 @@ class TradeResult(BaseModel):
     timestamp: int
     trace_id: Optional[str] = None
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Helper Functions
-# ────────────────────────────────────────────────────────────────────────────────
-async def _retry_async(fn, retries: int, delay: int, err_msg: str):
+# Helper Functions\ async def _retry_async(fn, retries: int, delay: int, err_msg: str):
     for attempt in range(retries):
         try:
             return await fn()
@@ -120,21 +111,26 @@ async def _explain_trade_llm(trade: TradeRequest, quote: dict, pnl: float) -> st
         logger.warning(f"[LLM Rationale Fallback] {e}")
         return f"Trade rationale for {trade.symbol} ({trade.side})."
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Core: execute_trade
-# ────────────────────────────────────────────────────────────────────────────────
-async def execute_trade(
+# Core: execute_trade\ async def execute_trade(
     trade: TradeRequest,
     *,
     wallet_manager: WalletManager,
     market_service: MarketConditionsService,
     plugin_manager: PluginManager,
 ) -> TradeResult:
-    """Execute a single live trade with full audit trail."""
+    """Execute a single live trade with full audit and auto-mode guard."""
+    # Check auto-mode: only run if enabled for this user
+    auto_flag = await redis.get(f"auto:{trade.user_id}")
+    if trade.user_id != "global" and auto_flag != "1":
+        return TradeResult(
+            success=False,
+            error="auto-mode off",
+            timestamp=int(datetime.utcnow().timestamp()),
+            trace_id=trade.trace_id,
+        )
+
     TRADES_EXECUTED.inc()
     rl_trader = RLTrader()
-    # RL sizing: using provided trade.amount or default model
-    # trade.amount remains unchanged unless set externally
 
     # Routing and trade execution
     router_fn = plugin_manager.get_router(trade.dex)
