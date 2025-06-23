@@ -1,8 +1,6 @@
-# Core framework
 fastapi
 uvicorn[standard]
 
-# Async tooling
 aiofiles
 aiohttp
 aiocache
@@ -11,25 +9,21 @@ apscheduler
 httpx
 python-multipart
 
-# Data science & ML
 joblib
-numpy<1.25
+numpy
 pandas-ta
 scikit-learn
 tqdm
 
-# Crypto & blockchain
 anchorpy
 base58
 solana
 solders
 
-# Caching & messaging
 redis
 aiosqlite
 aioredis
 
-# HTTP & serialization
 magic-filter
 msgpack
 requests
@@ -37,7 +31,6 @@ ujson
 wrapt
 zipp
 
-# Observability
 opentelemetry-exporter-jaeger
 opentelemetry-instrumentation
 opentelemetry-instrumentation-asgi
@@ -47,16 +40,13 @@ opentelemetry-semantic-conventions
 opentelemetry-util-http
 prometheus-client
 
-# AI & utilities
 openai
-pillow
+Pillow
 tenacity
-deprecated
+Deprecated
 
-# Config & settings
 pydantic
 pydantic-settings
 
-# Packaging / build tools
 setuptools
 wheel
