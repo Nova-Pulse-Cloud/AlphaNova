@@ -28,10 +28,10 @@ from core.signal_generation.signal_explainer_ai import SignalExplainerAI
 from core.signal_generation.alpha_signal_agent import AlphaSignalAgent
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.agents.quantum_fractal_agent import QuantumFractalAgent
-from core.data_collection.social_sentiment import SocialSentiment
+from core.data_collection.social_sentiment import SocialSentiment, register_sentiment_event_hook  # ← import hook
 from core.data_collection.tech_indicator_agent import TechIndicatorAgent
 from core.signal_generation.sl_watchdog import start_sl_watchdog
-from core.utils.plugin_manager import PluginManager as CorePluginManager
+from core.utils.plugin_manager import PluginManager as CorePluginManager, fire_plugin_event
 from core.ws_endpoint import ws_manager, websocket_endpoint
 from core.signal_generation.rl_trainer_loop import RLTrainerLoop
 from core.execution.execute_trade import AutoTrader
@@ -57,7 +57,6 @@ class Settings(BaseSettings):
     CMC_API_KEY: str
     OPENAI_API_KEY: str
     METRICS_PORT: int = 8001
-    # For internal polling
     HTTP_PORT: int = 8000
     JAEGER_HOST: str = "localhost"
     JAEGER_PORT: int = 6831
@@ -90,18 +89,15 @@ signals_counter = Counter("nova_signals_generated", "Signals generated")
 agents_gauge = Gauge("nova_agents_active", "Active agents in mesh")
 
 # === Core subsystems ===
-wallet_manager = WalletManager(config)
-trade_memory = TradeMemory(config)
-rl_tuner = ReinforcementTuner(config)
-execution_router = ExecutionRouter(
-    wallet_manager=wallet_manager,
-    rpc_nodes=[settings.HELIUS_RPC],
-)
-auditor = TokenAuditor(config.REDIS_URL)
-guardian = TokenGuardian(config.HELIUS_API_KEY)
-explainer = SignalExplainerAI(config.OPENAI_API_KEY)
-plugin_manager = CorePluginManager()
-auto_trader = AutoTrader(
+wallet_manager    = WalletManager(config)
+trade_memory      = TradeMemory(config)
+rl_tuner          = ReinforcementTuner()
+execution_router  = ExecutionRouter(wallet_manager=wallet_manager, rpc_nodes=[settings.HELIUS_RPC])
+auditor           = TokenAuditor(config.REDIS_URL)
+guardian          = TokenGuardian(config.HELIUS_API_KEY)
+explainer         = SignalExplainerAI(config.OPENAI_API_KEY)
+plugin_manager    = CorePluginManager()
+auto_trader       = AutoTrader(
     redis_url=settings.REDIS_URL,
     router=execution_router,
     wallet_manager=wallet_manager,
@@ -117,10 +113,9 @@ def register_agent(name: str, agent_obj):
 register_agent(
     "alpha_signal",
     AlphaSignalAgent(
-        config=config,
-        trade_memory=trade_memory,
-        rl_tuner=rl_tuner,
-        orderbook_overlay=None,
+        redis_url=settings.REDIS_URL,
+        openai_key=settings.OPENAI_API_KEY,
+        symbols=[]
     ),
 )
 register_agent("quantum_fractal", QuantumFractalAgent(config))
@@ -149,67 +144,14 @@ async def load_plugins_from_dir(directory: str = "core/plugins"):
     logging.info("🔌 Loaded plugins: %s", list(mapping.keys()))
 
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 def setup_tracing():
-    exporter = JaegerExporter(
-        agent_host_name=settings.JAEGER_HOST, agent_port=settings.JAEGER_PORT
-    )
+    exporter = JaegerExporter(agent_host_name=settings.JAEGER_HOST, agent_port=settings.JAEGER_PORT)
     provider = TracerProvider(resource=Resource.create({"service.name": "nova-pulse"}))
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
-    logging.info(
-        "✅ Jaeger tracing initialized on %s:%s", settings.JAEGER_HOST, settings.JAEGER_PORT
-    )
-
-# Telegram pushers
-async def push_signal_card(signal: dict):
-    try:
-        img = await generate_signal_card(signal)
-        caption = (
-            f"🚨 *Nova Pulse Signal*\n"
-            f"Symbol: {signal.get('symbol')}\n"
-            f"Confidence: {signal.get('score'):.2f}\n"
-            f"Entry: {signal.get('entry', 'N/A')}\n"
-            f"TP: {signal.get('tp', '...')} | SL: {signal.get('sl', '...')}\n"
-            f"@NovaPulseAI"
-        )
-        await bot.send_photo(
-            settings.TELEGRAM_CHAT_ID, img, caption, parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error("[push_signal_card] %s", e)
-
-async def push_trade_card(signal: dict, execution: dict):
-    try:
-        img = await generate_signal_card({**signal, **execution, "executed": True})
-        caption = (
-            f"💸 *Trade Executed*\n"
-            f"Symbol: {signal.get('symbol')} | Side: {execution.get('side', 'N/A')}\n"
-            f"Size: {execution.get('size', 'N/A')} | Entry: {execution.get('entry', 'N/A')}\n"
-            f"TP: {execution.get('tp', '...')} | SL: {execution.get('sl', '...')}\n"
-            f"Status: {'✅ Success' if execution.get('success') else '❌ Fail'}\n"
-            f"@NovaPulseAI"
-        )
-        await bot.send_photo(
-            settings.TELEGRAM_CHAT_ID, img, caption, parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error("[push_trade_card] %s", e)
-
-async def push_pnl_card(symbol: str):
-    try:
-        img = await generate_pnl_card(symbol)
-        caption = (
-            f"🏁 *Trade Closed*\nSymbol: {symbol}\nPnL snapshot below\n@NovaPulseAI"
-        )
-        await bot.send_photo(
-            settings.TELEGRAM_CHAT_ID, img, caption, parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error("[push_pnl_card] %s", e)
+    logging.info("✅ Jaeger tracing initialized on %s:%s", settings.JAEGER_HOST, settings.JAEGER_PORT)
 
 # ─ Startup & shutdown ─
 @app.on_event("startup")
@@ -218,7 +160,7 @@ async def startup_event():
     setup_tracing()
     logging.info("Prometheus metrics on port %s", settings.METRICS_PORT)
 
-    # Connect agents and subsystems
+    # 1) connect your agents
     for agent in AGENT_REGISTRY.values():
         if hasattr(agent, "connect"):
             await agent.connect()
@@ -226,13 +168,18 @@ async def startup_event():
     await explainer.connect()
     await auto_trader.connect()
     await execution_router.connect()
+
+    # 2) hook SentimentAgent into the PluginManager
+    register_sentiment_event_hook(fire_plugin_event)    # ← ensures sentiment events go to plugin bus
+
+    # 3) load any external plugins
     await load_plugins_from_dir()
 
-    # RL trainer & SL watchdog
+    # 4) RL trainer & SL watchdog
     asyncio.create_task(RLTrainerLoop(rl_tuner).start())
     asyncio.create_task(start_sl_watchdog(wallet_manager, trade_memory, execution_router))
 
-    # Auto-trade loop
+    # 5) auto-trade loop
     async def trade_loop():
         while True:
             try:
@@ -242,7 +189,7 @@ async def startup_event():
             await asyncio.sleep(60)
     asyncio.create_task(trade_loop())
 
-    # Automated signal loop
+    # 6) periodic signal generation
     symbols = os.getenv("WATCH_SYMBOLS", "SOL,ETH,BTC").split(",")
     interval = int(os.getenv("SIGNAL_INTERVAL", "60"))
     async def signal_loop():
@@ -259,7 +206,7 @@ async def startup_event():
             await asyncio.sleep(interval)
     asyncio.create_task(signal_loop())
 
-    # Helius webhook (if using)
+    # 7) Helius webhook
     await register_helius_webhook(settings)
 
     logging.info("Nova Pulse LIVE: %s", list(AGENT_REGISTRY.keys()))
@@ -304,21 +251,16 @@ async def generate_signal(request: Request):
 
     # Gather agent signals
     tasks = [
-        agent.analyze(symbol, **payload)
-        if hasattr(agent, "analyze")
-        else agent.score_sentiment(symbol)
+        agent.analyze(symbol, **payload) if hasattr(agent, "analyze")
+        else agent.fetch_sentiment({"symbol": symbol}, user=None)
         for agent in AGENT_REGISTRY.values()
     ]
     results = await asyncio.gather(*tasks)
 
     agent_results = []
     for name, res in zip(AGENT_REGISTRY.keys(), results):
-        score = getattr(res, "confidence", None) or getattr(res, "score", 0.0)
+        score = getattr(res, "sentiment_score", None) or getattr(res, "score", 0.0)
         meta = {}
-        if hasattr(res, "trust_score"):
-            meta["trust"] = res.trust_score
-        if hasattr(res, "volume"):
-            meta["volume"] = res.volume
         agent_results.append(
             {"source": name, "score": score, "meta": meta, "entry": getattr(res, "entry", 0.0)}
         )
