@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional
 from prometheus_client import Counter, Histogram
 from solders.pubkey import Pubkey
 from solana.rpc.async_api import AsyncClient
-from solders.transaction import Transaction
 
 from core.utils.config import Config, config
 from core.utils.plugin_manager import fire_plugin_event
@@ -27,10 +26,10 @@ logger = logging.getLogger("nova.onchain_flows")
 logger.setLevel(logging.INFO)
 
 # Prometheus metrics
-OCF_TX_FETCH  = Counter("ocf_tx_fetch_total", "Transactions fetched")
-OCF_ERRORS    = Counter("ocf_errors_total", "On-chain-flow errors")
+OCF_TX_FETCH  = Counter("ocf_tx_fetch_total",    "Transactions fetched")
+OCF_ERRORS    = Counter("ocf_errors_total",      "On-chain-flow errors")
 OCF_LATENCY   = Histogram("ocf_latency_seconds", "RPC latency")
-OCF_WHALE_EVT = Counter("ocf_whale_events_total", "Whale-size transfers detected")
+OCF_WH A LE_EVT = Counter("ocf_whale_events_total", "Whale-size transfers detected")
 
 def _hash(obj: Any) -> str:
     return hashlib.sha256(str(obj).encode()).hexdigest()
@@ -100,7 +99,7 @@ class OnChainFlows:
             else:
                 outflow += abs(delta)
             if abs(delta) >= self.whale_thresh:
-                OCF_WHALE_EVT.inc()
+                OCF_WH A LE_EVT.inc()
                 whales.append({
                     "sig":    tx.get("transaction", {}).get("signatures", ["?"])[0],
                     "amount": delta,
@@ -128,8 +127,7 @@ class OnChainFlows:
                     - t.get("meta", {}).get("preBalances", [0])[0]) / 1e9) >= thr
         ]
 
-# Convenience helper so upstream modules can do:
-#   from core.data_collection.onchain_flows import get_token_flow_stats
+# Convenience helper
 async def get_token_flow_stats(symbol: str, wallet: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
     svc = OnChainFlows(config)
     return await svc.token_flows(symbol, wallet or config.SOL_ADDRESS, limit=limit)
