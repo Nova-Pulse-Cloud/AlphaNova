@@ -1,4 +1,4 @@
-# File: src/telegram/commands/commands.py
+# File: telegram/commands/commands.py
 # 🚀 Nova Pulse ALPHA – Elite async commands for Nova Pulse
 
 import os
@@ -15,7 +15,7 @@ from core.utils.config import config
 from core.wallet_management.wallet_manager import WalletManager
 from core.utils.trade_memory import TradeMemory
 from core.signal_generation.reinforcement_tuner import ReinforcementTuner
-from core.signal_generation.adaptive_tp_sl import AdaptiveTPSL
+from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.utils.trade_logger import get_trade_log
 from core.signal_generation.signal_sources import get_top_signals
@@ -27,13 +27,13 @@ from core.utils.pnl_chart import generate_pnl_image
 from core.utils.signal_card import generate_signal_card
 from core.utils.plugin_manager import fire_plugin_event
 from core.signal_generation.reinforcement_learning import RLTrader
-from core.data_collection.social_sentiment import score_token_sentiment  # fixed import
+from core.data_collection.social_sentiment import score_token_sentiment
 
 # Initialize dependencies
 wallet_manager = WalletManager(config)
 trade_memory   = TradeMemory(config)
 rl_tuner       = ReinforcementTuner()
-adaptive_tp_sl = AdaptiveTPSL(memory=trade_memory, rl_agent=None)
+adaptive_tp_sl = AdaptiveTPSL(memory=trade_memory, rl_agent=rl_tuner)
 engine         = CombinedSignalEngine(trade_memory, rl_tuner, adaptive_tp_sl)
 
 # Redis for rate-limiting and auto-mode
@@ -87,10 +87,7 @@ async def start_handler(message: Message):
         ["/help"],
     ]
     markup = types.ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await message.answer(
-        "👋 Welcome to Nova Pulse! Choose a command:",
-        reply_markup=markup
-    )
+    await message.answer("👋 Welcome to Nova Pulse! Choose a command:", reply_markup=markup)
 
 @router.message(Command("help"))
 @admin_only
@@ -121,7 +118,7 @@ async def help_handler(message: Message):
 async def wallet_handler(message: Message):
     pubkey = wallet_manager.get_pubkey()
     await fire_plugin_event("cmd_wallet", {"pubkey": pubkey})
-    await message.answer(f"💼 *Wallet Public Key:*`{pubkey}`", parse_mode="Markdown")
+    await message.answer(f"💼 *Wallet Public Key:* `{pubkey}`", parse_mode="Markdown")
 
 @router.message(Command("pnl"))
 @admin_only
@@ -225,23 +222,23 @@ async def auto_handler(message: Message):
     if len(parts) != 2 or parts[1] not in ("on", "off"):
         await message.answer("Usage: /auto on|off")
         return
-    new = '1' if parts[1]=='on' else '0'
+    new = '1' if parts[1] == 'on' else '0'
     await auto_redis.set(f"auto:{message.from_user.id}", new)
     await fire_plugin_event("telegram_auto_toggle", {"mode": new, "user": message.from_user.id})
-    await message.answer(f"🤖 Auto-Trading {'ENABLED' if new=='1' else 'DISABLED'}")
+    await message.answer(f"🤖 Auto-Trading {'ENABLED' if new == '1' else 'DISABLED'}")
 
 @router.message(Command("status"))
 @admin_only
 async def status_handler(message: Message):
     mode = await auto_redis.get(f"auto:{message.from_user.id}") or '0'
-    status = "🟢 ON" if mode=='1' else "🔴 OFF"
+    status = "🟢 ON" if mode == '1' else "🔴 OFF"
     await message.answer(f"*Auto-Trading status:* {status}", parse_mode="Markdown")
 
 @router.message(Command("mode"))
 @admin_only
 async def mode_handler(message: Message):
     parts = message.text.split()
-    if len(parts)<2 or parts[1].lower() not in ("degen","moderate","safe"):
+    if len(parts) < 2 or parts[1].lower() not in ("degen", "moderate", "safe"):
         await message.answer("Usage: /mode <degen|moderate|safe>")
         return
     await auto_redis.set(f"risk_mode:{message.from_user.id}", parts[1].lower())
@@ -251,7 +248,7 @@ async def mode_handler(message: Message):
 @admin_only
 async def mirror_handler(message: Message):
     parts = message.text.split()
-    if len(parts)<2:
+    if len(parts) < 2:
         await message.answer("Usage: /mirror <SYMBOL>")
         return
     symbol = parts[1].upper()
@@ -263,5 +260,3 @@ async def mirror_handler(message: Message):
 async def export_handler(message: Message):
     await fire_plugin_event("cmd_export_data", {"user": message.from_user.id})
     await message.answer("🗃️ Export coming soon.")
-
-# EOF
