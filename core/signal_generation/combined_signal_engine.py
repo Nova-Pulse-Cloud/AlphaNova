@@ -27,7 +27,7 @@ from core.execution.execution_router import ExecutionRouter
 logger = logging.getLogger("nova.combined_signal_engine")
 logger.setLevel(logging.INFO)
 
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 SIG_TRIGGERS = Counter("signal_triggers_total",  "Total composite signal gens")
 SIG_ERRORS   = Counter("signal_errors_total",    "Composite signal errors")
 SIG_LATENCY  = Histogram("signal_latency_seconds","Composite signal latency")
