@@ -1,0 +1,9 @@
+[flake8]
+max-line-length = 88
+extend-ignore =
+    E203,  # whitespace before ':'
+    W391   # blank line at end of file
+
+# __init__.py often has harmless unused imports
+per-file-ignores =
+    **/__init__.py: F401,F403
