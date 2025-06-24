@@ -13,17 +13,17 @@ from core.utils.config import Config
 
 logger = logging.getLogger("risk_signals")
 
-# ─── Prometheus Metrics ──────────────────────────────
+# ─── Prometheus Metrics ─────────────────────────────────
 RISK_REQUESTS = Counter("risk_signals_requests_total", "Total risk signal requests")
 RISK_LATENCY = Histogram("risk_signals_latency_seconds", "Latency of risk assessment operations")
 RISK_ERRORS = Counter("risk_signals_errors_total", "Total errors in risk signal generation")
 
-# ─── External Sources/Constants ─────────────────────
+# ─── External Sources/Constants ────────────────────────
 JITO_SNIPER_DB = "https://raw.githubusercontent.com/jito-foundation/jito-snipers/main/snipers.json"
 TRAP_KEYWORDS = ["honeypot", "snipe", "rug", "trap", "scam", "exit"]
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/token/"
 
-# ─── Risk Data Model ────────────────────────────────
+# ─── Risk Data Model ─────────────────────────
 class RiskMetrics(BaseModel):
     symbol: str
     volatility: float
@@ -37,18 +37,9 @@ class RiskMetrics(BaseModel):
     rugcheck_score: float = None
     meta_risk_score: float = None
 
-# ─── Core Risk Engine ───────────────────────────────
+# ─── Core Risk Engine ─────────────────────────
 class RiskSignals:
     def __init__(self, redis_url: str, cmc_api_key: str, redis_ttl: int = 300, var_window: int = 252, vol_window: int = 30):
-        """
-        Initialize the RiskSignals engine with configuration settings.
-        
-        :param redis_url: URL for the Redis cache.
-        :param cmc_api_key: CoinMarketCap API key.
-        :param redis_ttl: Time-to-live for Redis cache (default: 300 seconds).
-        :param var_window: The window size (in days) for Value at Risk calculation (default: 252).
-        :param vol_window: The window size (in days) for volatility calculation (default: 30).
-        """
         self.redis_url = redis_url
         self.redis_ttl = redis_ttl
         self.cmc_api_key = cmc_api_key
@@ -57,13 +48,11 @@ class RiskSignals:
         self.redis = None
 
     async def connect_redis(self):
-        """Connect to Redis cache."""
         if self.redis is None:
             self.redis = await aioredis.from_url(self.redis_url, encoding="utf8", decode_responses=True)
             logger.info("[Risk] Connected to Redis.")
 
     async def check_jito_sniper(self, mint: str) -> Dict[str, Any]:
-        """Check if the mint is flagged by Jito sniper DB."""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(JITO_SNIPER_DB, timeout=10) as resp:
@@ -79,30 +68,24 @@ class RiskSignals:
 
     @staticmethod
     def symbol_is_trappy(symbol: str) -> bool:
-        """Check if the symbol name contains trap-related keywords."""
         symbol = symbol.lower()
         return any(kw in symbol for kw in TRAP_KEYWORDS)
 
     async def fetch_market_data(self, symbol: str) -> List[float]:
-        """Fetch market data (e.g., historical prices) for a symbol."""
         raise NotImplementedError("fetch_market_data must be wired to live pricing source (e.g., CMC, DEX aggregator)")
 
     def compute_var(self, prices: List[float], alpha: float = 0.05) -> float:
-        """Calculate Value at Risk (VaR) for the symbol."""
         returns = np.diff(prices) / prices[:-1]
         return np.percentile(returns, 100 * alpha)
 
     def compute_volatility(self, prices: List[float]) -> float:
-        """Calculate the volatility of the symbol."""
         returns = np.diff(prices) / prices[:-1]
         return np.std(returns) * np.sqrt(self.vol_window)
 
     async def compute_liquidity_risk(self, symbol: str) -> float:
-        """Calculate liquidity risk for the symbol."""
         raise NotImplementedError("compute_liquidity_risk must be connected to a DEX/CMC liquidity API")
 
     async def rugcheck_score(self, mint: str) -> float:
-        """Fetch the Rugcheck score for a symbol."""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RUGCHECK_API + mint, timeout=10) as resp:
@@ -114,7 +97,6 @@ class RiskSignals:
         return None
 
     async def meta_risk_ml_score(self, features: Dict[str, Any]) -> float:
-        """Compute a meta risk score based on multiple risk features."""
         base = 0.5
         if features.get("sniper_flag"):
             base += 0.25
@@ -125,13 +107,6 @@ class RiskSignals:
         return min(base, 1.0)
 
     async def get_risk_metrics(self, symbol: str, mint: str) -> RiskMetrics:
-        """
-        Generate the full risk metrics for a symbol by performing various risk checks.
-        
-        :param symbol: The symbol to assess (e.g., "BTC").
-        :param mint: The mint address of the token.
-        :return: A RiskMetrics object with the computed risk metrics.
-        """
         RISK_REQUESTS.inc()
         async with RISK_LATENCY.time():
             await self.connect_redis()
