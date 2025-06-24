@@ -4,44 +4,54 @@ on:
   push:
     branches: [ main ]
   pull_request:
+    branches: [ main ]
 
 jobs:
-  format-and-lint:
-    runs-on: ubuntu-latest
+  lint-and-test:
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        python: [3.10, 3.11]
+        python: [3.11]
 
     steps:
-      - name: 🚀 Checkout
-        uses: actions/checkout@v4
+      - name: 📂 Checkout code
+        uses: actions/checkout@v3
 
       - name: 🔧 Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python }}
+          check-latest: false
+          update-environment: true
+          allow-prereleases: false
 
-      - name: 📦 Install dev tools
+      - name: 📦 Install linters & formatters
         run: |
-          pip install --upgrade \
+          python -m pip install --upgrade pip
+          pip install \
             black \
             isort \
             autoflake \
             flake8
 
-      - name: 🧹 autoflake (remove unused)
+      - name: 🔍 Format-check with Black
         run: |
-          autoflake \
-            --in-place --recursive \
-            --remove-all-unused-imports \
-            --remove-unused-variables \
-            .
+          black --check .
 
-      - name: 📑 isort (sort imports)
-        run: isort .
+      - name: ➕ Import-sorting with isort
+        run: |
+          isort --check-only --diff .
 
-      - name: 🎨 black (format)
-        run: black .
+      - name: 🧹 Remove unused imports/code with autoflake
+        run: |
+          autoflake --check --recursive --remove-all-unused-imports --remove-unused-variables .
 
-      - name: 🔍 flake8 (lint)
-        run: flake8 .
+      - name: 📏 Code-style lint with flake8
+        run: |
+          flake8 .
+
+      # ─── add your test step(s) here if you have any ─────────────────────
+      # - name: ▶️ Run tests
+      #   run: |
+      #     pytest
+
