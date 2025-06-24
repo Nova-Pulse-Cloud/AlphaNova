@@ -21,6 +21,8 @@ from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.utils.config import config
 from core.utils.plugin_manager import fire_plugin_event
 from core.utils.trade_memory import TradeMemory
+from core.wallet_management.wallet_manager import WalletManager
+from core.execution.execution_router import ExecutionRouter
 
 logger = logging.getLogger("nova.combined_signal_engine")
 logger.setLevel(logging.INFO)
@@ -31,7 +33,6 @@ SIG_ERRORS   = Counter("signal_errors_total",    "Composite signal errors")
 SIG_LATENCY  = Histogram("signal_latency_seconds","Composite signal latency")
 SIG_ACTION   = Gauge("signal_action_gauge",       "RL action values", ["action"])
 
-# pre‐instantiate sentiment helper
 _sentiment = SocialSentiment(config)
 
 class AlphaSignal(BaseModel):
@@ -53,10 +54,12 @@ class CombinedSignalEngine:
     def __init__(
         self,
         trade_memory: TradeMemory,
+        wallet_manager: WalletManager,
         rl_tuner: ReinforcementTuner,
         adaptive_tp_sl: AdaptiveTPSL,
     ):
         self.trade_memory   = trade_memory
+        self.wallet_manager = wallet_manager
         self.rl_tuner       = rl_tuner
         self.adaptive_tp_sl = adaptive_tp_sl
         self.event_hooks: List[Any] = []
@@ -81,7 +84,6 @@ class CombinedSignalEngine:
         SIG_TRIGGERS.inc()
         start = datetime.utcnow()
         try:
-            # 1) Trust & memory weights
             scores, trusts = {}, {}
             mem_rate = await asyncio.get_event_loop().run_in_executor(
                 None, self.trade_memory.get_win_rate, symbol
@@ -94,17 +96,14 @@ class CombinedSignalEngine:
                 scores[src] = base * weight
                 trusts[src] = weight
 
-            # 2) Overlays
             ob_task    = asyncio.create_task(get_orderbook_imbalance(symbol))
             whale_task = asyncio.create_task(get_recent_whale_activity(symbol))
             flow_task  = asyncio.create_task(get_token_flow_stats(symbol))
             ob, whale, flow = await asyncio.gather(ob_task, whale_task, flow_task)
 
-            # 3) Sentiment
             sent_score   = await _sentiment.score_token_sentiment(symbol)
             caption_narr = await _sentiment.get_live_narrative(symbol)
 
-            # 4) Composite score & risk
             depth_adj = 1.0 - min(abs(ob), 1.0)
             whale_adj = whale.get("score", 0.0)
             composite = sum(scores.values()) / max(len(scores),1)
@@ -113,7 +112,6 @@ class CombinedSignalEngine:
             entry     = float(agent_signals[0].get("entry", 0.0)) if agent_signals else 0.0
             flavor    = "Safe" if score > 0.8 else "Moderate" if score > 0.3 else "Degen"
 
-            # 5) Adaptive TP/SL
             tp_sl = await self.adaptive_tp_sl.compute(
                 symbol,
                 entry,
@@ -122,7 +120,6 @@ class CombinedSignalEngine:
             tp = float(tp_sl["tp"])
             sl = float(tp_sl["sl"])
 
-            # 6) Build signal
             blob = f"{symbol}{scores}{flavor}{score}{risk}{entry}{tp}{sl}"
             sig = AlphaSignal(
                 symbol=symbol,
@@ -167,8 +164,7 @@ class CombinedSignalEngine:
             result = sig_res.dict()
 
             if user and await _sentiment._redis.get(f"auto:{user}") == "1":
-                from core.execution.execution_router import ExecutionRouter
-                router = ExecutionRouter(wallet_manager=self.trade_memory, rpc_nodes=[config.HELIUS_RPC])
+                router = ExecutionRouter(wallet_manager=self.wallet_manager, rpc_nodes=[config.HELIUS_RPC])
                 asyncio.create_task(router.execute_trade(result, user))
 
             return result
