@@ -1,37 +1,47 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [ main ]
+  pull_request:
 
 jobs:
-  lint-and-format:
+  format-and-lint:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: [3.10, 3.11]
+
     steps:
-      - name: Check out code
+      - name: 🚀 Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 🔧 Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'   # match your runtime
+          python-version: ${{ matrix.python }}
 
-      - name: Install formatting & linting tools
+      - name: 📦 Install dev tools
         run: |
-          pip install --upgrade black isort autoflake flake8
+          pip install --upgrade \
+            black \
+            isort \
+            autoflake \
+            flake8
 
-      - name: Autoflake (remove unused imports/vars)
+      - name: 🧹 autoflake (remove unused)
         run: |
           autoflake \
+            --in-place --recursive \
             --remove-all-unused-imports \
             --remove-unused-variables \
-            --in-place \
-            --recursive \
             .
 
-      - name: isort (sort imports)
+      - name: 📑 isort (sort imports)
         run: isort .
 
-      - name: black (format code)
+      - name: 🎨 black (format)
         run: black .
 
-      - name: flake8 (lint check)
+      - name: 🔍 flake8 (lint)
         run: flake8 .
