@@ -29,7 +29,7 @@ logger.setLevel(logging.INFO)
 OCF_TX_FETCH  = Counter("ocf_tx_fetch_total",    "Transactions fetched")
 OCF_ERRORS    = Counter("ocf_errors_total",      "On-chain-flow errors")
 OCF_LATENCY   = Histogram("ocf_latency_seconds", "RPC latency")
-OCF_WH A LE_EVT = Counter("ocf_whale_events_total", "Whale-size transfers detected")
+OCF_WHALE_EVT = Counter("ocf_whale_events_total", "Whale-size transfers detected")
 
 def _hash(obj: Any) -> str:
     return hashlib.sha256(str(obj).encode()).hexdigest()
@@ -99,7 +99,7 @@ class OnChainFlows:
             else:
                 outflow += abs(delta)
             if abs(delta) >= self.whale_thresh:
-                OCF_WH A LE_EVT.inc()
+                OCF_WHALE_EVT.inc()
                 whales.append({
                     "sig":    tx.get("transaction", {}).get("signatures", ["?"])[0],
                     "amount": delta,
