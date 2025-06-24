@@ -1,4 +1,3 @@
-```python
 # core/utils/dlq_manager.py
 
 import asyncio
@@ -92,4 +91,3 @@ async def replay_plugin_dlq(plugin_manager) -> List[Any]:
             logger.error(f"[DLQ Replay] Plugin replay error for {entry}: {e}")
     logger.info(f"[DLQ Replay] Plugin DLQ replay completed. Successes: {len(results)}")
     return results
-```
