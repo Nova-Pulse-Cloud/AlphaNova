@@ -62,7 +62,7 @@ class AlphaSignalAgent:
         self._cap_lock = asyncio.Lock()
 
         self.token_auditor  = TokenAuditor()
-        self.token_guardian = TokenGuardian
+        self.token_guardian = TokenGuardian()
         self.tpsl_agent     = AdaptiveTPSL(memory=self.memory, rl_agent=self.rl_tuner)
 
     async def connect(self):
