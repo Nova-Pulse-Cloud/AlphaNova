@@ -111,7 +111,8 @@ async def _explain_trade_llm(trade: TradeRequest, quote: dict, pnl: float) -> st
         logger.warning(f"[LLM Rationale Fallback] {e}")
         return f"Trade rationale for {trade.symbol} ({trade.side})."
 
-# Core: execute_trade\ async def execute_trade(
+# Core: execute_trade
+async def execute_trade(
     trade: TradeRequest,
     *,
     wallet_manager: WalletManager,
@@ -145,6 +146,7 @@ async def _explain_trade_llm(trade: TradeRequest, quote: dict, pnl: float) -> st
         )
 
     try:
+        
         # Market‑aware slippage
         imbalance = await get_orderbook_imbalance(trade.symbol)
         trade.slippage = max(trade.slippage, imbalance * 0.01)
