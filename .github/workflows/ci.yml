@@ -2,56 +2,52 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  lint-and-test:
-    runs-on: ubuntu-24.04
+  lint-and-format-check:
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: [3.11]
-
+        python-version: [3.11]
     steps:
-      - name: 📂 Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: 🔧 Set up Python ${{ matrix.python }}
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v4
         with:
-          python-version: ${{ matrix.python }}
+          python-version: ${{ matrix.python-version }}
           check-latest: false
-          update-environment: true
-          allow-prereleases: false
 
-      - name: 📦 Install linters & formatters
+      - name: Install linters & formatters
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            black \
-            isort \
-            autoflake \
-            flake8
+          pip install black isort autoflake flake8
 
-      - name: 🔍 Format-check with Black
+      - name: Automatically remove unused imports & vars
+        run: |
+          autoflake \
+            --recursive \
+            --in-place \
+            --remove-all-unused-imports \
+            --remove-unused-variables \
+            .
+
+      - name: Sort imports
+        run: |
+          isort .
+
+      - name: Reformat code
+        run: |
+          black .
+
+      - name: Lint & formatting checks
         run: |
           black --check .
-
-      - name: ➕ Import-sorting with isort
-        run: |
-          isort --check-only --diff .
-
-      - name: 🧹 Remove unused imports/code with autoflake
-        run: |
+          isort --check-only .
           autoflake --check --recursive --remove-all-unused-imports --remove-unused-variables .
-
-      - name: 📏 Code-style lint with flake8
-        run: |
           flake8 .
-
-      # ─── add your test step(s) here if you have any ─────────────────────
-      # - name: ▶️ Run tests
-      #   run: |
-      #     pytest
 
