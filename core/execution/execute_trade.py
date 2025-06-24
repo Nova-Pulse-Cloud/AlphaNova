@@ -1,11 +1,12 @@
 # File: core/execution/execute_trade.py
-# 🚀 Nova Pulse ALPHA – Ultra‑Grade Trade Executor (Phantom / Jupiter / Raydium)
+# 🚀 Nova Pulse ALPHA – Ultra-Grade Trade Executor (Phantom / Jupiter / Raydium)
 
+import asyncio
 import hashlib
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 import httpx
 from openai import AsyncOpenAI
@@ -29,7 +30,7 @@ logger = logging.getLogger("nova.execute_trade")
 logger.setLevel(logging.INFO)
 
 # Redis for auto-mode toggle
-redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
+auto_redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
 
 # Prometheus Metrics
 TRADES_EXECUTED = Counter("trades_executed_total", "Total trades executed")
@@ -52,7 +53,8 @@ async def _fire_trade_event(event_name: str, data: Dict[str, Any]):
         except Exception as e:
             logger.error(f"[Trade Event] Hook failure [{hook.__name__}]: {e}")
 
-# Pydantic Models\ class TradeRequest(BaseModel):
+# Pydantic Models
+class TradeRequest(BaseModel):
     symbol: str
     side: str  # "buy" or "sell"
     user_id: Optional[str] = "global"
@@ -73,7 +75,11 @@ class TradeResult(BaseModel):
     timestamp: int
     trace_id: Optional[str] = None
 
-# Helper Functions\ async def _retry_async(fn, retries: int, delay: int, err_msg: str):
+# Helper Functions
+async def _retry_async(fn, retries: int, delay: int, err_msg: str):
+    """
+    Retry an async function up to `retries` times with exponential backoff.
+    """
     for attempt in range(retries):
         try:
             return await fn()
@@ -121,7 +127,7 @@ async def execute_trade(
 ) -> TradeResult:
     """Execute a single live trade with full audit and auto-mode guard."""
     # Check auto-mode: only run if enabled for this user
-    auto_flag = await redis.get(f"auto:{trade.user_id}")
+    auto_flag = await auto_redis.get(f"auto:{trade.user_id}")
     if trade.user_id != "global" and auto_flag != "1":
         return TradeResult(
             success=False,
@@ -146,17 +152,16 @@ async def execute_trade(
         )
 
     try:
-        
-        # Market‑aware slippage
+        # Market-aware slippage
         imbalance = await get_orderbook_imbalance(trade.symbol)
         trade.slippage = max(trade.slippage, imbalance * 0.01)
 
         async with TRADE_LATENCY.time():
-            quote   = await _retry_async(lambda: router_fn.get_quote(trade), 2, 2, "DEX quote failed")
+            quote = await _retry_async(lambda: router_fn.get_quote(trade), 2, 2, "DEX quote failed")
             tx_hash, pnl = await _retry_async(lambda: router_fn.execute_swap(trade, quote), 2, 3, "Swap failed")
 
-        rationale    = await _retry_async(lambda: _explain_trade_llm(trade, quote, pnl), 2, 3, "LLM rationale failed")
-        pnl_card     = await generate_pnl_card(trade.symbol)
+        rationale = await _retry_async(lambda: _explain_trade_llm(trade, quote, pnl), 2, 3, "LLM rationale failed")
+        pnl_card  = await generate_pnl_card(trade.symbol)
 
         # Audit & Memory
         audit_data = {**trade.dict(), "tx_hash": tx_hash, "pnl": pnl}
