@@ -45,7 +45,7 @@ async def fire_source_event(event: str, payload: Dict[str, Any]) -> None:
     for hook in source_event_hooks:
         try:
             await hook(event, payload)
-        except Exception:
+        except Exception as e:
             logger.warning(f"[SignalSources] Event hook {hook.__name__} failed")
 
 
