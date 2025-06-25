@@ -1,12 +1,11 @@
 # core/utils/recovery_shard_manager.py
 
-import asyncio
 import hashlib
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple,
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import redis.asyncio as redis_client
 from prometheus_client import Counter, Histogram
@@ -30,9 +29,6 @@ SHARD_DLQ       = Counter("shard_dlq_total", "Shard DLQ events", ["group"])
 FAILED_SHARD_DLQ: List[Dict[str, Any]] = []
 _EVENT_HOOKS: List[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Hook registration & event firing
-# ────────────────────────────────────────────────────────────────────────────────
 def register_shard_event_hook(fn: Callable[[str, Dict[str, Any]], Awaitable[None]]) -> None:
     """Register a coroutine to receive shard events."""
     _EVENT_HOOKS.append(fn)
@@ -45,9 +41,6 @@ async def fire_shard_event(event: str, data: Dict[str, Any]) -> None:
         except Exception as e:
             logger.error(f"[ShardManager] Event hook error: {e}")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Internal helper – audit hash
-# ────────────────────────────────────────────────────────────────────────────────
 def _shard_hash(shard: Dict[str, Any]) -> str:
     """Compute a SHA256 hash for the shard payload."""
     return hashlib.sha256(json.dumps(shard, sort_keys=True).encode()).hexdigest()
@@ -103,12 +96,21 @@ class RecoveryShardManager:
                 key = f"shard:{group}:{key_user}:{ver}"
                 await self.redis.set(key, json.dumps(shard))
                 await self._prune_old_shards(group, key_user)
-                await fire_shard_event("shard_set", {"group": group, "user": key_user, "version": ver, "shard": shard})
+                await fire_shard_event("shard_set", {
+                    "group": group, "user": key_user, "version": ver, "shard": shard
+                })
                 self._backup_to_disk(key, shard)
         except Exception as e:
             SHARD_ERRORS.labels(group=group).inc()
             SHARD_DLQ.labels(group=group).inc()
-            failed = {"group": group, "user": key_user, "version": ver, "shard": shard, "error": str(e), "trace_id": trace_id}
+            failed = {
+                "group": group,
+                "user": key_user,
+                "version": ver,
+                "shard": shard,
+                "error": str(e),
+                "trace_id": trace_id
+            }
             FAILED_SHARD_DLQ.append(failed)
             await fire_shard_event("shard_set_failed", failed)
             logger.error(f"[ShardManager] Failed to set shard for {group}/{key_user}: {e}")
@@ -144,7 +146,12 @@ class RecoveryShardManager:
         """Retry failed shard operations from the DLQ."""
         for entry in FAILED_SHARD_DLQ[:]:
             try:
-                await self.set_shard(entry["group"], entry["shard"], entry.get("user"), entry.get("version"))
+                await self.set_shard(
+                    entry["group"],
+                    entry["shard"],
+                    entry.get("user"),
+                    entry.get("version"),
+                )
                 FAILED_SHARD_DLQ.remove(entry)
             except Exception as e:
                 logger.error(f"[ShardManager] Replay DLQ failed for {entry}: {e}")
