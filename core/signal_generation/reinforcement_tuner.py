@@ -180,7 +180,7 @@ class ReinforcementTuner:
                 res = await self.tune(entry.get("ctx", {}), {}, user=entry.get("user"))
                 successes.append(res)
                 FAILED_TUNER_DLQ.remove(entry)
-            except:
+            except Exception as e:
                 continue
         return successes
 
