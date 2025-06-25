@@ -20,7 +20,14 @@ from core.wallet_management.wallet_manager import WalletManager
 from core.data_collection.market_conditions import MarketConditionsService
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from core.signal_generation.reinforcement_learning import RLTrader
-from core.alpha_memory_mesh import update_memory
+# Attempt to import update_memory; if missing, stub it out
+try:
+    from core.alpha_memory_mesh import update_memory
+except ImportError:
+    async def update_memory(symbol: str, event: str, data: Dict[str, Any], user: Optional[str] = None):
+        # No-op fallback if update_memory not available
+        return
+
 from core.utils.plugin_manager import PluginManager
 from core.utils.pnl_card import generate_pnl_card
 
