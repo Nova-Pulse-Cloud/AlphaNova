@@ -102,7 +102,6 @@ class SignalSources:
                 return result
 
             try:
-                # Parallel plugin fetch
                 if plugin == "ensemble":
                     raw = await self._fetch_ensemble(ctx, user, simulation)
                 else:
@@ -224,7 +223,7 @@ class SignalSources:
 
     @staticmethod
     async def default_source(ctx: Dict[str, Any], user: Optional[str], simulation: bool) -> Dict[str, Any]:
-        # Fallback default plugin: returns safe dummy signal for symbol
+        
         now = int(time.time())
         return {
             "price": ctx.get("price", 1.0),
