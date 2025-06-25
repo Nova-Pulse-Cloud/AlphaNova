@@ -103,7 +103,7 @@ class TokenUtils:
             }
             payload = {"mintAccounts": [mint]}
             async with HTTP_LATENCY.time():
-                resp = await self.http.post(url, json=payload)
+                resp = await self.http.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 items = resp.json()
 
