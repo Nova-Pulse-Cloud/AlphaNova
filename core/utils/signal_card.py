@@ -5,7 +5,7 @@ import logging
 import os
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
-from typing import Dict
+from typing import Tuple, Any
 
 from core.signal_generation.sl_manager import get_last_sl_tp_for_token
 from core.utils.config import config
