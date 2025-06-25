@@ -1,7 +1,6 @@
-# File: ml_tp_sl.py
 """
 Nova Pulse ML TP/SL Predictor:
-- Async, plugin‑driven model chain
+- Async, plugin-driven model chain
 - Local sklearn fallback with joblib
 - Prometheus metrics and DLQ
 - Audit hash for reproducibility
@@ -11,7 +10,6 @@ import os
 import json
 import asyncio
 import logging
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Callable, Optional
 
 import joblib
@@ -39,15 +37,14 @@ _FAILED_DLQ: List[Dict[str, Any]] = []
 _TPSL_HOOKS: List[Callable[[str, Dict[str, Any]], Any]] = []
 
 def register_tpsl_hook(fn: Callable[[str, Dict[str, Any]], Any]) -> None:
-    """Register a hook for TP/SL events."""
     _TPSL_HOOKS.append(fn)
 
 async def _fire_tpsl_event(event: str, payload: Dict[str, Any]) -> None:
     for hook in list(_TPSL_HOOKS):
         try:
-            result = hook(event, payload)
-            if asyncio.iscoroutine(result):
-                await result
+            r = hook(event, payload)
+            if asyncio.iscoroutine(r):
+                await r
         except Exception as exc:
             logger.warning(f"[ML_TPSL] Hook error on {event}: {exc}")
 
@@ -57,37 +54,39 @@ async def _fire_tpsl_event(event: str, payload: Dict[str, Any]) -> None:
 _TPSL_PLUGINS: Dict[str, Callable[[Dict[str, Any], Optional[str]], Any]] = {}
 
 def register_tpsl_plugin(name: str, fn: Callable[[Dict[str, Any], Optional[str]], Any]) -> None:
-    """Register a TP/SL plugin."""
     _TPSL_PLUGINS[name] = fn
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers stubs: extract_features & feedback hook
+# ────────────────────────────────────────────────────────────────────────────────
+def extract_features(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "entry_price": ctx.get("entry", 0.0),
+        "volatility": ctx.get("volatility", 0.0),
+        "trend_strength": ctx.get("trend_strength", 0.0),
+        "liquidity": ctx.get("liquidity", 0.0),
+        "whale_pressure": ctx.get("whale_pressure", 0.0),
+    }
+
+async def tpsl_rl_feedback(features: Dict[str, Any], outcome: Dict[str, Any]) -> None:
+    ML_TPSL_FEEDBACK.inc()
+    # placeholder for RL feedback logic
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Constants
 # ────────────────────────────────────────────────────────────────────────────────
-_MODEL_PATH      = config.TPSL_MODEL_PATH or "models/tp_sl_predictor.pkl"
-_FALLBACK_TP     = config.DEFAULT_TP_PCT or 0.07
-_FALLBACK_SL     = config.DEFAULT_SL_PCT or 0.04
+_MODEL_PATH  = config.TPSL_MODEL_PATH
+_FALLBACK_TP = config.DEFAULT_TP_PCT
+_FALLBACK_SL = config.DEFAULT_SL_PCT
 _CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Main prediction
 # ────────────────────────────────────────────────────────────────────────────────
-
-def _audit_hash(features: Dict[str, Any], result: Dict[str, Any]) -> str:
-    import hashlib
-    h = hashlib.sha256()
-    h.update(json.dumps(features, sort_keys=True).encode())
-    h.update(json.dumps(result, sort_keys=True).encode())
-    return h.hexdigest()
-
 async def predict_tp_sl(
     features: Dict[str, Any],
-    use_cloud: bool = False,
     user: Optional[str] = None
 ) -> Tuple[float, float, Dict[str, Any]]:
-    """
-    Predict TP/SL given feature dict.
-    Returns (tp_price, sl_price, metadata).
-    """
     ML_TPSL_CALLS.inc()
     key = json.dumps(features, sort_keys=True)
     if key in _CACHE:
@@ -99,7 +98,7 @@ async def predict_tp_sl(
             # plugin chain
             for name, fn in _TPSL_PLUGINS.items():
                 try:
-                    out = fn(features, user)  # may return coroutine
+                    out = fn(features, user)
                     if asyncio.iscoroutine(out):
                         out = await out
                     tp_pct, sl_pct, meta = out
@@ -109,21 +108,14 @@ async def predict_tp_sl(
                     continue
 
             if not result:
-                # local model fallback
+                # fallback to local model or defaults
                 if os.path.exists(_MODEL_PATH):
                     model = joblib.load(_MODEL_PATH)
-                    X = np.array([[
-                        features.get("entry_price", 0.0),
-                        features.get("volatility", 0.0),
-                        features.get("trend_strength", 0.0),
-                        features.get("liquidity", 0.0),
-                        features.get("whale_pressure", 0.0)
-                    ]])
+                    X = np.array([[features.get(k, 0.0) for k in ("entry_price","volatility","trend_strength","liquidity","whale_pressure")]])
                     preds = model.predict(X)[0]
                     result = {"tp_pct": float(preds[0]), "sl_pct": float(preds[1]), "plugin": "sklearn"}
                 else:
                     result = {"tp_pct": _FALLBACK_TP, "sl_pct": _FALLBACK_SL, "plugin": "fallback"}
-
     except Exception as exc:
         ML_TPSL_ERRORS.inc()
         ML_TPSL_DLQ.inc()
@@ -132,35 +124,12 @@ async def predict_tp_sl(
         await _fire_tpsl_event("error", entry)
         result = {"tp_pct": _FALLBACK_TP, "sl_pct": _FALLBACK_SL, "plugin": "fallback"}
 
-    # compute prices
     entry_price = float(features.get("entry_price", 0.0))
     tp_price = round(entry_price * (1 + result["tp_pct"]), 8)
     sl_price = round(entry_price * (1 - result["sl_pct"]), 8)
     result.update({"tp_price": tp_price, "sl_price": sl_price})
-    result["audit_hash"] = _audit_hash(features, result)
+    result["audit_hash"] = hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest()
     _CACHE[key] = result
 
     await _fire_tpsl_event("prediction", {"features": features, **result})
     return tp_price, sl_price, result
-
-async def replay_dlq() -> None:
-    """Retry any failed predictions."""
-    for entry in list(_FAILED_DLQ):
-        try:
-            await predict_tp_sl(entry["features"])
-            _FAILED_DLQ.remove(entry)
-        except Exception:
-            pass
-
-def get_dlq() -> List[Dict[str, Any]]:
-    return list(_FAILED_DLQ)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Optional: Register Jupiter plugin if available
-# ────────────────────────────────────────────────────────────────────────────────
-try:
-    from core.utils.tpsl_jupiter_plugin import jupiter_tp_sl_plugin
-    register_tpsl_plugin("jupiter", jupiter_tp_sl_plugin)
-    logger.info("[ML_TPSL] Jupiter plugin registered.")
-except ImportError:
-    logger.info("[ML_TPSL] Jupiter plugin not found, skipping.")
