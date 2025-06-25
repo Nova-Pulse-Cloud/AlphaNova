@@ -1,144 +1,160 @@
-# core/utils/token_utils.py
-
+# File: core/utils/token_logo.py
+"""
+Production-grade Token Logo Service for Nova Pulse.
+Handles fetching, caching, resizing, and placeholder generation for token icons.
+"""
+import asyncio
 import logging
-import json
-from datetime import datetime
-from typing import Any, Dict, Optional
+from io import BytesIO
+from pathlib import Path
+from typing import Optional, List
 
 import httpx
 import redis.asyncio as redis_client
-from pydantic import BaseModel, Field
+from PIL import Image, ImageDraw, ImageFont
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential_jitter
 from prometheus_client import Counter, Histogram
 
 from core.utils.config import config
 
-logger = logging.getLogger("nova.token_utils")
+logger = logging.getLogger("nova.token_logo")
 logger.setLevel(logging.INFO)
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Metrics
-# ────────────────────────────────────────────────────────────────────────────────
-CACHE_HITS = Counter("token_utils_cache_hits_total", "Cache hits for token utils")
-CACHE_MISSES = Counter("token_utils_cache_misses_total", "Cache misses for token utils")
-TOKEN_ERRORS = Counter("token_utils_errors_total", "Errors in token utils")
-CACHE_LATENCY = Histogram("token_utils_cache_latency_seconds", "Latency of cache operations")
-HTTP_LATENCY = Histogram("token_utils_http_latency_seconds", "Latency of HTTP requests")
+# ─────────────────────────────────────────────────────────────────────────────
+LOGO_CACHE_HITS   = Counter("token_logo_cache_hits_total", "Cache hits for token logos")
+LOGO_CACHE_MISSES = Counter("token_logo_cache_misses_total", "Cache misses for token logos")
+LOGO_FETCH_ERRORS = Counter("token_logo_fetch_errors_total", "Errors fetching token logos")
+SOURCE_SUCCESS    = Counter("token_logo_source_success_total", "Successful fetches per source", ["source"])
+SOURCE_FAILURE    = Counter("token_logo_source_failure_total", "Failed fetches per source", ["source"])
+LOGO_LATENCY      = Histogram("token_logo_latency_seconds", "Latency of token logo operations")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Data Models
-# ────────────────────────────────────────────────────────────────────────────────
-class TokenMetadata(BaseModel):
-    name: str
-    symbol: str
-    decimals: int = Field(..., ge=0)
+# ─────────────────────────────────────────────────────────────────────────────
+# Configurable paths and cache
+# ─────────────────────────────────────────────────────────────────────────────
+TRUSTED_LOGO_SOURCES: List[str] = config.TRUSTED_LOGO_SOURCES
+DEFAULT_LOGO_PATH = Path(config.DEFAULT_LOGO_PATH)
+LOGO_DIR = Path(config.LOGO_DIR)
+LOGO_DIR.mkdir(parents=True, exist_ok=True)
 
-class TokenPrice(BaseModel):
-    mint: str
-    price: float = Field(..., gt=0)
-    timestamp: int
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Token Utilities
-# ────────────────────────────────────────────────────────────────────────────────
-class TokenUtils:
+class TokenLogoService:
     """
-    Fetches and caches token metadata and prices using Helius and Birdeye APIs.
-    Async, retry-enabled HTTP calls, Redis caching, and Prometheus metrics.
+    Async service to get token icons:
+      - Checks Redis cache
+      - Fetches from trusted sources with retries
+      - Generates placeholder if missing
+      - Resizes and caches result
+      - Persists to disk
     """
-    def __init__(self, cache_ttl: int = 300):
+    def __init__(self, ttl: int = 86400) -> None:
         self.redis_url = config.REDIS_URL
-        self.helius_key = config.HELIUS_API_KEY
-        self.helius_base = config.HELIUS_RPC  # use RPC for on-chain flows or adjust API URL
-        self.birdeye_url = config.GECKO_API_URL.rstrip('/') + "/public/price"
-        self.cache_ttl = cache_ttl
+        self.ttl = ttl
         self.redis: Optional[redis_client.Redis] = None
-        self.http = httpx.AsyncClient(timeout=10)
+        self.http = httpx.AsyncClient(timeout=5)
 
     async def connect(self) -> None:
         try:
-            self.redis = redis_client.from_url(self.redis_url, decode_responses=True)
+            self.redis = redis_client.from_url(self.redis_url, decode_responses=False)
             await self.redis.ping()
-            logger.info("[TokenUtils] Redis connected")
+            logger.info("[TokenLogoService] Connected to Redis")
         except Exception as e:
-            logger.error(f"[TokenUtils] Redis connection failed: {e}")
+            logger.error(f"[TokenLogoService] Redis connection failed: {e}")
             self.redis = None
 
     async def disconnect(self) -> None:
         await self.http.aclose()
         if self.redis:
             await self.redis.close()
-        logger.info("[TokenUtils] Shutdown complete")
 
-    async def get_token_metadata(self, mint: str) -> TokenMetadata:
-        key = f"token_meta:{mint}"
-        start = datetime.utcnow().timestamp()
-        try:
-            # Cache lookup
-            with CACHE_LATENCY.time():
-                if self.redis:
-                    cached = await self.redis.get(key)
-                    if cached:
-                        CACHE_HITS.inc()
-                        return TokenMetadata.parse_raw(cached)
-            CACHE_MISSES.inc()
-
-            # Fetch via Helius API
-            url = f"{config.HELIUS_RPC}/tokens/metadata"
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.helius_key}"}
-            payload = {"mintAccounts": [mint]}
-            async with HTTP_LATENCY.time():
-                resp = await self.http.post(url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-
-            item = data[0] if isinstance(data, list) and data else {}
-            meta = TokenMetadata(
-                name=item.get("name", ""),
-                symbol=item.get("symbol", mint[:4].upper()),
-                decimals=item.get("decimals", 6),
-            )
+    async def get_logo(self, mint: str, size: int = 128) -> bytes:
+        cache_key = f"token_logo:{mint}:{size}"
+        async with LOGO_LATENCY.time():
+            await self.connect()
+            # Try cache
+            data = await self._get_cache(cache_key)
+            if data:
+                return data
+            # Fetch or generate
+            img_bytes = await self._fetch_or_placeholder(mint, size)
+            # Cache result
             if self.redis:
-                await self.redis.set(key, meta.json(), ex=self.cache_ttl)
-            return meta
-        except Exception as e:
-            TOKEN_ERRORS.inc()
-            logger.error(f"[TokenUtils] Metadata fetch failed for {mint}: {e}")
-            # Return fallback metadata
-            return TokenMetadata(name="Unknown", symbol=mint[:4].upper(), decimals=6)
+                await self.redis.set(cache_key, img_bytes, ex=self.ttl)
+            # Persist to disk
+            await self._persist_disk(mint, size, img_bytes)
+            return img_bytes
 
-    async def get_token_price(self, mint: str) -> TokenPrice:
-        key = f"token_price:{mint}"
-        with CACHE_LATENCY.time():
-            if self.redis:
-                cached = await self.redis.get(key)
-                if cached:
-                    CACHE_HITS.inc()
-                    return TokenPrice.parse_raw(cached)
-        CACHE_MISSES.inc()
-
-        # Fetch price via Birdeye API with retries
-        url = self.birdeye_url
-        params = {"address": mint}
+    async def _get_cache(self, key: str) -> Optional[bytes]:
+        if not self.redis:
+            return None
         try:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 5), reraise=True
-            ):
-                with HTTP_LATENCY.time():
-                    resp = await self.http.get(url, params=params)
-                    resp.raise_for_status()
-                    payload = resp.json()
-                    value = payload.get("data", {}).get("value", 0)
-                    if not value or value <= 0:
-                        raise RuntimeError("Invalid price data")
-                    price = float(value)
-                    ts = int(datetime.utcnow().timestamp())
-                    quote = TokenPrice(mint=mint, price=price, timestamp=ts)
-                    if self.redis:
-                        await self.redis.set(key, quote.json(), ex=self.cache_ttl)
-                    return quote
+            data = await self.redis.get(key)
+            if data:
+                LOGO_CACHE_HITS.inc()
+                return data
         except Exception as e:
-            TOKEN_ERRORS.inc()
-            logger.error(f"[TokenUtils] Price fetch failed for {mint}: {e}")
-            # Fallback: zero price
-            return TokenPrice(mint=mint, price=0.0, timestamp=int(datetime.utcnow().timestamp()))
+            logger.warning(f"[TokenLogoService] Cache get error: {e}")
+        # Miss
+        LOGO_CACHE_MISSES.inc()
+        return None
+
+    async def _fetch_or_placeholder(self, mint: str, size: int) -> bytes:
+        # Try online sources
+        for template in TRUSTED_LOGO_SOURCES:
+            url = template.format(mint=mint)
+            try:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 3), reraise=True
+                ):
+                    with LOGO_LATENCY.time():
+                        resp = await self.http.get(url)
+                        resp.raise_for_status()
+                data = resp.content
+                resized = await asyncio.to_thread(self._resize, data, size)
+                SOURCE_SUCCESS.labels(source=url).inc()
+                return resized
+            except Exception as e:
+                SOURCE_FAILURE.labels(source=url).inc()
+                logger.debug(f"[TokenLogoService] Fetch failed {url}: {e}")
+        # Fallback
+        LOGO_FETCH_ERRORS.inc()
+        return await asyncio.to_thread(self._placeholder, mint, size)
+
+    def _resize(self, data: bytes, size: int) -> bytes:
+        try:
+            img = Image.open(BytesIO(data)).convert("RGBA")
+            img = img.resize((size, size), Image.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as e:
+            LOGO_FETCH_ERRORS.inc()
+            logger.error(f"[TokenLogoService] Resize failed: {e}")
+            return data
+
+    def _placeholder(self, mint: str, size: int) -> bytes:
+        # Use default asset if exists
+        if DEFAULT_LOGO_PATH.exists():
+            try:
+                data = DEFAULT_LOGO_PATH.read_bytes()
+                return self._resize(data, size)
+            except Exception as e:
+                logger.warning(f"[TokenLogoService] Default asset load failed: {e}")
+        # Dynamic text placeholder
+        img = Image.new("RGBA", (size, size), (50, 50, 50, 255))
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.load_default()
+        text = mint[:4].upper()
+        w, h = draw.textsize(text, font=font)
+        draw.text(((size - w) / 2, (size - h) / 2), text, font=font, fill=(255, 255, 255, 255))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    async def _persist_disk(self, mint: str, size: int, data: bytes) -> None:
+        try:
+            path = LOGO_DIR / f"{mint}_{size}.png"
+            await asyncio.to_thread(path.write_bytes, data)
+        except Exception as e:
+            logger.warning(f"[TokenLogoService] Disk write failed: {e}")
