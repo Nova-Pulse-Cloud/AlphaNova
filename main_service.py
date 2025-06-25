@@ -242,14 +242,17 @@ async def on_startup() -> None:
         while True:
             try:
                 tokens = await token_scanner.get_all_tokens(filter_rugs=True)
-                # You can integrate signal generation directly here
                 logging.info("Scanned %d tokens at %s", len(tokens), datetime.utcnow())
             except Exception as exc:
                 logging.error("Scan loop error: %s", exc)
             await asyncio.sleep(settings.SIGNAL_INTERVAL)
 
     asyncio.create_task(scan_loop())
-    await register_helius_webhook(settings)
+
+-    await register_helius_webhook(settings)
++    # Mount Helius webhook routes onto FastAPI
++    register_helius_webhook(app)
+
     logging.info("Nova Pulse LIVE with agents: %s", list(AGENT_REGISTRY.keys()))
 
 
@@ -343,24 +346,4 @@ async def generate_signal(request: Request):
     )
     await push_trade_update(fused)
     if exec_res.get("success") and exec_res.get("exit"):
-        await push_pnl_card(fused["symbol"])
-
-    return fused
-
-
-# Token audit endpoint
-@app.post("/audit/{address}")
-async def audit_token(address: str):
-    result = await auditor.audit_token(address)
-    return result.dict()
-
-
-# Explain signal endpoint
-@app.post("/explain_signal")
-async def explain_signal(request: Request):
-    payload = await request.json()
-    symbol = payload.get("symbol")
-    if not symbol:
-        raise HTTPException(400, "Missing 'symbol' in payload")
-    explanation = await explainer.explain(symbol, payload.get("context", {}))
-    return explanation.dict() if hasattr(explanation, "dict") else explanation
+        await push_pnl_card(fused["symbol"])```
