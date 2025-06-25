@@ -1,9 +1,8 @@
-# core/alpha_memory_mesh.py
 """
 Nova Pulse ALPHA – Alpha Memory Mesh (Elite Trade Meta-Learning Layer)
 ────────────────────────────────────────────────────────────────────────
 • Tracks advanced memory states for signals, trades, and token patterns
-• Used for RL and trade explainer AI modules
+• Used by trade explainer, RL agent, and advanced TP/SL overlays
 • Supports elite risk overlays, regret/prune, and pattern scoring
 • 100% compatible with the rest of the Nova Pulse system
 """
@@ -61,3 +60,23 @@ class MemoryMesh:
     def to_json(self) -> Dict[str, Any]:
         with self._lock:
             return {k: v for k, v in self._memory.items()}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Module-level singleton and async helper
+# ───────────────────────────────────────────────────────────────────────────────
+
+_mesh = MemoryMesh()
+
+async def update_memory(
+    symbol: str,
+    event_type: str,
+    data: Dict[str, Any],
+    user: Optional[str] = None
+) -> None:
+    """
+    Async helper to update the memory mesh with arbitrary event data.
+    """
+    # Construct a synthetic trade record using provided data
+    trade_record = {"symbol": symbol, **data}
+    signal_context = {"event_type": event_type, "user": user}
+    _mesh.log_trade(trade_record, signal_context)
