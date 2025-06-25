@@ -158,7 +158,7 @@ class QuantumFractalAgent:
             try:
                 _ = await self.analyze(failed["symbol"], failed.get("points", []), failed.get("user"), force_refresh=True)
                 FAILED_FRACTAL_DLQ.remove(failed)
-            except:
+            except Exception as e:
                 pass
 
     def get_dlq(self):
