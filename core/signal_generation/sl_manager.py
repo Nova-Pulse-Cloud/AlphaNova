@@ -43,7 +43,7 @@ class SLResult(BaseModel):
     sl: float = Field(..., ge=0)
     method: str
     meta: Dict[str, Any]
-    event: Optional[str] = None  # for plugin events, e.g. 'tp_hit', 'sl_hit'
+    event: Optional[str] = None
     audit_hash: Optional[str] = None
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -55,10 +55,10 @@ def register_slm_plugin(name: str, fn: Any) -> None:
     _slm_plugins[name] = fn
     logger.info(f"[SLM] Registered plugin: {name}")
 
-# register Jupiter plugin
+# Register Jupiter plugin
 register_slm_plugin("jupiter", jupiter_tp_sl_plugin)
 
-# adaptive instance
+# Adaptive instance
 _adaptive = AdaptiveTPSL(config)
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -76,9 +76,6 @@ class SLManager:
         methods: Optional[List[str]] = None,
         timeout: float = 5.0
     ) -> SLResult:
-        """
-        Compute TP/SL using specified methods in parallel, with full plugin event logging and audit trail.
-        """
         key = ctx.get("trace_id", str(id(ctx)))
         async with self._lock:
             cached = self._cache.get(key)
@@ -87,9 +84,7 @@ class SLManager:
                 return cached[0]
 
         methods = methods or ["ml", "adaptive", *_slm_plugins.keys()]
-        tasks = []
-        for m in methods:
-            tasks.append(self._run_method(ctx, m, timeout))
+        tasks = [self._run_method(ctx, m, timeout) for m in methods]
 
         results: List[SLResult] = []
         for task in asyncio.as_completed(tasks):
@@ -105,7 +100,6 @@ class SLManager:
         if not results:
             raise RuntimeError("All TP/SL methods failed")
 
-        # choose by lowest expected_loss then highest confidence
         ranked = sorted(
             results,
             key=lambda r: (r.meta.get("expected_loss", float('inf')), -r.meta.get("confidence", 0))
@@ -126,7 +120,6 @@ class SLManager:
     ) -> SLResult:
         label = method
         SLM_CALLS.labels(method=label).inc()
-        start = asyncio.get_event_loop().time()
         try:
             async with SLM_LATENCY.labels(method=label).time():
                 if method == "ml":
@@ -160,13 +153,11 @@ class SLManager:
         ctx: Dict[str, Any],
         outcome: Dict[str, Any]
     ) -> None:
-        # ML feedback
         try:
             features = extract_features(ctx)
             await tpsl_rl_feedback(features, outcome)
         except Exception:
             pass
-        # adaptive feedback
         try:
             await _adaptive.tpsl_rl_feedback(ctx, outcome)
         except Exception:
@@ -176,7 +167,6 @@ class SLManager:
         self._cache.clear()
 
     async def replay_dlq(self) -> None:
-        # implement DLQ replay if desired
         pass
 
     @staticmethod
@@ -185,5 +175,15 @@ class SLManager:
         raw = str(slresult.dict()).encode()
         return hashlib.sha256(raw).hexdigest()
 
-# singleton
+    def get_last_sl_tp_for_token(self, symbol: str) -> Optional[SLResult]:
+        for k, (res, _) in self._cache.items():
+            if res.meta.get("symbol") == symbol:
+                return res
+        return None
+
+# Singleton
 sl_manager = SLManager()
+
+# Expose utility method
+def get_last_sl_tp_for_token(symbol: str) -> Optional[SLResult]:
+    return sl_manager.get_last_sl_tp_for_token(symbol)
