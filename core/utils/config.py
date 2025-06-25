@@ -1,5 +1,3 @@
-# core/utils/config.py
-
 import os
 import json
 import re
@@ -73,6 +71,14 @@ class Config:
         self.MACRO_API_URL        = self._require("MACRO_API_URL")
         self.MACRO_API_KEY        = self._require("MACRO_API_KEY")
         self.ETHERSCAN_API_KEY    = self._require("ETHERSCAN_API_KEY")
+
+        # ML TP/SL model path & defaults
+        self.TPSL_MODEL_PATH = os.getenv("TPSL_MODEL_PATH", "models/tp_sl_predictor.pkl")
+        try:
+            self.DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.07"))
+            self.DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.04"))
+        except ValueError:
+            raise ValueError("[Config] DEFAULT_TP_PCT and DEFAULT_SL_PCT must be floats")
 
         # Optional Jaeger tracing
         self.JAEGER_HOST = os.getenv("JAEGER_HOST", "localhost")
