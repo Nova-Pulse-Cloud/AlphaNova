@@ -1,4 +1,3 @@
-# File: core/execution/execute_trade.py
 # 🚀 Nova Pulse ALPHA – Ultra-Grade Trade Executor (Phantom / Jupiter / Raydium)
 
 import asyncio
@@ -6,13 +5,12 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, List, Tuple
 
 import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram
-
 import aioredis
 
 from core.utils.config import config
@@ -20,14 +18,7 @@ from core.wallet_management.wallet_manager import WalletManager
 from core.data_collection.market_conditions import MarketConditionsService
 from core.data_collection.orderbook_overlay import get_orderbook_imbalance
 from core.signal_generation.reinforcement_learning import RLTrader
-# Attempt to import update_memory; if missing, stub it out
-try:
-    from core.alpha_memory_mesh import update_memory
-except ImportError:
-    async def update_memory(symbol: str, event: str, data: Dict[str, Any], user: Optional[str] = None):
-        # No-op fallback if update_memory not available
-        return
-
+from core.alpha_memory_mesh import update_memory
 from core.utils.plugin_manager import PluginManager
 from core.utils.pnl_card import generate_pnl_card
 
@@ -47,8 +38,8 @@ TRADE_PNL       = Gauge("trade_pnl", "Realized PnL from trades")
 TRADE_DLQ       = Counter("trade_dlq_total", "Failed trades in DLQ")
 
 # Event Hooks & DLQ
-trade_event_hooks: list[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
-FAILED_TRADES_DLQ: list = []
+trade_event_hooks: List[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
+FAILED_TRADES_DLQ: List[Dict[str, Any]] = []
 
 def register_trade_event_hook(hook_fn: Callable[[str, Dict[str, Any]], Awaitable[None]]):
     trade_event_hooks.append(hook_fn)
@@ -78,15 +69,12 @@ class TradeResult(BaseModel):
     error: Optional[str] = None
     audit_hash: Optional[str] = None
     rationale: Optional[str] = None
-    pnl_card: Optional[str] = None
+    pnl_card: Optional[bytes] = None
     timestamp: int
     trace_id: Optional[str] = None
 
 # Helper Functions
-async def _retry_async(fn, retries: int, delay: int, err_msg: str):
-    """
-    Retry an async function up to `retries` times with exponential backoff.
-    """
+async def _retry_async(fn: Callable[[], Awaitable[Any]], retries: int, delay: int, err_msg: str) -> Any:
     for attempt in range(retries):
         try:
             return await fn()
@@ -124,7 +112,7 @@ async def _explain_trade_llm(trade: TradeRequest, quote: dict, pnl: float) -> st
         logger.warning(f"[LLM Rationale Fallback] {e}")
         return f"Trade rationale for {trade.symbol} ({trade.side})."
 
-# Core: execute_trade
+# ─ Core: execute_trade ─────────────────────────────────────────────────────────
 async def execute_trade(
     trade: TradeRequest,
     *,
@@ -132,31 +120,19 @@ async def execute_trade(
     market_service: MarketConditionsService,
     plugin_manager: PluginManager,
 ) -> TradeResult:
-    """Execute a single live trade with full audit and auto-mode guard."""
-    # Check auto-mode: only run if enabled for this user
+    # Auto-mode guard
     auto_flag = await auto_redis.get(f"auto:{trade.user_id}")
     if trade.user_id != "global" and auto_flag != "1":
-        return TradeResult(
-            success=False,
-            error="auto-mode off",
-            timestamp=int(datetime.utcnow().timestamp()),
-            trace_id=trade.trace_id,
-        )
+        return TradeResult(success=False, error="auto-mode off", timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
 
     TRADES_EXECUTED.inc()
     rl_trader = RLTrader()
 
-    # Routing and trade execution
     router_fn = plugin_manager.get_router(trade.dex)
     if not router_fn:
         TRADE_ERRORS.inc()
         await _fire_trade_event("router_not_found", trade.dict())
-        return TradeResult(
-            success=False,
-            error=f"Router {trade.dex} not found",
-            timestamp=int(datetime.utcnow().timestamp()),
-            trace_id=trade.trace_id,
-        )
+        return TradeResult(success=False, error=f"Router {trade.dex} not found", timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
 
     try:
         # Market-aware slippage
@@ -168,14 +144,14 @@ async def execute_trade(
             tx_hash, pnl = await _retry_async(lambda: router_fn.execute_swap(trade, quote), 2, 3, "Swap failed")
 
         rationale = await _retry_async(lambda: _explain_trade_llm(trade, quote, pnl), 2, 3, "LLM rationale failed")
-        pnl_card  = await generate_pnl_card(trade.symbol)
+        pnl_card = await generate_pnl_card(trade.symbol)
 
         # Audit & Memory
         audit_data = {**trade.dict(), "tx_hash": tx_hash, "pnl": pnl}
         audit_hash = hashlib.sha256(str(audit_data).encode()).hexdigest()
         await update_memory(trade.symbol, "trade_audit", audit_data, user=trade.user_id)
 
-        # Rewards
+        # Reinforcement
         rl_trader.reward(trade.meta, {"pnl": pnl}, user=trade.user_id)
         TRADE_PNL.set(pnl or 0.0)
 
@@ -190,7 +166,6 @@ async def execute_trade(
             trace_id=trade.trace_id,
         )
 
-        # Post-trade hooks
         await plugin_manager.post_trade(trade.dict(), result.dict())
         await _fire_trade_event("trade_success", {**trade.dict(), **result.dict()})
         await _telegram_alert(f"✅ Trade success: {trade.symbol} {trade.side} PnL: {pnl:.4f}")
@@ -204,9 +179,38 @@ async def execute_trade(
         await plugin_manager.post_trade(trade.dict(), {"success": False, "error": err, "trace_id": trade.trace_id})
         await _fire_trade_event("trade_failed", {"trade": trade.dict(), "error": err})
         await _telegram_alert(f"❌ Trade failed: {trade.symbol} {trade.side} reason: {err}")
-        return TradeResult(
-            success=False,
-            error=err,
-            timestamp=int(datetime.utcnow().timestamp()),
-            trace_id=trade.trace_id,
-        )
+        return TradeResult(success=False, error=err, timestamp=int(datetime.utcnow().timestamp()), trace_id=trade.trace_id)
+
+# ───────────── AutoTrader Class ──────────────────────────────────────────────
+class AutoTrader:
+    """
+    Scheduling wrapper for live trading.
+    Provides connect/disconnect and drives execute_trade.
+    """
+    def __init__(
+        self,
+        redis_url: str,
+        router: PluginManager,
+        wallet_manager: WalletManager,
+        telegram_token: str,
+        telegram_chat_id: int,
+    ):
+        self.redis_url = redis_url
+        self.plugin_router = router
+        self.wallet_manager = wallet_manager
+        self.telegram_token = telegram_token
+        self.telegram_chat_id = telegram_chat_id
+        self.connected = False
+
+    async def connect(self) -> None:
+        self.connected = True
+        logger.info("[AutoTrader] Connected.")
+
+    async def disconnect(self) -> None:
+        self.connected = False
+        logger.info("[AutoTrader] Disconnected.")
+
+    async def execute_next_trade(self) -> None:
+        # Placeholder: implement your scheduling logic here
+        logger.debug("[AutoTrader] execute_next_trade called - stub.")
+"
