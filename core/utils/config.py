@@ -23,6 +23,13 @@ class Config:
     _instance: "Config" = None
     _initialized: bool = False
 
+from pydantic import Field
+
+class Config(BaseSettings):
+    ...
+    TRUSTED_LOGO_SOURCES: List[str] = Field(default=["https://assets.coingecko.com", "https://raw.githubusercontent.com"])
+
+
     # Base58 regex (exclude 0/O, I/l)
     _BASE58_REGEX = re.compile(r'^[A-HJ-NP-Za-km-z1-9]{32,44}$')
 
