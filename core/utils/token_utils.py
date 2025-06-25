@@ -3,7 +3,7 @@
 import logging
 import json
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import httpx
 import redis.asyncio as redis_client
@@ -49,7 +49,7 @@ class TokenUtils:
     def __init__(self, cache_ttl: int = 300):
         self.redis_url = config.REDIS_URL
         self.helius_key = config.HELIUS_API_KEY
-        self.helius_base = config.HELIUS_RPC  # use RPC for on-chain flows or adjust API URL
+        self.helius_base = config.HELIUS_RPC
         self.birdeye_url = config.GECKO_API_URL.rstrip('/') + "/public/price"
         self.cache_ttl = cache_ttl
         self.redis: Optional[redis_client.Redis] = None
@@ -74,12 +74,10 @@ class TokenUtils:
         key = f"token_meta:{mint}"
         start = datetime.utcnow().timestamp()
         try:
-            # Prepare headers for Helius API
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.helius_key}"
             }
-            # Cache lookup
             with CACHE_LATENCY.time():
                 if self.redis:
                     cached = await self.redis.get(key)
@@ -88,7 +86,6 @@ class TokenUtils:
                         return TokenMetadata.parse_raw(cached)
             CACHE_MISSES.inc()
 
-            # Fetch via Helius API
             url = f"{self.helius_base}/tokens/metadata"
             payload = {"mintAccounts": [mint]}
             async with HTTP_LATENCY.time():
@@ -108,7 +105,6 @@ class TokenUtils:
         except Exception as e:
             TOKEN_ERRORS.inc()
             logger.error(f"[TokenUtils] Metadata fetch failed for {mint}: {e}")
-            # Return fallback metadata
             return TokenMetadata(name="Unknown", symbol=mint[:4].upper(), decimals=6)
 
     async def get_token_price(self, mint: str) -> TokenPrice:
@@ -121,12 +117,13 @@ class TokenUtils:
                     return TokenPrice.parse_raw(cached)
         CACHE_MISSES.inc()
 
-        # Fetch price via Birdeye API with retries
         url = self.birdeye_url
         params = {"address": mint}
         try:
             async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 5), reraise=True
+                stop=stop_after_attempt(3),
+                wait=wait_exponential_jitter(1, 5),
+                reraise=True
             ):
                 with HTTP_LATENCY.time():
                     resp = await self.http.get(url, params=params)
@@ -144,5 +141,4 @@ class TokenUtils:
         except Exception as e:
             TOKEN_ERRORS.inc()
             logger.error(f"[TokenUtils] Price fetch failed for {mint}: {e}")
-            # Fallback: zero price
             return TokenPrice(mint=mint, price=0.0, timestamp=int(datetime.utcnow().timestamp()))
