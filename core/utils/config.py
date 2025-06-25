@@ -93,6 +93,9 @@ class Config:
             "trade_memory.db"
         )
 
+        # MASCOT image fallback path
+        self.MASCOT_IMAGE_PATH = os.getenv("MASCOT_IMAGE_PATH", "assets/mascot/Nova1.png")
+
     def _require(self, key: str) -> str:
         val = os.getenv(key)
         if not val:
@@ -124,7 +127,6 @@ class Config:
     def _validate_base58(self, addr: str, key: str) -> None:
         if not self._BASE58_REGEX.match(addr):
             raise ValueError(f"[Config] Invalid Base58 address in '{key}': '{addr}'")
-
 
 # Global singleton instance for imports
 config = Config()
