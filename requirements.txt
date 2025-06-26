@@ -47,7 +47,7 @@ openai
 Pillow
 tenacity
 deprecated
-
+matplotlib
 pydantic
 pydantic-settings
 
