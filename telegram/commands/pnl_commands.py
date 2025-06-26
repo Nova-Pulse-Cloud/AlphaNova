@@ -43,7 +43,7 @@ async def pnl_handler(message: Message):
     try:
         img = await generate_pnl_image(user=user_id, symbol=symbol)
         caption = f"📈 PnL {'for ' + symbol if symbol else 'overview'}"
-        stats = await get_token_stats(symbol) if symbol else None
+        stats = _mesh.get_token_stats(symbol)
         if stats and "cycle" in stats:
             caption += f"\n⏳ Cycle: {stats['cycle']} | Win Rate: {stats.get('win_rate', 'N/A')}"
         await fire_plugin_event("cmd_pnl", {"user_id": user_id, "symbol": symbol, "trace_id": trace_id})
