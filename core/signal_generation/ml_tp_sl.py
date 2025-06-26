@@ -10,6 +10,7 @@ import os
 import json
 import asyncio
 import logging
+import hashlib
 from typing import Any, Dict, List, Tuple, Callable, Optional
 
 import joblib
@@ -111,7 +112,9 @@ async def predict_tp_sl(
                 # fallback to local model or defaults
                 if os.path.exists(_MODEL_PATH):
                     model = joblib.load(_MODEL_PATH)
-                    X = np.array([[features.get(k, 0.0) for k in ("entry_price","volatility","trend_strength","liquidity","whale_pressure")]])
+                    X = np.array([[features.get(k, 0.0) for k in (
+                        "entry_price", "volatility", "trend_strength", "liquidity", "whale_pressure"
+                    )]])
                     preds = model.predict(X)[0]
                     result = {"tp_pct": float(preds[0]), "sl_pct": float(preds[1]), "plugin": "sklearn"}
                 else:
