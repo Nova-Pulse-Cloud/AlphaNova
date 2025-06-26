@@ -163,7 +163,7 @@ async def stats_handler(message: Message):
         await message.answer("Usage: /stats <SYMBOL>")
         return
     symbol = parts[1].upper()
-    stats = await get_token_stats(symbol)
+    stats = _mesh.get_token_stats(symbol)
     await fire_plugin_event("cmd_stats", {"symbol": symbol})
     await message.answer(f"📊 *Stats for {symbol}:*\n{stats}", parse_mode="Markdown")
 
