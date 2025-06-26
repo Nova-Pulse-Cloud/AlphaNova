@@ -130,12 +130,12 @@ class TokenLogoService:
             return raw
 
     def _placeholder(self, mint: str, size: int) -> bytes:
-        if DEFAULT_LOGO_PATH.exists():
-            try:
+        try:
+            if DEFAULT_LOGO_PATH.exists():
                 raw = DEFAULT_LOGO_PATH.read_bytes()
                 return self._resize(raw, size)
-            except Exception as e:
-                logger.warning(f"[TokenLogoService] default asset load failed from {DEFAULT_LOGO_PATH}: {e}")
+        except Exception as e:
+            logger.warning(f"[TokenLogoService] default asset load failed from {DEFAULT_LOGO_PATH}: {e}")
 
         logger.warning(f"[TokenLogoService] generating dynamic placeholder for {mint}")
         img = Image.new("RGBA", (size, size), (40, 40, 40, 255))
