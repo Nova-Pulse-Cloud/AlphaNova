@@ -2,6 +2,8 @@ import os
 import json
 import re
 from typing import Any
+from pydantic import BaseSettings
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Legacy constants (still available if you need direct calls)
