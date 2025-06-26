@@ -7,9 +7,8 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from core.utils.config import config
 from core.utils.plugin_manager import fire_plugin_event, register_plugin_event_hook
 from core.utils.pnl_card import generate_pnl_card
-from core.utils.token_logo import fetch_token_logo
+from core.utils.token_logo import TokenLogoService
 from core.utils.trade_logger import register_trade_log_hook
-from core.signal_generation.signal_sources import get_top_signals
 from core.alpha_memory_mesh import get_token_stats
 from core.top_wallet_tracer import get_recent_whale_tokens
 
@@ -28,6 +27,14 @@ router.include_router(streak_router)
 bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
 
 ADMIN_ID = str(config.TELEGRAM_CHAT_ID)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inject fallback token logo fetcher
+# ─────────────────────────────────────────────────────────────────────────────
+logo_service = TokenLogoService()
+
+async def fetch_token_logo(mint: str) -> bytes:
+    return await logo_service.get_logo(mint)
 
 def admin_only(func):
     async def wrapper(obj, *args, **kwargs):
