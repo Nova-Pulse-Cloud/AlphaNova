@@ -23,24 +23,12 @@ logger.setLevel(logging.INFO)
 # ─────────────────────────────────────────────────────────────────────────────
 # Metrics
 # ─────────────────────────────────────────────────────────────────────────────
-LOGO_CACHE_HITS   = Counter(
-    "token_logo_cache_hits_total", "Cache hits for token logos"
-)
-LOGO_CACHE_MISSES = Counter(
-    "token_logo_cache_misses_total", "Cache misses for token logos"
-)
-LOGO_FETCH_ERRORS = Counter(
-    "token_logo_fetch_errors_total", "Errors fetching token logos"
-)
-SOURCE_SUCCESS    = Counter(
-    "token_logo_source_success_total", "Successful fetches per source", ["source"]
-)
-SOURCE_FAILURE    = Counter(
-    "token_logo_source_failure_total", "Failed fetches per source", ["source"]
-)
-LOGO_LATENCY      = Histogram(
-    "token_logo_latency_seconds", "Latency of token logo operations"
-)
+LOGO_CACHE_HITS   = Counter("token_logo_cache_hits_total", "Cache hits for token logos")
+LOGO_CACHE_MISSES = Counter("token_logo_cache_misses_total", "Cache misses for token logos")
+LOGO_FETCH_ERRORS = Counter("token_logo_fetch_errors_total", "Errors fetching token logos")
+SOURCE_SUCCESS    = Counter("token_logo_source_success_total", "Successful fetches per source", ["source"])
+SOURCE_FAILURE    = Counter("token_logo_source_failure_total", "Failed fetches per source", ["source"])
+LOGO_LATENCY      = Histogram("token_logo_latency_seconds", "Latency of token logo operations")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configurable paths and cache
@@ -52,13 +40,6 @@ LOGO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class TokenLogoService:
-    """
-    Async service to get token icons:
-      - Lazy Redis connection
-      - Fetch from trusted sources with retry/backoff
-      - Fallback placeholder generation
-      - Resize, cache, and persist
-    """
     def __init__(self, ttl: int = 86400) -> None:
         self.ttl = ttl
         self.redis_url = config.REDIS_URL
@@ -68,9 +49,7 @@ class TokenLogoService:
     async def _ensure_redis(self) -> None:
         if self._redis is None:
             try:
-                self._redis = redis_client.from_url(
-                    self.redis_url, decode_responses=False
-                )
+                self._redis = redis_client.from_url(self.redis_url, decode_responses=False)
                 await self._redis.ping()
                 logger.info("[TokenLogoService] Redis connected")
             except Exception as e:
@@ -78,25 +57,18 @@ class TokenLogoService:
                 self._redis = None
 
     async def close(self) -> None:
-        """Cleanly close HTTP and Redis clients"""
         await self._http.aclose()
         if self._redis:
             await self._redis.close()
 
     async def get_logo(self, mint: str, size: int = 128) -> bytes:
-        """
-        Main entry: try cache, then fetch or placeholder, then store.
-        """
         key = f"token_logo:{mint}:{size}"
         async with LOGO_LATENCY.time():
             await self._ensure_redis()
-            # 1) cache
             data = await self._fetch_cache(key)
             if data:
                 return data
-            # 2) fetch or placeholder
             payload = await self._retrieve(mint, size)
-            # 3) cache and persist
             await self._store_cache(key, payload)
             await self._persist_to_disk(mint, size, payload)
             return payload
@@ -143,7 +115,6 @@ class TokenLogoService:
                 SOURCE_FAILURE.labels(source=url).inc()
                 logger.debug(f"[TokenLogoService] fetch failed {url}: {e}")
         LOGO_FETCH_ERRORS.inc()
-        # placeholder fallback
         return await asyncio.to_thread(self._placeholder, mint, size)
 
     def _resize(self, raw: bytes, size: int) -> bytes:
@@ -159,20 +130,20 @@ class TokenLogoService:
             return raw
 
     def _placeholder(self, mint: str, size: int) -> bytes:
-        # use default asset if available
         if DEFAULT_LOGO_PATH.exists():
             try:
                 raw = DEFAULT_LOGO_PATH.read_bytes()
                 return self._resize(raw, size)
             except Exception as e:
-                logger.warning(f"[TokenLogoService] default asset load failed: {e}")
-        # dynamic text placeholder
+                logger.warning(f"[TokenLogoService] default asset load failed from {DEFAULT_LOGO_PATH}: {e}")
+
+        logger.warning(f"[TokenLogoService] generating dynamic placeholder for {mint}")
         img = Image.new("RGBA", (size, size), (40, 40, 40, 255))
         draw = ImageDraw.Draw(img)
         text = mint[:4].upper()
         font = ImageFont.load_default()
         w, h = draw.textsize(text, font=font)
-        draw.text(((size-w)/2, (size-h)/2), text, font=font, fill=(255,255,255,255))
+        draw.text(((size - w) / 2, (size - h) / 2), text, font=font, fill=(255, 255, 255, 255))
         buf = BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
