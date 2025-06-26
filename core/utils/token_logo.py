@@ -130,12 +130,12 @@ class TokenLogoService:
             return raw
 
     def _placeholder(self, mint: str, size: int) -> bytes:
-        try:
-            if DEFAULT_LOGO_PATH.exists():
+        if DEFAULT_LOGO_PATH.exists():
+            try:
                 raw = DEFAULT_LOGO_PATH.read_bytes()
                 return self._resize(raw, size)
-        except Exception as e:
-            logger.warning(f"[TokenLogoService] default asset load failed from {DEFAULT_LOGO_PATH}: {e}")
+            except Exception as e:
+                logger.warning(f"[TokenLogoService] default asset load failed from {DEFAULT_LOGO_PATH}: {e}")
 
         logger.warning(f"[TokenLogoService] generating dynamic placeholder for {mint}")
         img = Image.new("RGBA", (size, size), (40, 40, 40, 255))
@@ -154,3 +154,13 @@ class TokenLogoService:
             await asyncio.to_thread(path.write_bytes, raw)
         except Exception as e:
             logger.warning(f"[TokenLogoService] disk write failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Functional Wrapper for Compatibility
+# ─────────────────────────────────────────────────────────────────────────────
+_logo_service = TokenLogoService()
+
+async def fetch_token_logo(mint: str, size: int = 128) -> BytesIO:
+    raw_bytes = await _logo_service.get_logo(mint, size)
+    return BytesIO(raw_bytes)
