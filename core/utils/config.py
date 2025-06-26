@@ -1,5 +1,3 @@
-# File: core/utils/config.py
-
 import os
 import json
 import re
@@ -78,6 +76,7 @@ class Config:
         # Fallback paths
         self.TRADE_MEMORY_DB_PATH = os.getenv("TRADE_MEMORY_DB_PATH", "trade_memory.db")
         self.MASCOT_IMAGE_PATH = os.getenv("MASCOT_IMAGE_PATH", "assets/mascot/Nova1.png")
+        self.DEFAULT_LOGO_PATH = os.getenv("DEFAULT_LOGO_PATH", "assets/templates/default_logo.png")
 
     def _require(self, key: str) -> str:
         val = os.getenv(key)
