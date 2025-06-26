@@ -19,7 +19,7 @@ from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.utils.trade_logger import get_trade_log
 from core.signal_generation.signal_sources import get_top_signals
-from core import alpha_memory_mesh
+from core.alpha_memory_mesh import MemoryMesh
 from core.top_wallet_tracer import get_recent_whale_tokens
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
 from core.utils.pnl_card import generate_pnl_card
@@ -35,7 +35,7 @@ trade_memory   = TradeMemory(config)
 rl_tuner       = ReinforcementTuner()
 adaptive_tp_sl = AdaptiveTPSL(memory=trade_memory, rl_agent=rl_tuner)
 engine         = CombinedSignalEngine(trade_memory, rl_tuner, adaptive_tp_sl)
-_mesh          = alpha_memory_mesh.MemoryMesh()
+_mesh          = MemoryMesh()
 
 # Redis for rate-limiting and auto-mode
 auto_redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
@@ -113,6 +113,7 @@ async def help_handler(message: Message):
         "/exportdata — Export fills as CSV\n"
     )
     await message.answer(help_text, parse_mode="Markdown")
+
 
 @router.message(Command("wallet"))
 @admin_only
