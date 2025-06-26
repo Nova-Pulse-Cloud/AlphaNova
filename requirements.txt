@@ -50,3 +50,6 @@ pydantic-settings
 
 setuptools
 wheel
+
+pytest
+pytest-asyncio
