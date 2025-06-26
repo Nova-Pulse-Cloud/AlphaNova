@@ -19,7 +19,7 @@ from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.utils.trade_logger import get_trade_log
 from core.signal_generation.signal_sources import get_top_signals
-from core.alpha_memory_mesh import get_token_stats
+from core.alpha_memory_mesh import _mesh
 from core.top_wallet_tracer import get_recent_whale_tokens
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
 from core.utils.pnl_card import generate_pnl_card
