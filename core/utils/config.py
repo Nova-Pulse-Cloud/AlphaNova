@@ -1,39 +1,32 @@
+# File: core/utils/config.py
+
 import os
 import json
 import re
-from typing import Any
-from pydantic import BaseSettings
+from typing import Any, List
 
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Legacy constants (still available if you need direct calls)
-# ────────────────────────────────────────────────────────────────────────────────
-DEXSCREENER_URL = os.environ.get(
-    "DEXSCREENER_URL",
-    "https://api.dexscreener.com/latest/dex/tokens/"
-)
-PRICE_CHANGE_THRESHOLD = float(
-    os.environ.get("PRICE_CHANGE_THRESHOLD", "0.02")
-)
+# Legacy constants
+DEXSCREENER_URL = os.getenv("DEXSCREENER_URL", "https://api.dexscreener.com/latest/dex/tokens/")
+PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.02"))
 
 class Config:
     """
-    Singleton configuration loader with strict validation.
-    Loads required environment variables, validates formats,
-    and reads the Solana private key from a JSON secret file.
+    Singleton config loader with strict validation for all required envs,
+    secret JSON keys, fallback defaults, and Base58/URL checks.
     """
     _instance: "Config" = None
     _initialized: bool = False
 
-from pydantic import Field
-
-class Config(BaseSettings):
-    ...
-    TRUSTED_LOGO_SOURCES: List[str] = Field(default=["https://assets.coingecko.com", "https://raw.githubusercontent.com"])
-
-
-    # Base58 regex (exclude 0/O, I/l)
+    # Base58 regex pattern (avoiding ambiguous chars)
     _BASE58_REGEX = re.compile(r'^[A-HJ-NP-Za-km-z1-9]{32,44}$')
+
+    # Trusted token logo sources
+    TRUSTED_LOGO_SOURCES: List[str] = [
+        "https://assets.coingecko.com",
+        "https://raw.githubusercontent.com",
+        "https://s2.coinmarketcap.com/",
+        "https://cdn.solana.fm/"
+    ]
 
     def __new__(cls) -> "Config":
         if cls._instance is None:
@@ -45,64 +38,45 @@ class Config(BaseSettings):
             return
         self._initialized = True
 
-        # HTTP client timeout (seconds)
-        try:
-            self.HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
-        except ValueError:
-            raise ValueError("[Config] 'HTTP_TIMEOUT' must be an integer")
-
-        # Jupiter swap API endpoint
-        self.JUPITER_SWAP_ENDPOINT = os.getenv(
-            "JUPITER_SWAP_ENDPOINT",
-            "https://quote-api.jup.ag/v6/swap"
-        )
+        # Timeouts and URLs
+        self.HTTP_TIMEOUT = self._require_int("HTTP_TIMEOUT", default="15")
+        self.JUPITER_SWAP_ENDPOINT = os.getenv("JUPITER_SWAP_ENDPOINT", "https://quote-api.jup.ag/v6/swap")
 
         # Core connectivity
-        self.REDIS_URL          = self._require("REDIS_URL")
+        self.REDIS_URL = self._require("REDIS_URL")
         self.TELEGRAM_BOT_TOKEN = self._require("TELEGRAM_BOT_TOKEN")
-        self.TELEGRAM_CHAT_ID   = self._require_int("TELEGRAM_CHAT_ID")
-        self.WEBHOOK_URL        = self._require("WEBHOOK_URL")
+        self.TELEGRAM_CHAT_ID = self._require_int("TELEGRAM_CHAT_ID")
+        self.WEBHOOK_URL = self._require("WEBHOOK_URL")
 
-        # Solana wallet secret (path to JSON array)
+        # Solana wallet
         key_path = self._require("SOL_PRIVATE_KEY_PATH")
-        self.SOL_PRIVATE_KEY    = self._load_json_secret(key_path)
-        self.SOL_ADDRESS        = self._require("SOL_ADDRESS")
+        self.SOL_PRIVATE_KEY = self._load_json_secret(key_path)
+        self.SOL_ADDRESS = self._require("SOL_ADDRESS")
         self._validate_base58(self.SOL_ADDRESS, "SOL_ADDRESS")
 
-        # RPC / API keys & URLs
-        self.HELIUS_RPC           = self._require("HELIUS_RPC")
+        # API keys and services
+        self.HELIUS_RPC = self._require("HELIUS_RPC")
         self._validate_url(self.HELIUS_RPC, "HELIUS_RPC")
-        self.HELIUS_API_KEY       = self._require("HELIUS_API_KEY")
-        self.CMC_API_KEY          = self._require("CMC_API_KEY")
-        self.GECKO_API_URL        = self._require("GECKO_API_URL")
-        self.OPENAI_API_KEY       = self._require("OPENAI_API_KEY")
+        self.HELIUS_API_KEY = self._require("HELIUS_API_KEY")
+        self.CMC_API_KEY = self._require("CMC_API_KEY")
+        self.GECKO_API_URL = self._require("GECKO_API_URL")
+        self.OPENAI_API_KEY = self._require("OPENAI_API_KEY")
         self.TWITTER_BEARER_TOKEN = self._require("TWITTER_BEARER_TOKEN")
-        self.MACRO_API_URL        = self._require("MACRO_API_URL")
-        self.MACRO_API_KEY        = self._require("MACRO_API_KEY")
-        self.ETHERSCAN_API_KEY    = self._require("ETHERSCAN_API_KEY")
+        self.MACRO_API_URL = self._require("MACRO_API_URL")
+        self.MACRO_API_KEY = self._require("MACRO_API_KEY")
+        self.ETHERSCAN_API_KEY = self._require("ETHERSCAN_API_KEY")
 
-        # ML TP/SL model path & defaults
+        # TP/SL model settings
         self.TPSL_MODEL_PATH = os.getenv("TPSL_MODEL_PATH", "models/tp_sl_predictor.pkl")
-        try:
-            self.DEFAULT_TP_PCT = float(os.getenv("DEFAULT_TP_PCT", "0.07"))
-            self.DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.04"))
-        except ValueError:
-            raise ValueError("[Config] DEFAULT_TP_PCT and DEFAULT_SL_PCT must be floats")
+        self.DEFAULT_TP_PCT = self._require_float("DEFAULT_TP_PCT", default="0.07")
+        self.DEFAULT_SL_PCT = self._require_float("DEFAULT_SL_PCT", default="0.04")
 
-        # Optional Jaeger tracing
+        # Optional tracing
         self.JAEGER_HOST = os.getenv("JAEGER_HOST", "localhost")
-        try:
-            self.JAEGER_PORT = int(os.getenv("JAEGER_PORT", "6831"))
-        except ValueError:
-            raise ValueError("[Config] 'JAEGER_PORT' must be an integer.")
+        self.JAEGER_PORT = self._require_int("JAEGER_PORT", default="6831")
 
-        # Trade-memory DB path (fallback)
-        self.TRADE_MEMORY_DB_PATH = os.getenv(
-            "TRADE_MEMORY_DB_PATH",
-            "trade_memory.db"
-        )
-
-        # MASCOT image fallback path
+        # Fallback paths
+        self.TRADE_MEMORY_DB_PATH = os.getenv("TRADE_MEMORY_DB_PATH", "trade_memory.db")
         self.MASCOT_IMAGE_PATH = os.getenv("MASCOT_IMAGE_PATH", "assets/mascot/Nova1.png")
 
     def _require(self, key: str) -> str:
@@ -111,12 +85,19 @@ class Config(BaseSettings):
             raise EnvironmentError(f"[Config] Missing required environment variable: '{key}'")
         return val
 
-    def _require_int(self, key: str) -> int:
-        val = self._require(key)
+    def _require_int(self, key: str, default: str = None) -> int:
+        val = os.getenv(key, default)
         try:
             return int(val)
         except ValueError:
             raise ValueError(f"[Config] '{key}' must be an integer, got '{val}'")
+
+    def _require_float(self, key: str, default: str = None) -> float:
+        val = os.getenv(key, default)
+        try:
+            return float(val)
+        except ValueError:
+            raise ValueError(f"[Config] '{key}' must be a float, got '{val}'")
 
     def _load_json_secret(self, path: str) -> Any:
         if not os.path.isfile(path):
@@ -126,8 +107,6 @@ class Config(BaseSettings):
                 return json.load(f)
         except json.JSONDecodeError:
             raise ValueError(f"[Config] Secret file at '{path}' is not valid JSON")
-        except Exception as e:
-            raise RuntimeError(f"[Config] Failed to load secret from '{path}': {e}")
 
     def _validate_url(self, url: str, key: str) -> None:
         if not url.startswith(("https://", "http://")):
@@ -137,5 +116,6 @@ class Config(BaseSettings):
         if not self._BASE58_REGEX.match(addr):
             raise ValueError(f"[Config] Invalid Base58 address in '{key}': '{addr}'")
 
-# Global singleton instance for imports
+
+# Global config instance
 config = Config()
