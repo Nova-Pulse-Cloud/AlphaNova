@@ -9,7 +9,7 @@ from core.utils.plugin_manager import fire_plugin_event, register_plugin_event_h
 from core.utils.pnl_card import generate_pnl_card
 from core.utils.token_logo import fetch_token_logo
 from core.utils.trade_logger import register_trade_log_hook
-from core.alpha_memory_mesh import get_token_stats
+from core.alpha_memory_mesh import _mesh
 from core.top_wallet_tracer import get_recent_whale_tokens
 
 from telegram.commands.commands import router as commands_router
