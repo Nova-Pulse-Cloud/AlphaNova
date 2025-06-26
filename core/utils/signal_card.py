@@ -1,3 +1,4 @@
+# File: core/utils/signal_card.py
 import io
 import logging
 import os
@@ -12,8 +13,7 @@ from core.utils.config import config
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Constants with fallback (do not rely on config.FOO if not defined)
-MASCOT_PATH = os.getenv("MASCOT_IMAGE_PATH", "assets/mascot/Nova1.png")
+MASCOT_PATH = os.getenv("MASCOT_IMAGE_PATH", config.MASCOT_IMAGE_PATH)
 FONT_PATH = os.getenv("FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 
 CARD_WIDTH = 900
@@ -21,7 +21,6 @@ CARD_HEIGHT = 480
 TITLE_FONT_SIZE = 32
 TEXT_FONT_SIZE = 18
 WATERMARK_FONT_SIZE = 21
-
 
 def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
     try:
@@ -34,14 +33,16 @@ TITLE_FONT = _load_font(FONT_PATH, TITLE_FONT_SIZE)
 TEXT_FONT = _load_font(FONT_PATH, TEXT_FONT_SIZE)
 WATERMARK_FONT = _load_font(FONT_PATH, WATERMARK_FONT_SIZE)
 
-
 async def generate_signal_card(
     signal: Dict[str, Any],
     mascot_path: Optional[str] = None
 ) -> io.BytesIO:
     path = mascot_path or MASCOT_PATH
     if not os.path.isfile(path):
-        logger.error("Mascot image not found at %s", path)
+        logger.warning("Mascot path invalid or missing, fallback to config.MASCOT_IMAGE_PATH")
+        path = config.MASCOT_IMAGE_PATH
+    if not os.path.isfile(path):
+        logger.error("Fallback mascot image not found: %s", path)
         raise FileNotFoundError(f"Mascot image not found: {path}")
 
     bg = (
