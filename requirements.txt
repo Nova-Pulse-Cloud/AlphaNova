@@ -46,13 +46,10 @@ prometheus-client
 openai
 Pillow
 tenacity
-Deprecated
+deprecated
 
 pydantic
 pydantic-settings
-
-setuptools
-wheel
 
 pytest
 pytest-asyncio
