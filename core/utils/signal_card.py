@@ -9,6 +9,7 @@ from core.utils.plugin_manager import fire_plugin_event, register_plugin_event_h
 from core.utils.pnl_card import generate_pnl_card
 from core.utils.token_logo import fetch_token_logo
 from core.utils.trade_logger import register_trade_log_hook
+from core.alpha_memory_mesh import get_token_stats
 from core.top_wallet_tracer import get_recent_whale_tokens
 
 from telegram.commands.commands import router as commands_router
@@ -43,7 +44,6 @@ def admin_only(func):
 async def push_trade_pnl_card(event_name: str, data: dict):
     if event_name != "trade_logged":
         return
-    logger.info("[push_trade_pnl_card] Triggered with data: %s", data)
     symbol = data.get("symbol")
     pnl    = data.get("pnl")
     side   = data.get("side")
@@ -59,7 +59,6 @@ def _push_alpha_signal(event_name: str, data: dict):
         return
     async def _send():
         try:
-            logger.info("[_push_alpha_signal] Dispatching signal: %s", data)
             symbol = data["symbol"]
             logo   = await fetch_token_logo(symbol)
             caption = (
@@ -83,7 +82,7 @@ def _push_alpha_signal(event_name: str, data: dict):
                 reply_markup=kb
             )
         except Exception as e:
-            logger.error("[_push_alpha_signal] Failed to push: %s", e)
+            logger.error(f"Failed to push alpha signal: {e}")
 
     asyncio.create_task(_send())
 
@@ -94,7 +93,6 @@ register_plugin_event_hook(_push_alpha_signal)
 @admin_only
 async def exec_trade_cb(query: CallbackQuery):
     symbol = query.data.split(":", 1)[1]
-    logger.info("[exec_trade_cb] Executing: %s", symbol)
     await query.answer("🚀 Executing trade…")
     await fire_plugin_event("telegram_exec_trade", {"symbol": symbol, "user": query.from_user.id})
 
@@ -102,14 +100,12 @@ async def exec_trade_cb(query: CallbackQuery):
 @admin_only
 async def mirror_trade_cb(query: CallbackQuery):
     symbol = query.data.split(":", 1)[1]
-    logger.info("[mirror_trade_cb] Mirroring: %s", symbol)
     await query.answer("👥 Mirror trade activated!")
     await fire_plugin_event("telegram_mirror_trade", {"symbol": symbol, "user": query.from_user.id})
 
 @router.callback_query(F.data == "auto_toggle")
 @admin_only
 async def auto_toggle_cb(query: CallbackQuery):
-    logger.info("[auto_toggle_cb] Auto toggle triggered")
     await query.answer("🔁 Auto mode toggled.")
     await fire_plugin_event("telegram_auto_toggle", {"user": query.from_user.id})
 
@@ -117,7 +113,6 @@ async def auto_toggle_cb(query: CallbackQuery):
 @admin_only
 async def skip_trade_cb(query: CallbackQuery):
     symbol = query.data.split(":", 1)[1]
-    logger.info("[skip_trade_cb] Skipping: %s", symbol)
     await query.answer("⏭️ Trade skipped.")
     await fire_plugin_event("telegram_skip_trade", {"symbol": symbol, "user": query.from_user.id})
 
@@ -125,5 +120,12 @@ async def skip_trade_cb(query: CallbackQuery):
 @router.message(Command("status"))
 @admin_only
 async def status_handler(message: Message):
-    logger.info("[status_handler] Status check received")
     await message.answer("🛰️ Nova Pulse Status: ✅ Running and connected")
+
+# ─── Patch for broken import fallback ───────────────────────────────────
+# Enables: from core.alpha_memory_mesh import get_token_stats
+try:
+    from core.alpha_memory_mesh import _mesh
+    get_token_stats = _mesh.get_token_stats
+except Exception as e:
+    logger.error("[Patch] get_token_stats fallback failed: %s", e)
