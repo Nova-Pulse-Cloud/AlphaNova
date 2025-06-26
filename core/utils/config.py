@@ -80,6 +80,12 @@ class Config:
         self.MASCOT_IMAGE_PATH = os.getenv("MASCOT_IMAGE_PATH", "assets/mascot/Nova1.png")
         self.LOGO_DIR = os.getenv("LOGO_DIR", "assets/templates/")  # 🔥 This fixes your crash.
 
+# Default token logo path (used by token_logo.py)
+        default_logo_filename = os.getenv("DEFAULT_LOGO_FILENAME", "default_logo.png")
+        self.DEFAULT_LOGO_PATH = os.path.join(self.LOGO_DIR, default_logo_filename)
+        if not os.path.isfile(self.DEFAULT_LOGO_PATH):
+            raise FileNotFoundError(f"[Config] DEFAULT_LOGO_PATH does not exist: {self.DEFAULT_LOGO_PATH}")
+
     # ───── Validation + Secrets ─────
 
     def _require(self, key: str) -> str:
