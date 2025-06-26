@@ -2,42 +2,42 @@ services:
   - type: web
     name: nova-alpha-launch
     env: python
-    python_version: 3.10.12
-    build_command: pip install --no-cache-dir -r requirements.txt
-    start_command: python -m uvicorn main_service:app --host 0.0.0.0 --port ${PORT:-8000}
-    env_vars:
+    pythonVersion: 3.10.12
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python -m uvicorn main_service:app --host 0.0.0.0 --port ${PORT:-8000}
+    envVars:
       - key: TELEGRAM_BOT_TOKEN
-        from_secret: TELEGRAM_BOT_TOKEN
+        fromSecret: TELEGRAM_BOT_TOKEN
       - key: TELEGRAM_CHAT_ID
-        from_secret: TELEGRAM_CHAT_ID
+        fromSecret: TELEGRAM_CHAT_ID
       - key: SOL_PRIVATE_KEY_PATH
-        from_secret: SOL_PRIVATE_KEY_PATH
+        fromSecret: SOL_PRIVATE_KEY_PATH
       - key: SOL_ADDRESS
-        from_secret: SOL_ADDRESS
+        fromSecret: SOL_ADDRESS
       - key: REDIS_URL
-        from_secret: REDIS_URL
+        fromSecret: REDIS_URL
       - key: HELIUS_RPC
-        from_secret: HELIUS_RPC
+        fromSecret: HELIUS_RPC
       - key: HELIUS_API_KEY
-        from_secret: HELIUS_API_KEY
+        fromSecret: HELIUS_API_KEY
       - key: CMC_API_KEY
-        from_secret: CMC_API_KEY
+        fromSecret: CMC_API_KEY
       - key: GECKO_API_URL
-        from_secret: GECKO_API_URL
+        fromSecret: GECKO_API_URL
       - key: OPENAI_API_KEY
-        from_secret: OPENAI_API_KEY
+        fromSecret: OPENAI_API_KEY
       - key: TWITTER_BEARER_TOKEN
-        from_secret: TWITTER_BEARER_TOKEN
+        fromSecret: TWITTER_BEARER_TOKEN
       - key: MACRO_API_URL
-        from_secret: MACRO_API_URL
+        fromSecret: MACRO_API_URL
       - key: MACRO_API_KEY
-        from_secret: MACRO_API_KEY
+        fromSecret: MACRO_API_KEY
       - key: ETHERSCAN_API_KEY
-        from_secret: ETHERSCAN_API_KEY
+        fromSecret: ETHERSCAN_API_KEY
       - key: WEBHOOK_URL
-        from_secret: WEBHOOK_URL
+        fromSecret: WEBHOOK_URL
       - key: DASHBOARD_URL
-        from_secret: DASHBOARD_URL
+        fromSecret: DASHBOARD_URL
       - key: HTTP_TIMEOUT
         value: "15"
       - key: JUPITER_SWAP_ENDPOINT
