@@ -19,7 +19,7 @@ from core.agents.adaptive_tp_sl import AdaptiveTPSL
 from core.signal_generation.combined_signal_engine import CombinedSignalEngine
 from core.utils.trade_logger import get_trade_log
 from core.signal_generation.signal_sources import get_top_signals
-from core.alpha_memory_mesh import _mesh
+from core import alpha_memory_mesh
 from core.top_wallet_tracer import get_recent_whale_tokens
 from core.signal_generation.signal_explainer_ai import SignalExplainerAI
 from core.utils.pnl_card import generate_pnl_card
@@ -35,6 +35,7 @@ trade_memory   = TradeMemory(config)
 rl_tuner       = ReinforcementTuner()
 adaptive_tp_sl = AdaptiveTPSL(memory=trade_memory, rl_agent=rl_tuner)
 engine         = CombinedSignalEngine(trade_memory, rl_tuner, adaptive_tp_sl)
+_mesh          = alpha_memory_mesh.MemoryMesh()
 
 # Redis for rate-limiting and auto-mode
 auto_redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
@@ -163,7 +164,7 @@ async def stats_handler(message: Message):
         await message.answer("Usage: /stats <SYMBOL>")
         return
     symbol = parts[1].upper()
-    stats = _mesh.get_token_stats(symbol)
+    stats = await _mesh.get_token_stats(symbol)
     await fire_plugin_event("cmd_stats", {"symbol": symbol})
     await message.answer(f"📊 *Stats for {symbol}:*\n{stats}", parse_mode="Markdown")
 
