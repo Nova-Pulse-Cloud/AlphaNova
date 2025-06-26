@@ -13,7 +13,7 @@ httpx
 python-multipart
 
 joblib
-numpy>=1.26.0
+numpy
 pandas-ta
 scikit-learn
 tqdm
