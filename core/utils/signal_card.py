@@ -1,124 +1,123 @@
-# File: core/utils/signal_card.py
-import io
 import logging
-import os
-from datetime import datetime
-from typing import Any, Dict, Optional
+import asyncio
+from aiogram import Router, Bot, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-from PIL import Image, ImageDraw, ImageFont
-
-from core.signal_generation.sl_manager import get_last_sl_tp_for_token
 from core.utils.config import config
+from core.utils.plugin_manager import fire_plugin_event, register_plugin_event_hook
+from core.utils.pnl_card import generate_pnl_card
+from core.utils.token_logo import fetch_token_logo
+from core.utils.trade_logger import register_trade_log_hook
+from core.alpha_memory_mesh import get_token_stats
+from core.top_wallet_tracer import get_recent_whale_tokens
 
-logger = logging.getLogger(__name__)
+from telegram.commands.commands import router as commands_router
+from telegram.commands.pnl_commands import router as pnl_cmd_router
+from telegram.commands.streak_cmd import router as streak_router
+
+logger = logging.getLogger("telegram_router")
 logger.setLevel(logging.INFO)
 
-MASCOT_PATH = os.getenv("MASCOT_IMAGE_PATH", config.MASCOT_IMAGE_PATH)
-FONT_PATH = os.getenv("FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+router = Router()
+router.include_router(commands_router)
+router.include_router(pnl_cmd_router)
+router.include_router(streak_router)
 
-CARD_WIDTH = 900
-CARD_HEIGHT = 480
-TITLE_FONT_SIZE = 32
-TEXT_FONT_SIZE = 18
-WATERMARK_FONT_SIZE = 21
+bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
 
-def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        logger.warning("Font not found at %s, using default.", path)
-        return ImageFont.load_default()
+ADMIN_ID = str(config.TELEGRAM_CHAT_ID)
 
-TITLE_FONT = _load_font(FONT_PATH, TITLE_FONT_SIZE)
-TEXT_FONT = _load_font(FONT_PATH, TEXT_FONT_SIZE)
-WATERMARK_FONT = _load_font(FONT_PATH, WATERMARK_FONT_SIZE)
+def admin_only(func):
+    async def wrapper(obj, *args, **kwargs):
+        user_id = str(obj.from_user.id) if hasattr(obj, 'from_user') else None
+        if user_id != ADMIN_ID:
+            if isinstance(obj, Message):
+                await obj.reply("❌ Access denied. This bot is private.")
+            elif isinstance(obj, CallbackQuery):
+                await obj.answer("❌ Access denied. This bot is private.")
+            return
+        return await func(obj, *args, **kwargs)
+    return wrapper
 
-async def generate_signal_card(
-    signal: Dict[str, Any],
-    mascot_path: Optional[str] = None
-) -> io.BytesIO:
-    path = mascot_path or MASCOT_PATH
-    if not os.path.isfile(path):
-        logger.warning("Mascot path invalid or missing, fallback to config.MASCOT_IMAGE_PATH")
-        path = config.MASCOT_IMAGE_PATH
-    if not os.path.isfile(path):
-        logger.error("Fallback mascot image not found: %s", path)
-        raise FileNotFoundError(f"Mascot image not found: {path}")
+# ─── Trade PnL Image Push ──────────────────────────────────────────────
+async def push_trade_pnl_card(event_name: str, data: dict):
+    if event_name != "trade_logged":
+        return
+    symbol = data.get("symbol")
+    pnl    = data.get("pnl")
+    side   = data.get("side")
+    img    = await generate_pnl_card(symbol)
+    caption = f"📊 Trade Closed: {symbol} ({side.upper()})\nPnL: {pnl:.4f}"
+    await bot.send_photo(chat_id=int(config.TELEGRAM_CHAT_ID), photo=img, caption=caption)
 
-    bg = (
-        Image.open(path)
-        .convert("RGBA")
-        .resize((CARD_WIDTH, CARD_HEIGHT))
-    )
-    overlay = Image.new("RGBA", bg.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+register_trade_log_hook(push_trade_pnl_card)
 
-    symbol = signal.get("symbol", "N/A")
-    score = float(signal.get("score", 0.0))
-    entry = float(signal.get("entry", 0.0))
-    sl = signal.get("sl")
-    tp = signal.get("tp")
-    breakdown = signal.get("breakdown", [])
-    flavor = signal.get("flavor", "")
-    risk = signal.get("risk", "")
-    meta = signal.get("meta_features", {})
+# ─── Signal Preview Push ────────────────────────────────────────────────
+def _push_alpha_signal(event_name: str, data: dict):
+    if event_name != "alpha_signal":
+        return
+    async def _send():
+        try:
+            symbol = data["symbol"]
+            logo   = await fetch_token_logo(symbol)
+            caption = (
+                f"🚨 *Nova Pulse Signal*\n"
+                f"Token: {symbol}\n"
+                f"Score: *{data.get('score', 0):.2f}*\n"
+                f"Entry: `{data.get('entry', 'N/A')}`\n"
+                f"TP: `{data.get('take_profit', '...')}`\n"
+                f"SL: `{data.get('stop_loss', '...')}`"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton("🚀 Execute", callback_data=f"exec:{symbol}"),
+                 InlineKeyboardButton("👥 Mirror", callback_data=f"mirror:{symbol}")],
+                [InlineKeyboardButton("🔁 Auto ON/OFF", callback_data="auto_toggle")]
+            ])
+            await bot.send_photo(
+                chat_id=int(config.TELEGRAM_CHAT_ID),
+                photo=logo,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+        except Exception as e:
+            logger.error(f"Failed to push alpha signal: {e}")
 
-    if sl is None or tp is None:
-        fallback = await get_last_sl_tp_for_token(symbol)
-        sl = sl or fallback.get("sl")
-        tp = tp or fallback.get("tp")
+    asyncio.create_task(_send())
 
-    draw.text((30, 30), f"Nova Pulse Signal: {symbol}", font=TITLE_FONT, fill="white")
-    draw.text((30, 80), f"Confidence: {score:.2f}", font=TEXT_FONT, fill=(200, 255, 200))
-    draw.text((30, 110), f"Entry: {entry:.6f}", font=TEXT_FONT, fill="white")
-    draw.text(
-        (30, 140),
-        f"TP: {float(tp):.6f}" if tp is not None else "TP: ?",
-        font=TEXT_FONT,
-        fill=(120, 255, 120),
-    )
-    draw.text(
-        (30, 170),
-        f"SL: {float(sl):.6f}" if sl is not None else "SL: ?",
-        font=TEXT_FONT,
-        fill=(255, 120, 120),
-    )
-    if flavor or risk:
-        draw.text(
-            (30, 200),
-            f"Flavor: {flavor} | Risk: {risk}",
-            font=TEXT_FONT,
-            fill=(255, 200, 100),
-        )
+register_plugin_event_hook(_push_alpha_signal)
 
-    sources = ", ".join(
-        str(item.get("source", "?")) for item in breakdown
-    ) or "Unknown"
-    draw.text((30, 240), f"Sources: {sources}", font=TEXT_FONT, fill=(180, 200, 255))
+# ─── Inline Callback Handlers ───────────────────────────────────────────
+@router.callback_query(F.data.startswith("exec:"))
+@admin_only
+async def exec_trade_cb(query: CallbackQuery):
+    symbol = query.data.split(":", 1)[1]
+    await query.answer("🚀 Executing trade…")
+    await fire_plugin_event("telegram_exec_trade", {"symbol": symbol, "user": query.from_user.id})
 
-    if isinstance(meta, dict) and meta:
-        meta_str = ", ".join(f"{k}:{v}" for k, v in meta.items())
-        draw.text(
-            (30, 270),
-            f"Meta: {meta_str}",
-            font=TEXT_FONT,
-            fill=(180, 210, 220),
-        )
+@router.callback_query(F.data.startswith("mirror:"))
+@admin_only
+async def mirror_trade_cb(query: CallbackQuery):
+    symbol = query.data.split(":", 1)[1]
+    await query.answer("👥 Mirror trade activated!")
+    await fire_plugin_event("telegram_mirror_trade", {"symbol": symbol, "user": query.from_user.id})
 
-    ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-    draw.text((30, 330), f"Generated: {ts}", font=TEXT_FONT, fill=(140, 140, 140))
+@router.callback_query(F.data == "auto_toggle")
+@admin_only
+async def auto_toggle_cb(query: CallbackQuery):
+    await query.answer("🔁 Auto mode toggled.")
+    await fire_plugin_event("telegram_auto_toggle", {"user": query.from_user.id})
 
-    watermark = "@NovaPulseAI"
-    w, h = draw.textsize(watermark, font=WATERMARK_FONT)
-    draw.text(
-        (bg.width - w - 30, bg.height - h - 18),
-        watermark,
-        font=WATERMARK_FONT,
-        fill=(0, 255, 255, 128),
-    )
+@router.callback_query(F.data.startswith("skip:"))
+@admin_only
+async def skip_trade_cb(query: CallbackQuery):
+    symbol = query.data.split(":", 1)[1]
+    await query.answer("⏭️ Trade skipped.")
+    await fire_plugin_event("telegram_skip_trade", {"symbol": symbol, "user": query.from_user.id})
 
-    card = Image.alpha_composite(bg, overlay).convert("RGB")
-    output = io.BytesIO()
-    card.save(output, format="PNG", optimize=True)
-    output.seek(0)
-    return output
+# ─── Status Check ───────────────────────────────────────────────────────
+@router.message(Command("status"))
+@admin_only
+async def status_handler(message: Message):
+    await message.answer("🛰️ Nova Pulse Status: ✅ Running and connected")
